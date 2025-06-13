@@ -42,7 +42,7 @@ app.listen(port, '0.0.0.0', () => {
 });
 
 // Add property
-app.post('/properties/add', (req, res) => {
+app.post('/properties/add', authenticateToken, (req, res) => {
     const { type, address, price, monthly_pay, bedrooms, bathrooms, land, construction, description } = req.body;
     const query = 'INSERT INTO properties (type, address, price, monthly_pay, bedrooms, bathrooms, land, construction, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
     const values = [type, address, price, monthly_pay, bedrooms, bathrooms, land, construction, description];
@@ -107,7 +107,19 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
           }
           return res.status(500).json({ error: 'Error al registrar el usuario.' });
         }
-        res.status(201).json({ message: 'Usuario registrado con éxito.' });
+        const userId = result.insertId;
+        const token = jwt.sign({ id: userId, email }, process.env.JWT_SECRET, {
+        expiresIn: '1h',
+        });
+        res.status(201).json({
+            message: 'Usuario registrado con éxito.',
+            token,
+            user: {
+              id: userId,
+              name,
+              email,
+            },
+          });
         console.log('Usuario agregado correctamente')
       });
     } catch (error) {
@@ -140,4 +152,11 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
       console.log('Login exitoso')
       res.json({ message: 'Login exitoso.', token, user: { id: user.id, name: user.name, email: user.email } });
     });
+  });
+
+  //  Auth endpoint
+
+  // Endpoint para validar token
+  app.get('/auth/validate', authenticateToken, (req, res) => {
+    res.json({ valid: true });
   });
