@@ -43,9 +43,75 @@ app.listen(port, '0.0.0.0', () => {
 
 // Add property
 app.post('/properties/add', authenticateToken, (req, res) => {
-    const { type, address, price, monthly_pay, bedrooms, bathrooms, land, construction, description } = req.body;
-    const query = 'INSERT INTO properties (type, address, price, monthly_pay, bedrooms, bathrooms, land, construction, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
-    const values = [type, address, price, monthly_pay, bedrooms, bathrooms, land, construction, description];
+  const {
+    type,
+    address,
+    price,
+    monthly_pay,
+    bedrooms,
+    bathrooms,
+    half_bathrooms,
+    land,
+    construction,
+    description,
+    sell_rent,
+    date_build,
+    estate_type,
+    parking_spaces,
+    stories,
+    private_pool,
+    new_construction,
+    water_serv,
+    electricity_serv,
+    sewer_serv,
+    garbage_collection_serv,
+    solar,
+    ac,
+    laundry_room,
+    lat,
+    lng
+  } = req.body;
+  const query = `
+    INSERT INTO properties (
+      type, address, price, monthly_pay,
+      bedrooms, bathrooms, half_bathrooms,
+      land, construction, description,
+      sell_rent, date_build, estate_type,
+      parking_spaces, stories,
+      private_pool, new_construction,
+      water_serv, electricity_serv,
+      sewer_serv, garbage_collection_serv,
+      solar, ac, laundry_room, lat, lng
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `;
+  const values = [
+    type,
+    address,
+    price || null,
+    monthly_pay || null,
+    bedrooms,
+    bathrooms,
+    half_bathrooms || null,
+    land,
+    construction,
+    description || null,
+    sell_rent || null,
+    date_build || null,
+    estate_type || null,
+    parking_spaces || null,
+    stories || null,
+    private_pool ? 1 : 0,
+    new_construction ? 1 : 0,
+    water_serv ? 1 : 0,
+    electricity_serv ? 1 : 0,
+    sewer_serv ? 1 : 0,
+    garbage_collection_serv ? 1 : 0,
+    solar ? 1 : 0,
+    ac ? 1 : 0,
+    laundry_room ? 1 : 0,
+    lat || null,
+    lng || null
+  ];
   
     pool.query(query, values, (err, results) => {
         if (err) {
@@ -58,19 +124,57 @@ app.post('/properties/add', authenticateToken, (req, res) => {
     });
 });
 
-// Get all properties
+// Get properties in a specific region
 app.get('/properties', (req, res) => {
-    const query = 'SELECT * FROM properties';
+  const { minLat, maxLat, minLng, maxLng } = req.query;
+  if (
+    minLat === undefined || maxLat === undefined ||
+    minLng === undefined || maxLng === undefined
+  ) {
+    return res.status(400).json({ error: 'Faltan parámetros de región' });
+  }
+  const query = `
+    SELECT 
+      id,
+      address,
+      lat,
+      lng,
+      type,
+      price,
+      monthly_pay,
+      bedrooms,
+      bathrooms,
+      land,
+      construction,
+      description
+    FROM properties
+    WHERE lat BETWEEN ? AND ?
+      AND lng BETWEEN ? AND ?
+  `;
 
-    pool.query(query, (err, results) => {
-        if (err) {
-            console.error('Error fetching properties:', err);
-            res.status(500).json({ error: 'Failed to fetch properties' });
-            return;
-        }
-        console.log('All properties fetched successfully')
-        res.json(results);
-    });
+  pool.query(
+    query,
+    [Number(minLat), Number(maxLat), Number(minLng), Number(maxLng)],
+    (err, results) => {
+      if (err) {
+        console.error('Error fetching properties:', err);
+        res.status(500).json({ error: 'Failed to fetch properties' });
+        return;
+      }
+      res.json(results);
+    }
+  );
+});
+
+// Get property by id
+app.get('/properties/:id', (req, res) => {
+  const { id } = req.params;
+  pool.query('SELECT * FROM properties WHERE id = ?', [id], (err, results) => {
+    if (err) return res.status(500).json({ error: 'Error al buscar la propiedad' });
+    if (results.length === 0) return res.status(404).json({ error: 'No encontrada' });
+    console.log('Got property with id: ', id)
+    res.json(results[0]);
+  });
 });
 
 // Delete property
@@ -147,7 +251,7 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
       }
   
       const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, {
-        expiresIn: '1m',
+        expiresIn: '1h',
       });
       console.log('Login exitoso')
       res.json({ message: 'Login exitoso.', token, user: { id: user.id, name: user.name, email: user.email } });
