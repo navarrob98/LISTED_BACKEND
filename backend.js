@@ -203,8 +203,8 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
     }
     try {
       const hashedPassword = await bcrypt.hash(password, 10);
-      const query = 'INSERT INTO users (name, email, password) VALUES (?, ?, ?)';
-      pool.query(query, [name, email, hashedPassword], (err, result) => {
+      const query = "INSERT INTO users (name, email, password, type) VALUES (?, ?, ?, ?)";
+      pool.query(query, [name, email, hashedPassword, 'regular'], (err, result) => {
         if (err) {
           if (err.code === 'ER_DUP_ENTRY') {
             return res.status(400).json({ error: 'El correo ya está registrado.' });
@@ -221,12 +221,53 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
             user: {
               id: userId,
               name,
-              email,
+              email, 
+              type: 'regular'
             },
           });
         console.log('Usuario agregado correctamente')
       });
     } catch (error) {
+      res.status(500).json({ error: 'Error interno del servidor.' });
+    }
+  });
+
+  // Register new agent
+  app.post('/agents/register', async (req, res) => {
+    const { name, email, password, phone, license } = req.body;
+    if (!name || !email || !password) {
+        return res.status(400).json({ error: 'Faltan datos obligatorios.' });
+    }
+    try {
+      const hashedPassword = await bcrypt.hash(password, 10);
+      const query = "INSERT INTO users (name, email, password, phone, license, type ) VALUES (?, ?, ?, ?, ?, ?)";
+      pool.query(query, [name, email, hashedPassword, phone, license, 'agente'], (err, result) => {
+        if (err) {
+          if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({ error: "El email ya existe" });
+          }
+          return res.status(500).json({ error: 'Error al registrar el usuario.' });
+        }
+        const userId = result.insertId;
+        const token = jwt.sign({ id: userId, email }, process.env.JWT_SECRET, {
+        expiresIn: '1h',
+        });
+        res.status(201).json({
+            message: 'Usuario registrado con éxito.',
+            token,
+            user: {
+              id: userId,
+              name,
+              email,
+              phone,
+              license,
+              type: 'agente'
+            },
+          });
+        console.log('Usuario agregado correctamente')
+      });
+    } catch (error) {
+      console.log('error:', error);
       res.status(500).json({ error: 'Error interno del servidor.' });
     }
   });
