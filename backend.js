@@ -69,8 +69,9 @@ app.post('/properties/add', authenticateToken, (req, res) => {
     ac,
     laundry_room,
     lat,
-    lng
+    lng,
   } = req.body;
+  const created_by = req.user.id;
   const query = `
     INSERT INTO properties (
       type, address, price, monthly_pay,
@@ -81,8 +82,8 @@ app.post('/properties/add', authenticateToken, (req, res) => {
       private_pool, new_construction,
       water_serv, electricity_serv,
       sewer_serv, garbage_collection_serv,
-      solar, ac, laundry_room, lat, lng
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      solar, ac, laundry_room, lat, lng, created_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `;
   const values = [
     type,
@@ -110,7 +111,8 @@ app.post('/properties/add', authenticateToken, (req, res) => {
     ac ? 1 : 0,
     laundry_room ? 1 : 0,
     lat || null,
-    lng || null
+    lng || null,
+    created_by
   ];
   
     pool.query(query, values, (err, results) => {
@@ -122,6 +124,17 @@ app.post('/properties/add', authenticateToken, (req, res) => {
         console.log('Property saved successfully')
         res.json({ message: 'Property saved successfully', insertId: results.insertId });
     });
+});
+
+// Edit property by id
+app.put('/properties/:id', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  const { address, price, bedrooms, bathrooms } = req.body;
+  const query = 'UPDATE properties SET address = ?, price = ?, bedrooms = ?, bathrooms = ? WHERE id = ? AND created_by = ?';
+  pool.query(query, [address, price, bedrooms, bathrooms, id, req.user.id], (err, results) => {
+    if (err) return res.status(500).json({ error: 'No se pudo actualizar' });
+    res.json({ message: 'Actualizada' });
+  });
 });
 
 // Get properties in a specific region
@@ -174,6 +187,26 @@ app.get('/properties/:id', (req, res) => {
     if (results.length === 0) return res.status(404).json({ error: 'No encontrada' });
     console.log('Got property with id: ', id)
     res.json(results[0]);
+  });
+});
+
+// GET solo las del usuario logueado
+app.get('/my-properties', authenticateToken, (req, res) => {
+  const userId = req.user.id; // El id del usuario autenticado del token
+
+  const query = `
+    SELECT * FROM properties
+    WHERE created_by = ?
+    ORDER BY id DESC
+  `;
+  // console.log('Request to my-properties with', req, userId)
+  pool.query(query, [userId], (err, results) => {
+    if (err) {
+      console.error('Error getting user properties:', err);
+      return res.status(500).json({ error: 'Error al obtener tus propiedades.' });
+    }
+    console.log('Results: ', results)
+    res.json(results);
   });
 });
 
@@ -291,11 +324,21 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
         return res.status(401).json({ error: 'Contraseña incorrecta.' });
       }
   
-      const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, {
+      // Incluye el tipo de usuario en el token si quieres
+      const token = jwt.sign({ id: user.id, email: user.email, user_type: user.type }, process.env.JWT_SECRET, {
         expiresIn: '1h',
       });
-      console.log('Login exitoso')
-      res.json({ message: 'Login exitoso.', token, user: { id: user.id, name: user.name, email: user.email } });
+  
+      res.json({
+        message: 'Login exitoso.',
+        token,
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          user_type: user.type,
+        },
+      });
     });
   });
 
@@ -303,5 +346,19 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
 
   // Endpoint para validar token
   app.get('/auth/validate', authenticateToken, (req, res) => {
-    res.json({ valid: true });
+    const { id, email, type } = req.user;
+    const query = 'SELECT name, email, type FROM users WHERE id = ? LIMIT 1';
+    pool.query(query, [id], (err, results) => {
+      if (err || results.length === 0) {
+        return res.status(401).json({ error: 'Usuario no encontrado.' });
+      }
+      const user = results[0];
+      res.json({
+        valid: true,
+        id,
+        name: user.name,
+        email: user.email,
+        user_type: user.type,
+      });
+    });
   });
