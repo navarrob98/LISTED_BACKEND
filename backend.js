@@ -129,11 +129,45 @@ app.post('/properties/add', authenticateToken, (req, res) => {
 // Edit property by id
 app.put('/properties/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
-  const { address, price, bedrooms, bathrooms } = req.body;
-  const query = 'UPDATE properties SET address = ?, price = ?, bedrooms = ?, bathrooms = ? WHERE id = ? AND created_by = ?';
-  pool.query(query, [address, price, bedrooms, bathrooms, id, req.user.id], (err, results) => {
-    if (err) return res.status(500).json({ error: 'No se pudo actualizar' });
-    res.json({ message: 'Actualizada' });
+  const fields = req.body; // todos los campos que el cliente quiera actualizar
+  if (!id || Object.keys(fields).length === 0) {
+    return res.status(400).json({ error: 'Faltan parámetros' });
+  }
+
+  // Solo permite actualizar campos válidos, evita SQL injection:
+  const allowedFields = [
+    'type','price','monthly_pay','images','address','bedrooms','bathrooms','half_bathrooms',
+    'land','construction','sell_rent','date_build','home_type','parking_spaces','stories',
+    'private_pool','new_construction','water_serv','electricity_serv','sewer_serv',
+    'garbage_collection_serv','solar','ac','laundry_room','description','lat','lng'
+  ];
+
+  // Filtra solo los campos que sí puedes actualizar
+  const setFields = [];
+  const values = [];
+  for (const key in fields) {
+    if (allowedFields.includes(key)) {
+      setFields.push(`${key} = ?`);
+      values.push(fields[key]);
+    }
+  }
+
+  if (setFields.length === 0) {
+    return res.status(400).json({ error: 'No hay campos válidos para actualizar' });
+  }
+
+  values.push(id, req.user.id);
+
+  const query = `
+    UPDATE properties
+    SET ${setFields.join(', ')}
+    WHERE id = ? AND created_by = ?
+  `;
+
+  pool.query(query, values, (err, results) => {
+    if (err) return res.status(500).json({ error: 'No se pudo actualizar', details: err });
+    if (results.affectedRows === 0) return res.status(404).json({ error: 'Propiedad no encontrada o no autorizada' });
+    res.json({ message: 'Actualizada', updatedFields: setFields.map(f => f.split('=')[0].trim()) });
   });
 });
 
@@ -147,19 +181,7 @@ app.get('/properties', (req, res) => {
     return res.status(400).json({ error: 'Faltan parámetros de región' });
   }
   const query = `
-    SELECT 
-      id,
-      address,
-      lat,
-      lng,
-      type,
-      price,
-      monthly_pay,
-      bedrooms,
-      bathrooms,
-      land,
-      construction,
-      description
+    SELECT *
     FROM properties
     WHERE lat BETWEEN ? AND ?
       AND lng BETWEEN ? AND ?
