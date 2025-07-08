@@ -327,42 +327,75 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
     }
   });
   
-  // User log in
-  app.post('/users/login', (req, res) => {
-    const { email, password } = req.body;
-    const query = 'SELECT * FROM users WHERE email = ?';
-  
-    pool.query(query, [email], async (err, results) => {
-      if (err) return res.status(500).json({ error: 'Error al buscar el usuario.' });
-  
-      if (results.length === 0) {
-        return res.status(400).json({ error: 'Usuario no encontrado.' });
-      }
-  
-      const user = results[0];
-      const isValid = await bcrypt.compare(password, user.password);
-  
-      if (!isValid) {
-        return res.status(401).json({ error: 'Contraseña incorrecta.' });
-      }
-  
-      // Incluye el tipo de usuario en el token si quieres
-      const token = jwt.sign({ id: user.id, email: user.email, user_type: user.type }, process.env.JWT_SECRET, {
-        expiresIn: '1h',
-      });
-  
-      res.json({
-        message: 'Login exitoso.',
-        token,
-        user: {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          user_type: user.type,
-        },
-      });
+// User log in
+app.post('/users/login', (req, res) => {
+  const { email, password } = req.body;
+  const query = 'SELECT * FROM users WHERE email = ?';
+
+  pool.query(query, [email], async (err, results) => {
+    if (err) return res.status(500).json({ error: 'Error al buscar el usuario.' });
+
+    if (results.length === 0) {
+      return res.status(400).json({ error: 'Usuario no encontrado.' });
+    }
+
+    const user = results[0];
+    const isValid = await bcrypt.compare(password, user.password);
+
+    if (!isValid) {
+      return res.status(401).json({ error: 'Contraseña incorrecta.' });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, email: user.email, user_type: user.type },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    res.json({
+      message: 'Login exitoso.',
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone ?? null, 
+        user_type: user.type ?? null
+      },
     });
   });
+});
+
+app.put('/users/:id', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  const { phone, email, password } = req.body;
+  let updates = [];
+  let values = [];
+
+  if (phone !== undefined) { updates.push('phone = ?'); values.push(phone); }
+  if (email !== undefined) { updates.push('email = ?'); values.push(email); }
+  if (password !== undefined) {
+    const hashedPassword = bcrypt.hashSync(password, 10);
+    updates.push('password = ?');
+    values.push(hashedPassword);
+  }
+
+  if (updates.length === 0) return res.status(400).json({ error: 'Nada que actualizar' });
+
+  values.push(id);
+
+  pool.query(
+    `UPDATE users SET ${updates.join(', ')} WHERE id = ?`,
+    values,
+    (err, results) => {
+      if (err) return res.status(500).json({ error: 'No se pudo actualizar' });
+      pool.query('SELECT id, name, email, phone FROM users WHERE id = ?', [id], (err2, rows) => {
+        if (err2 || !rows[0]) return res.json({ message: 'Actualizado' });
+        res.json(rows[0]);
+      });
+    }
+  );
+});
 
   //  Auth endpoint
 
@@ -382,5 +415,58 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
         email: user.email,
         user_type: user.type,
       });
+      console.log('auth: ', user);
+    });
+  });
+
+  // Buying Power endpoints
+
+  // POST Guardar Buying Power
+  app.post('/api/buying-power', (req, res) => {
+    const { user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price } = req.body;
+    if (!user_id) return res.status(400).json({ error: 'user_id es requerido' });
+  
+    const query = `
+      INSERT INTO buying_power
+        (user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        annual_income = VALUES(annual_income),
+        down_payment = VALUES(down_payment),
+        monthly_debt = VALUES(monthly_debt),
+        monthly_target = VALUES(monthly_target),
+        loan_years = VALUES(loan_years),
+        target_price = VALUES(target_price),
+        updated_at = CURRENT_TIMESTAMP
+    `;
+    const values = [user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price];
+  
+    pool.query(query, values, (err, result) => {
+      if (err) {
+        console.error('Error guardando buying power:', err);
+        return res.status(500).json({ error: 'Error guardando datos' });
+      }
+      res.json({ ok: true, message: "Buying power guardado o actualizado" });
+    });
+  });
+
+// GET Consultar Buying Power de un usuario
+  app.get('/api/buying-power/:user_id', (req, res) => {
+    const { user_id } = req.params;
+
+    const query = `
+      SELECT * FROM buying_power
+      WHERE user_id = ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+
+    pool.query(query, [user_id], (err, results) => {
+      if (err) {
+        console.error('Error consultando buying power:', err);
+        return res.status(500).json({ error: 'Error consultando datos' });
+      }
+      if (results.length === 0) return res.status(404).json({ error: "No encontrado" });
+      res.json(results[0]);
     });
   });
