@@ -1,6 +1,8 @@
 require('dotenv').config({ path: 'temporary.env' });
 
 const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 const mysql = require('mysql2');
 const bodyParser = require('body-parser');
 const cors = require('cors');
@@ -11,7 +13,6 @@ const authenticateToken = require('./middleware/authenticateToken');
 const app = express();
 const port = 3000;
 const dbPassword = process.env.DB_KEY;
-const jwtSecret = process.env.JWT_SECRET;
 
 // Middleware
 app.use(cors());
@@ -35,12 +36,13 @@ pool.getConnection((err, connection) => {
     connection.release();
 });
 
-// Property Endpoints
-
-app.listen(port, '0.0.0.0', () => {
-    console.log(`Backend server listening on port ${port}`);
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+server.listen(port, '0.0.0.0', () => {
+  console.log(`Backend server + Socket.io listening on port ${port}`);
 });
 
+// Property Endpoints
 // Add property
 app.post('/properties/add', authenticateToken, (req, res) => {
   const {
@@ -70,6 +72,7 @@ app.post('/properties/add', authenticateToken, (req, res) => {
     laundry_room,
     lat,
     lng,
+    images
   } = req.body;
   const created_by = req.user.id;
   const query = `
@@ -115,15 +118,47 @@ app.post('/properties/add', authenticateToken, (req, res) => {
     created_by
   ];
   
-    pool.query(query, values, (err, results) => {
-        if (err) {
-            console.error('Error saving property:', err);
-            res.status(500).json({ error: 'Failed to save property' });
+  pool.query(query, values, (err, results) => {
+    if (err) {
+      console.error('Error saving property:', err);
+      res.status(500).json({ error: 'Failed to save property' });
+      return;
+    }
+
+    const propertyId = results.insertId;
+    // Guardar imágenes si existen
+    if (Array.isArray(images) && images.length > 0) {
+      // Prepara los datos
+      const imageValues = images.map(url => [propertyId, url]);
+      // Inserta todas las imágenes en un solo query
+      pool.query(
+        'INSERT INTO property_images (property_id, image_url) VALUES ?',
+        [imageValues],
+        (imgErr, imgResults) => {
+          if (imgErr) {
+            console.error('Error saving images:', imgErr);
+            // Se guarda la propiedad aunque falle una imagen
+            res.status(201).json({ 
+              message: 'Property saved, but failed to save some images', 
+              propertyId 
+            });
             return;
+          }
+          // Todo OK
+          res.status(201).json({ 
+            message: 'Property and images saved successfully', 
+            propertyId 
+          });
         }
-        console.log('Property saved successfully')
-        res.json({ message: 'Property saved successfully', insertId: results.insertId });
-    });
+      );
+    } else {
+      // Si no hay imágenes, responde normal
+      res.status(201).json({ 
+        message: 'Property saved successfully', 
+        propertyId 
+      });
+    }
+  });
 });
 
 // Edit property by id
@@ -181,8 +216,9 @@ app.get('/properties', (req, res) => {
     return res.status(400).json({ error: 'Faltan parámetros de región' });
   }
   const query = `
-    SELECT *
-    FROM properties
+    SELECT p.*, 
+      (SELECT image_url FROM property_images pi WHERE pi.property_id = p.id LIMIT 1) AS images
+    FROM properties p
     WHERE lat BETWEEN ? AND ?
       AND lng BETWEEN ? AND ?
   `;
@@ -204,30 +240,61 @@ app.get('/properties', (req, res) => {
 // Get property by id
 app.get('/properties/:id', (req, res) => {
   const { id } = req.params;
-  pool.query('SELECT * FROM properties WHERE id = ?', [id], (err, results) => {
-    if (err) return res.status(500).json({ error: 'Error al buscar la propiedad' });
-    if (results.length === 0) return res.status(404).json({ error: 'No encontrada' });
-    console.log('Got property with id: ', id)
-    res.json(results[0]);
-  });
+
+  pool.query(
+    `
+      SELECT properties.*, users.name as owner_name 
+      FROM properties
+      JOIN users ON properties.created_by = users.id
+      WHERE properties.id = ?
+    `, 
+    [id], 
+    (err, results) => {
+      if (err) return res.status(500).json({ error: 'Error al buscar la propiedad' });
+      if (results.length === 0) return res.status(404).json({ error: 'No encontrada' });
+
+      const property = results[0];
+
+      // Ahora consulta las imágenes
+      pool.query(
+        `SELECT image_url FROM property_images WHERE property_id = ?`, 
+        [id], 
+        (imgErr, imgResults) => {
+          if (imgErr) {
+            console.error('Error fetching images:', imgErr);
+            return res.json({ ...property, images: [] });
+          }
+          const images = imgResults.map(img => img.image_url);
+          res.json({ ...property, images });
+        }
+      );
+    }
+  );
 });
 
-// GET solo las del usuario logueado
 app.get('/my-properties', authenticateToken, (req, res) => {
-  const userId = req.user.id; // El id del usuario autenticado del token
+  const userId = req.user.id;
 
   const query = `
-    SELECT * FROM properties
-    WHERE created_by = ?
-    ORDER BY id DESC
+    SELECT 
+      p.*, 
+      (
+        SELECT image_url 
+        FROM property_images 
+        WHERE property_id = p.id 
+        ORDER BY id ASC 
+        LIMIT 1
+      ) AS images
+    FROM properties p
+    WHERE p.created_by = ?
+    ORDER BY p.id DESC
   `;
-  // console.log('Request to my-properties with', req, userId)
+
   pool.query(query, [userId], (err, results) => {
     if (err) {
       console.error('Error getting user properties:', err);
       return res.status(500).json({ error: 'Error al obtener tus propiedades.' });
     }
-    console.log('Results: ', results)
     res.json(results);
   });
 });
@@ -366,6 +433,20 @@ app.post('/users/login', (req, res) => {
   });
 });
 
+// Get user name (and optionally more data) by id
+app.get('/users/:id', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  pool.query(
+    'SELECT id, name, email FROM users WHERE id = ? LIMIT 1',
+    [id],
+    (err, results) => {
+      if (err) return res.status(500).json({ error: 'Error buscando usuario' });
+      if (!results.length) return res.status(404).json({ error: 'No encontrado' });
+      res.json(results[0]);
+    }
+  );
+});
+
 app.put('/users/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
   const { phone, email, password } = req.body;
@@ -470,3 +551,169 @@ app.put('/users/:id', authenticateToken, (req, res) => {
       res.json(results[0]);
     });
   });
+
+  // Chat socket.io endpoints
+
+  io.on('connection', (socket) => {
+    // Recibe el userId del usuario conectado
+    socket.on('join', ({ userId }) => {
+      if (userId) {
+        socket.join('user_' + userId); // cada usuario en su sala única
+      }
+    });
+
+  // Enviar mensaje
+  socket.on('send_message', (data) => {
+    // data = { sender_id, receiver_id, property_id, message }
+    const { sender_id, receiver_id, property_id, message } = data;
+    if (!sender_id || !receiver_id || !message) return;
+
+    // Guarda el mensaje en la BD
+    const query = `
+      INSERT INTO chat_messages (property_id, sender_id, receiver_id, message)
+      VALUES (?, ?, ?, ?)
+    `;
+    pool.query(query, [property_id || null, sender_id, receiver_id, message], (err, result) => {
+      if (err) return;
+      const msgObj = {
+        id: result.insertId,
+        property_id,
+        sender_id,
+        receiver_id,
+        message,
+        created_at: new Date()
+      };
+      // Emite a ambos usuarios (receptor y emisor)
+      io.to('user_' + sender_id).emit('receive_message', msgObj);
+      io.to('user_' + receiver_id).emit('receive_message', msgObj);
+    });
+  });
+});
+
+// GET Cargar historial entre dos usuarios y opcional por propiedad
+app.get('/api/chat/messages', authenticateToken, (req, res) => {
+  const { user_id, property_id } = req.query;
+  const me = req.user.id;
+  if (!user_id) return res.status(400).json({ error: 'Faltan campos' });
+
+  let query = `
+    SELECT * FROM chat_messages
+    WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+  `;
+  const params = [me, user_id, user_id, me];
+  if (property_id) {
+    query += ' AND property_id = ?';
+    params.push(property_id);
+  }
+  query += ' ORDER BY created_at ASC';
+
+  // Marca los mensajes recibidos como leídos
+  const markAsRead = `
+    UPDATE chat_messages
+    SET is_read = 1
+    WHERE receiver_id = ? AND sender_id = ? AND (property_id = ? OR ? IS NULL)
+  `;
+
+  pool.query(query, params, (err, results) => {
+    if (err) return res.status(500).json({ error: 'No se pudo obtener los mensajes' });
+
+    // Marcar como leídos solo si hay property_id (ajusta según tu lógica)
+    pool.query(markAsRead, [me, user_id, property_id || null, property_id || null], (err2) => {
+      // No importa si hay error aquí para mostrar mensajes
+      res.json(results);
+    });
+  });
+});
+
+// GET Lista de conversaciones del usuario (resumen, no historial completo)
+app.get('/api/chat/my-chats', authenticateToken, (req, res) => {
+  const userId = req.user.id;
+  if (!userId) return res.status(400).json({ error: 'Falta user_id' });
+
+  const query = `
+    SELECT
+        t.chat_with_user_id,
+        u.name AS chat_with_user_name,
+        t.property_id,
+        p.address AS property_address,
+        p.price AS property_price,
+        p.monthly_pay AS property_monthly_pay,   -- agrega este
+        p.type AS property_type,
+        t.last_message_at,
+        t.last_message,
+        (
+          SELECT COUNT(*) FROM chat_messages m
+          WHERE m.sender_id = t.chat_with_user_id
+            AND m.receiver_id = ?
+            AND (m.property_id = t.property_id OR (m.property_id IS NULL AND t.property_id IS NULL))
+            AND m.is_read = 0
+        ) AS unread_count
+    FROM (
+        SELECT
+            IF(sender_id = ?, receiver_id, sender_id) AS chat_with_user_id,
+            property_id,
+            MAX(created_at) AS last_message_at,
+            SUBSTRING_INDEX(GROUP_CONCAT(message ORDER BY created_at DESC), ',', 1) AS last_message
+        FROM chat_messages
+        WHERE sender_id = ? OR receiver_id = ?
+        GROUP BY chat_with_user_id, property_id
+    ) t
+    JOIN users u ON u.id = t.chat_with_user_id
+    LEFT JOIN properties p ON t.property_id = p.id
+    ORDER BY t.last_message_at DESC
+    `;
+
+  const params = [userId, userId, userId, userId];
+
+  pool.query(query, params, (err, results) => {
+    if (err) {
+      console.error('Error en my-chats:', err);
+      return res.status(500).json({ error: 'Error fetching chats' });
+    }
+    res.json(results);
+  });
+});
+
+// PUT: Marcar mensajes como leídos
+app.put('/api/chat/mark-read', authenticateToken, (req, res) => {
+  console.log('removing...');
+  const { user_id, chat_with_user_id, property_id } = req.body;
+  if (!user_id || !chat_with_user_id) return res.status(400).json({ error: 'Faltan campos' });
+  let query = `
+    UPDATE chat_messages
+    SET is_read = 1
+    WHERE receiver_id = ?
+      AND sender_id = ?
+  `;
+  const params = [user_id, chat_with_user_id];
+  if (property_id) {
+    query += ' AND property_id = ?';
+    params.push(property_id);
+  } else {
+    query += ' AND property_id IS NULL';
+  }
+  pool.query(query, params, (err, result) => {
+    if (err) return res.status(500).json({ error: 'No se pudo marcar como leído' });
+    res.json({ ok: true });
+  });
+});
+
+app.delete('/api/chat/delete-chat', authenticateToken, (req, res) => {
+  const { user_id, chat_with_user_id, property_id } = req.body;
+  if (!user_id || !chat_with_user_id || !property_id) {
+    return res.status(400).json({ error: 'Faltan campos' });
+  }
+  const query = `
+    DELETE FROM chat_messages
+    WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+      AND property_id = ?
+  `;
+  const params = [user_id, chat_with_user_id, chat_with_user_id, user_id, property_id];
+  pool.query(query, params, (err, result) => {
+    if (err) {
+      console.error('Error eliminando chat:', err);
+      return res.status(500).json({ error: 'Error eliminando chat' });
+    }
+    res.json({ ok: true, deleted: result.affectedRows });
+  });
+});
