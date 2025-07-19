@@ -11,7 +11,7 @@ const jwt = require('jsonwebtoken');
 const authenticateToken = require('./middleware/authenticateToken');
 
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 const dbPassword = process.env.DB_KEY;
 
 // Middleware
@@ -19,11 +19,11 @@ app.use(cors());
 app.use(bodyParser.json());
 
 const pool = mysql.createPool({
-    host: 'localhost',
-    user: 'root',
-    password: dbPassword,
-    database: 'listed_property_sell',
-    connectionLimit: 10
+  host: process.env.MYSQLHOST,
+  user: process.env.MYSQLUSER,
+  password: process.env.MYSQLPASSWORD,
+  database: process.env.MYSQLDATABASE,
+  port: process.env.MYSQLPORT,
 });
 
 // Test database connection
