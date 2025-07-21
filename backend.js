@@ -416,7 +416,7 @@ app.post('/users/login', (req, res) => {
     const token = jwt.sign(
       { id: user.id, email: user.email, user_type: user.type },
       process.env.JWT_SECRET,
-      { expiresIn: '1h' }
+      { expiresIn: '3h' }
     );
 
     res.json({
@@ -565,15 +565,15 @@ app.put('/users/:id', authenticateToken, (req, res) => {
   // Enviar mensaje
   socket.on('send_message', (data) => {
     // data = { sender_id, receiver_id, property_id, message }
-    const { sender_id, receiver_id, property_id, message } = data;
-    if (!sender_id || !receiver_id || !message) return;
+    const { sender_id, receiver_id, property_id, message, file_url, file_name } = data;
+    if (!sender_id || !receiver_id || (!message && !file_url)) return;
 
     // Guarda el mensaje en la BD
     const query = `
-      INSERT INTO chat_messages (property_id, sender_id, receiver_id, message)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO chat_messages (property_id, sender_id, receiver_id, message, file_url, file_name )
+      VALUES (?, ?, ?, ?, ?, ?)
     `;
-    pool.query(query, [property_id || null, sender_id, receiver_id, message], (err, result) => {
+    pool.query(query, [property_id || null, sender_id, receiver_id, message, file_url, file_name], (err, result) => {
       if (err) return;
       const msgObj = {
         id: result.insertId,
@@ -581,7 +581,9 @@ app.put('/users/:id', authenticateToken, (req, res) => {
         sender_id,
         receiver_id,
         message,
-        created_at: new Date()
+        file_url,
+        file_name,
+        created_at: new Date().toISOString()
       };
       // Emite a ambos usuarios (receptor y emisor)
       io.to('user_' + sender_id).emit('receive_message', msgObj);
@@ -590,7 +592,7 @@ app.put('/users/:id', authenticateToken, (req, res) => {
   });
 });
 
-// GET Cargar historial entre dos usuarios y opcional por propiedad
+// GET Cargar historial entre dos usuarios y por propiedad
 app.get('/api/chat/messages', authenticateToken, (req, res) => {
   const { user_id, property_id } = req.query;
   const me = req.user.id;
@@ -676,7 +678,6 @@ app.get('/api/chat/my-chats', authenticateToken, (req, res) => {
 
 // PUT: Marcar mensajes como leídos
 app.put('/api/chat/mark-read', authenticateToken, (req, res) => {
-  console.log('removing...');
   const { user_id, chat_with_user_id, property_id } = req.body;
   if (!user_id || !chat_with_user_id) return res.status(400).json({ error: 'Faltan campos' });
   let query = `
