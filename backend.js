@@ -232,6 +232,7 @@ app.get('/properties', (req, res) => {
         res.status(500).json({ error: 'Failed to fetch properties' });
         return;
       }
+      console.log('get properties ping');
       res.json(results);
     }
   );
@@ -295,6 +296,7 @@ app.get('/my-properties', authenticateToken, (req, res) => {
       console.error('Error getting user properties:', err);
       return res.status(500).json({ error: 'Error al obtener tus propiedades.' });
     }
+    console.log('my properties endpoint ping');
     res.json(results);
   });
 });
@@ -316,17 +318,15 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
   });
 
   // User Endpoints
-
-  // Register new user
   app.post('/users/register', async (req, res) => {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) {
-        return res.status(400).json({ error: 'Faltan datos obligatorios.' });
+    const { name, last_name, email, password } = req.body;
+    if (!name || !last_name || !email || !password) {
+      return res.status(400).json({ error: 'Faltan datos obligatorios.' });
     }
     try {
       const hashedPassword = await bcrypt.hash(password, 10);
-      const query = "INSERT INTO users (name, email, password, type) VALUES (?, ?, ?, ?)";
-      pool.query(query, [name, email, hashedPassword, 'regular'], (err, result) => {
+      const query = "INSERT INTO users (name, last_name, email, password, type) VALUES (?, ?, ?, ?, ?)";
+      pool.query(query, [name, last_name, email, hashedPassword, 'regular'], (err, result) => {
         if (err) {
           if (err.code === 'ER_DUP_ENTRY') {
             return res.status(400).json({ error: 'El correo ya está registrado.' });
@@ -335,19 +335,20 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
         }
         const userId = result.insertId;
         const token = jwt.sign({ id: userId, email }, process.env.JWT_SECRET, {
-        expiresIn: '1h',
+          expiresIn: '1h',
         });
         res.status(201).json({
-            message: 'Usuario registrado con éxito.',
-            token,
-            user: {
-              id: userId,
-              name,
-              email, 
-              type: 'regular'
-            },
-          });
-        console.log('Usuario agregado correctamente')
+          message: 'Usuario registrado con éxito.',
+          token,
+          user: {
+            id: userId,
+            name,
+            last_name, // <-- Agregado
+            email, 
+            type: 'regular'
+          },
+        });
+        console.log('Usuario agregado correctamente');
       });
     } catch (error) {
       res.status(500).json({ error: 'Error interno del servidor.' });
@@ -356,14 +357,14 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
 
   // Register new agent
   app.post('/agents/register', async (req, res) => {
-    const { name, email, password, phone, license } = req.body;
-    if (!name || !email || !password) {
+    const { name, last_name, email, password, phone, license } = req.body;
+    if (!name || !last_name || !email || !password) {
         return res.status(400).json({ error: 'Faltan datos obligatorios.' });
     }
     try {
       const hashedPassword = await bcrypt.hash(password, 10);
-      const query = "INSERT INTO users (name, email, password, phone, license, type ) VALUES (?, ?, ?, ?, ?, ?)";
-      pool.query(query, [name, email, hashedPassword, phone, license, 'agente'], (err, result) => {
+      const query = "INSERT INTO users (name, last_name, email, password, phone, license, type ) VALUES (?, ?, ?, ?, ?, ?, ?)";
+      pool.query(query, [name, last_name, email, hashedPassword, phone, license, 'agente'], (err, result) => {
         if (err) {
           if (err.code === 'ER_DUP_ENTRY') {
             return res.status(400).json({ error: "El email ya existe" });
@@ -380,6 +381,7 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
             user: {
               id: userId,
               name,
+              last_name,
               email,
               phone,
               license,
@@ -425,6 +427,7 @@ app.post('/users/login', (req, res) => {
       user: {
         id: user.id,
         name: user.name,
+        last_name: user.last_name,
         email: user.email,
         phone: user.phone ?? null, 
         user_type: user.type ?? null
@@ -493,6 +496,7 @@ app.put('/users/:id', authenticateToken, (req, res) => {
         valid: true,
         id,
         name: user.name,
+        last_name: user.last_name,
         email: user.email,
         user_type: user.type,
       });
@@ -503,24 +507,25 @@ app.put('/users/:id', authenticateToken, (req, res) => {
   // Buying Power endpoints
 
   // POST Guardar Buying Power
-  app.post('/api/buying-power', (req, res) => {
-    const { user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price } = req.body;
+  app.post('/api/buying-power', authenticateToken, (req, res) => {
+    const { user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price_ideal, target_price_max } = req.body;
     if (!user_id) return res.status(400).json({ error: 'user_id es requerido' });
   
     const query = `
       INSERT INTO buying_power
-        (user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+        (user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price_ideal, target_price_max)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         annual_income = VALUES(annual_income),
         down_payment = VALUES(down_payment),
         monthly_debt = VALUES(monthly_debt),
         monthly_target = VALUES(monthly_target),
         loan_years = VALUES(loan_years),
-        target_price = VALUES(target_price),
+        target_price_ideal = VALUES(target_price_ideal),
+        target_price_max = VALUES(target_price_max),
         updated_at = CURRENT_TIMESTAMP
     `;
-    const values = [user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price];
+    const values = [user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price_ideal, target_price_max];
   
     pool.query(query, values, (err, result) => {
       if (err) {
@@ -532,7 +537,7 @@ app.put('/users/:id', authenticateToken, (req, res) => {
   });
 
 // GET Consultar Buying Power de un usuario
-  app.get('/api/buying-power/:user_id', (req, res) => {
+  app.get('/api/buying-power/:user_id', authenticateToken, (req, res) => {
     const { user_id } = req.params;
 
     const query = `
@@ -541,13 +546,14 @@ app.put('/users/:id', authenticateToken, (req, res) => {
       ORDER BY created_at DESC
       LIMIT 1
     `;
-
+    console.log(user_id);
     pool.query(query, [user_id], (err, results) => {
       if (err) {
         console.error('Error consultando buying power:', err);
         return res.status(500).json({ error: 'Error consultando datos' });
       }
       if (results.length === 0) return res.status(404).json({ error: "No encontrado" });
+      console.log(results[0]);
       res.json(results[0]);
     });
   });
@@ -716,5 +722,154 @@ app.delete('/api/chat/delete-chat', authenticateToken, (req, res) => {
       return res.status(500).json({ error: 'Error eliminando chat' });
     }
     res.json({ ok: true, deleted: result.affectedRows });
+  });
+});
+
+// Tenant profile Endpoints
+
+// POST Crear o actualizar perfil de rentero
+app.post('/api/tenant-profile', authenticateToken, (req, res) => {
+  const user_id = req.user.id;
+  const {
+    preferred_move_date,
+    preferred_contract_duration,
+    estimated_monthly_income,
+    has_guarantor,
+    guarantor_has_own_home,
+    family_size,
+    has_pets,
+    pets_count
+  } = req.body;
+
+  // Permite valores null (enviados como undefined del frontend)
+  const query = `
+    INSERT INTO tenant_profiles (
+      user_id, preferred_move_date, preferred_contract_duration,
+      estimated_monthly_income, has_guarantor, guarantor_has_own_home,
+      family_size, has_pets, pets_count
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      preferred_move_date = VALUES(preferred_move_date),
+      preferred_contract_duration = VALUES(preferred_contract_duration),
+      estimated_monthly_income = VALUES(estimated_monthly_income),
+      has_guarantor = VALUES(has_guarantor),
+      guarantor_has_own_home = VALUES(guarantor_has_own_home),
+      family_size = VALUES(family_size),
+      has_pets = VALUES(has_pets),
+      pets_count = VALUES(pets_count),
+      updated_at = CURRENT_TIMESTAMP
+  `;
+
+  pool.query(query, [
+    user_id,
+    preferred_move_date || null,
+    preferred_contract_duration || null,
+    estimated_monthly_income || null,
+    has_guarantor ? 1 : 0,
+    guarantor_has_own_home ? 1 : 0,
+    family_size || null,
+    has_pets ? 1 : 0,
+    pets_count || null
+  ], (err, result) => {
+    if (err) {
+      console.error('Error guardando tenant profile:', err);
+      return res.status(500).json({ error: 'Error guardando perfil de rentero' });
+    }
+    res.json({ ok: true, message: 'Perfil guardado correctamente' });
+  });
+});
+
+app.get('/api/tenant-profile/:user_id', authenticateToken, (req, res) => {
+  const { user_id } = req.params;
+  pool.query(
+    'SELECT * FROM tenant_profiles WHERE user_id = ? LIMIT 1',
+    [user_id],
+    (err, results) => {
+      if (err) {
+        console.error('Error consultando tenant profile:', err);
+        return res.status(500).json({ error: 'Error consultando perfil' });
+      }
+      if (!results.length) return res.status(404).json({ error: 'Perfil no encontrado' });
+      console.log('results: ', results);
+      res.json(results[0]);
+    }
+  );
+});
+
+// PUT: Actualizar cualquier campo del perfil de rentero del usuario autenticado
+app.put('/api/tenant-profile/:id', authenticateToken, (req, res) => {
+  const { id } = req.params;  // Este es el id del registro en tenant_profiles
+  const user_id = req.user.id;
+  const {
+    preferred_move_date,
+    preferred_contract_duration,
+    estimated_monthly_income,
+    has_guarantor,
+    guarantor_has_own_home,
+    family_size,
+    has_pets,
+    pets_count
+  } = req.body;
+
+  // Junta solo los campos enviados
+  const updates = [];
+  const values = [];
+
+  if (preferred_move_date !== undefined) {
+    updates.push('preferred_move_date = ?');
+    values.push(preferred_move_date || null);
+  }
+  if (preferred_contract_duration !== undefined) {
+    updates.push('preferred_contract_duration = ?');
+    values.push(preferred_contract_duration || null);
+  }
+  if (estimated_monthly_income !== undefined) {
+    updates.push('estimated_monthly_income = ?');
+    values.push(estimated_monthly_income || null);
+  }
+  if (has_guarantor !== undefined) {
+    updates.push('has_guarantor = ?');
+    values.push(has_guarantor ? 1 : 0);
+  }
+  if (guarantor_has_own_home !== undefined) {
+    updates.push('guarantor_has_own_home = ?');
+    values.push(guarantor_has_own_home ? 1 : 0);
+  }
+  if (family_size !== undefined) {
+    updates.push('family_size = ?');
+    values.push(family_size || null);
+  }
+  if (has_pets !== undefined) {
+    updates.push('has_pets = ?');
+    values.push(has_pets ? 1 : 0);
+  }
+  if (pets_count !== undefined) {
+    updates.push('pets_count = ?');
+    values.push(pets_count || null);
+  }
+
+  if (updates.length === 0) {
+    return res.status(400).json({ error: 'No se enviaron campos para actualizar' });
+  }
+
+  values.push(id, user_id);
+
+  // Verifica que el perfil pertenezca al usuario autenticado
+  const query = `
+    UPDATE tenant_profiles
+    SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND user_id = ?
+  `;
+
+  pool.query(query, values, (err, result) => {
+    if (err) {
+      console.error('Error actualizando tenant profile:', err);
+      return res.status(500).json({ error: 'Error actualizando perfil de rentero' });
+    }
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Perfil de rentero no encontrado o no autorizado' });
+    }
+    res.json({ ok: true, message: 'Perfil actualizado correctamente' });
   });
 });
