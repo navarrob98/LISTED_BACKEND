@@ -18,12 +18,20 @@ const dbPassword = process.env.DB_KEY;
 app.use(cors());
 app.use(bodyParser.json());
 
+// const pool = mysql.createPool({
+//   host: process.env.MYSQLHOST,
+//   user: process.env.MYSQLUSER,
+//   password: process.env.MYSQLPASSWORD,
+//   database: process.env.MYSQLDATABASE,
+//   port: process.env.MYSQLPORT,
+// });
+
 const pool = mysql.createPool({
-  host: process.env.MYSQLHOST,
-  user: process.env.MYSQLUSER,
-  password: process.env.MYSQLPASSWORD,
-  database: process.env.MYSQLDATABASE,
-  port: process.env.MYSQLPORT,
+  host: 'localhost',
+  user: 'root',
+  password: dbPassword,
+  database: 'listed_property_sell',
+  connectionLimit: 10
 });
 
 // Test database connection
@@ -355,46 +363,100 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
     }
   });
 
-  // Register new agent
-  app.post('/agents/register', async (req, res) => {
-    const { name, last_name, email, password, phone, license } = req.body;
-    if (!name || !last_name || !email || !password) {
-        return res.status(400).json({ error: 'Faltan datos obligatorios.' });
-    }
-    try {
-      const hashedPassword = await bcrypt.hash(password, 10);
-      const query = "INSERT INTO users (name, last_name, email, password, phone, license, type ) VALUES (?, ?, ?, ?, ?, ?, ?)";
-      pool.query(query, [name, last_name, email, hashedPassword, phone, license, 'agente'], (err, result) => {
-        if (err) {
-          if (err.code === 'ER_DUP_ENTRY') {
-            return res.status(400).json({ error: "El email ya existe" });
-          }
-          return res.status(500).json({ error: 'Error al registrar el usuario.' });
+// Register new agent
+app.post('/agents/register', async (req, res) => {
+  const { name, last_name, email, password, phone, license, work_start, work_end } = req.body;
+  if (!name || !last_name || !email || !password || !work_start || !work_end) {
+    return res.status(400).json({ error: 'Faltan datos obligatorios (incluyendo horario laboral).' });
+  }
+  // Validar formato HH:mm
+  const regex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+  if (!regex.test(work_start) || !regex.test(work_end)) {
+    return res.status(400).json({ error: 'Horario laboral en formato inválido. Usa HH:mm.' });
+  }
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const query = `
+      INSERT INTO users (name, last_name, email, password, phone, license, type, work_start, work_end)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    pool.query(query, [name, last_name, email, hashedPassword, phone, license, 'agente', work_start || null, work_end || null], (err, result) => {
+      if (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+          return res.status(400).json({ error: "El email ya existe" });
         }
-        const userId = result.insertId;
-        const token = jwt.sign({ id: userId, email }, process.env.JWT_SECRET, {
-        expiresIn: '1h',
-        });
-        res.status(201).json({
-            message: 'Usuario registrado con éxito.',
-            token,
-            user: {
-              id: userId,
-              name,
-              last_name,
-              email,
-              phone,
-              license,
-              type: 'agente'
-            },
-          });
-        console.log('Usuario agregado correctamente')
+        console.log(err);
+        return res.status(500).json({ error: 'Error al registrar el usuario.', err });
+      }
+      const userId = result.insertId;
+      const token = jwt.sign({ id: userId, email }, process.env.JWT_SECRET, {
+      expiresIn: '3h',
       });
-    } catch (error) {
-      console.log('error:', error);
-      res.status(500).json({ error: 'Error interno del servidor.' });
+      res.status(201).json({
+          message: 'Usuario registrado con éxito.',
+          token,
+          user: {
+            id: userId,
+            name,
+            last_name,
+            email,
+            phone,
+            license,
+            type: 'agente',
+            work_start: work_start || null,
+            work_end: work_end || null
+          },
+        });
+      console.log('Usuario agregado correctamente')
+    });
+  } catch (error) {
+    console.log('error:', error);
+    res.status(500).json({ error: 'Error interno del servidor.' });
+  }
+});
+
+// Actualizar horario laboral del agente (requiere token)
+app.put('/agents/:id/work-schedule', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  const { work_start, work_end } = req.body;
+
+  if (!work_start || !work_end) {
+    return res.status(400).json({ error: 'Debes enviar ambos campos: work_start y work_end.' });
+  }
+
+  const regex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+  if (!regex.test(work_start) || !regex.test(work_end)) {
+    return res.status(400).json({ error: 'Horario laboral en formato inválido. Usa HH:mm.' });
+  }
+
+  if (parseInt(id) !== req.user.id) {
+    return res.status(403).json({ error: 'No autorizado.' });
+  }
+
+  pool.query(
+    'UPDATE users SET work_start = ?, work_end = ? WHERE id = ? AND type = "agente"',
+    [work_start, work_end, id],
+    (err, result) => {
+      if (err) return res.status(500).json({ error: 'Error actualizando horario.' });
+      if (result.affectedRows === 0) return res.status(404).json({ error: 'No se actualizó (id no encontrado o no es agente).' });
+      res.json({ message: 'Horario actualizado correctamente.' });
     }
-  });
+  );
+});
+
+// Obtener horario laboral de un agente
+app.get('/agents/:id', (req, res) => {
+  const { id } = req.params;
+  pool.query(
+    'SELECT id, name, last_name, phone, work_start, work_end FROM users WHERE id = ? AND type = "agente" LIMIT 1',
+    [id],
+    (err, results) => {
+      if (err) return res.status(500).json({ error: 'Error al consultar el horario.' });
+      if (!results.length) return res.status(404).json({ error: 'Agente no encontrado.' });
+      res.json(results[0]);
+    }
+  );
+});
   
 // User log in
 app.post('/users/login', (req, res) => {
