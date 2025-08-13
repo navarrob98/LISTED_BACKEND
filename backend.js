@@ -169,48 +169,124 @@ app.post('/properties/add', authenticateToken, (req, res) => {
   });
 });
 
-// Edit property by id
+// Edit property by id (con manejo de imágenes por URL)
 app.put('/properties/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
-  const fields = req.body; // todos los campos que el cliente quiera actualizar
-  if (!id || Object.keys(fields).length === 0) {
+  const incoming = req.body || {};
+
+  if (!id || Object.keys(incoming).length === 0) {
     return res.status(400).json({ error: 'Faltan parámetros' });
   }
 
-  // Solo permite actualizar campos válidos, evita SQL injection:
-  const allowedFields = [
-    'type','price','monthly_pay','images','address','bedrooms','bathrooms','half_bathrooms',
-    'land','construction','sell_rent','date_build','home_type','parking_spaces','stories',
-    'private_pool','new_construction','water_serv','electricity_serv','sewer_serv',
-    'garbage_collection_serv','solar','ac','laundry_room','description','lat','lng'
-  ];
+  // 1) Manejo de imágenes (arrays opcionales)
+  const imagesAdd = Array.isArray(incoming.images_add) ? incoming.images_add.filter(Boolean) : [];
+  const imagesRemove = Array.isArray(incoming.images_remove_urls) ? incoming.images_remove_urls.filter(Boolean) : [];
 
-  // Filtra solo los campos que sí puedes actualizar
-  const setFields = [];
+  // 2) Campos permitidos de la tabla properties (según tu esquema)
+  const colTypes = {
+    address: 'string',
+    price: 'number',
+    monthly_pay: 'number',
+    bedrooms: 'int',
+    bathrooms: 'number',
+    land: 'number',
+    construction: 'number',
+    description: 'string',
+    type: 'string',
+    half_bathrooms: 'int',
+    sell_rent: 'string',
+    date_build: 'int',
+    estate_type: 'string',
+    parking_spaces: 'int',
+    stories: 'int',
+    private_pool: 'bool',
+    new_construction: 'bool',
+    water_serv: 'bool',
+    electricity_serv: 'bool',
+    sewer_serv: 'bool',
+    garbage_collection_serv: 'bool',
+    solar: 'bool',
+    ac: 'bool',
+    laundry_room: 'bool',
+    lat: 'float',
+    lng: 'float',
+  };
+
+  const setFragments = [];
   const values = [];
-  for (const key in fields) {
-    if (allowedFields.includes(key)) {
-      setFields.push(`${key} = ?`);
-      values.push(fields[key]);
+
+  const castValue = (val, type) => {
+    if (val === '' || val === undefined) return null;
+    if (type === 'string') return String(val).trim();
+    if (type === 'int') { const n = parseInt(val, 10); return Number.isFinite(n) ? n : null; }
+    if (type === 'float' || type === 'number') { const n = parseFloat(val); return Number.isFinite(n) ? n : null; }
+    if (type === 'bool') {
+      if (val === true || val === 'true' || val === 1 || val === '1') return 1;
+      if (val === false || val === 'false' || val === 0 || val === '0') return 0;
+      return val ? 1 : 0;
     }
+    return val;
+  };
+
+  for (const key of Object.keys(incoming)) {
+    if (!(key in colTypes)) continue;
+    const casted = castValue(incoming[key], colTypes[key]);
+    setFragments.push(`${key} = ?`);
+    values.push(casted);
   }
 
-  if (setFields.length === 0) {
-    return res.status(400).json({ error: 'No hay campos válidos para actualizar' });
-  }
+  // Verifica que el usuario sea dueño de la propiedad
+  const checkOwnerSql = `SELECT id FROM properties WHERE id = ? AND created_by = ?`;
+  pool.query(checkOwnerSql, [id, req.user.id], (chkErr, chkRows) => {
+    if (chkErr) return res.status(500).json({ error: 'Error de permisos' });
+    if (chkRows.length === 0) return res.status(403).json({ error: 'No autorizado' });
 
-  values.push(id, req.user.id);
+    // Inicia operaciones sobre imágenes
+    const doRemovals = (cb) => {
+      if (!imagesRemove.length) return cb();
+      const placeholders = imagesRemove.map(() => '?').join(',');
+      const delSql = `
+        DELETE FROM property_images
+        WHERE property_id = ? AND image_url IN (${placeholders})
+      `;
+      pool.query(delSql, [id, ...imagesRemove], (delErr) => cb(delErr));
+    };
 
-  const query = `
-    UPDATE properties
-    SET ${setFields.join(', ')}
-    WHERE id = ? AND created_by = ?
-  `;
+    const doAdds = (cb) => {
+      if (!imagesAdd.length) return cb();
+      const values = imagesAdd.map(url => [id, url]);
+      const insSql = `INSERT INTO property_images (property_id, image_url) VALUES ?`;
+      pool.query(insSql, [values], (insErr) => cb(insErr));
+    };
 
-  pool.query(query, values, (err, results) => {
-    if (err) return res.status(500).json({ error: 'No se pudo actualizar', details: err });
-    if (results.affectedRows === 0) return res.status(404).json({ error: 'Propiedad no encontrada o no autorizada' });
-    res.json({ message: 'Actualizada', updatedFields: setFields.map(f => f.split('=')[0].trim()) });
+    // Ejecuta: borrar → agregar → update properties
+    doRemovals((remErr) => {
+      if (remErr) return res.status(500).json({ error: 'No se pudieron eliminar imágenes' });
+
+      doAdds((addErr) => {
+        if (addErr) return res.status(500).json({ error: 'No se pudieron agregar imágenes' });
+
+        if (setFragments.length === 0) {
+          // No hay update de properties, solo imágenes
+          return res.json({ message: 'Actualizada (imágenes)', updatedFields: [] });
+        }
+
+        values.push(id, req.user.id);
+        const sql = `
+          UPDATE properties
+          SET ${setFragments.join(', ')}
+          WHERE id = ? AND created_by = ?
+        `;
+        pool.query(sql, values, (err, result) => {
+          if (err) return res.status(500).json({ error: 'No se pudo actualizar', details: err });
+          if (result.affectedRows === 0) return res.status(404).json({ error: 'Propiedad no encontrada o no autorizada' });
+          res.json({
+            message: 'Actualizada',
+            updatedFields: setFragments.map(f => f.split('=')[0].trim()),
+          });
+        });
+      });
+    });
   });
 });
 
@@ -514,7 +590,7 @@ app.get('/users/:id', authenticateToken, (req, res) => {
 
 app.put('/users/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
-  const { phone, email, password } = req.body;
+  const { phone, email, password, work_start, work_end, name, last_name } = req.body;
   let updates = [];
   let values = [];
 
@@ -525,6 +601,10 @@ app.put('/users/:id', authenticateToken, (req, res) => {
     updates.push('password = ?');
     values.push(hashedPassword);
   }
+  if (work_start !== undefined) { updates.push('work_start = ?'); values.push(work_start); }
+  if (work_end !== undefined) { updates.push('work_end = ?'); values.push(work_end); }
+  if (name !== undefined) { updates.push('name = ?'); values.push(name); }
+  if (last_name !== undefined) { updates.push('last_name = ?'); values.push(last_name); }
 
   if (updates.length === 0) return res.status(400).json({ error: 'Nada que actualizar' });
 
@@ -534,37 +614,43 @@ app.put('/users/:id', authenticateToken, (req, res) => {
     `UPDATE users SET ${updates.join(', ')} WHERE id = ?`,
     values,
     (err, results) => {
-      if (err) return res.status(500).json({ error: 'No se pudo actualizar' });
-      pool.query('SELECT id, name, email, phone FROM users WHERE id = ?', [id], (err2, rows) => {
-        if (err2 || !rows[0]) return res.json({ message: 'Actualizado' });
-        res.json(rows[0]);
-      });
+      if (err) {
+        console.log(err);
+        return res.status(500).json({ error: 'No se pudo actualizar' });}
+      pool.query(
+        'SELECT id, name, last_name, email, phone, work_start, work_end FROM users WHERE id = ?', 
+        [id], 
+        (err2, rows) => {
+          if (err2 || !rows[0]) return res.json({ message: 'Actualizado' });
+          res.json(rows[0]);
+        }
+      );
     }
   );
 });
 
   //  Auth endpoint
-
-  // Endpoint para validar token
-  app.get('/auth/validate', authenticateToken, (req, res) => {
-    const { id, email, type } = req.user;
-    const query = 'SELECT name, email, type FROM users WHERE id = ? LIMIT 1';
-    pool.query(query, [id], (err, results) => {
-      if (err || results.length === 0) {
-        return res.status(401).json({ error: 'Usuario no encontrado.' });
-      }
-      const user = results[0];
-      res.json({
-        valid: true,
-        id,
-        name: user.name,
-        last_name: user.last_name,
-        email: user.email,
-        user_type: user.type,
-      });
-      console.log('auth: ', user);
+// Endpoint para validar token
+app.get('/auth/validate', authenticateToken, (req, res) => {
+  const { id, email, type } = req.user;
+  const query = 'SELECT name, last_name, email, phone, type FROM users WHERE id = ? LIMIT 1';
+  pool.query(query, [id], (err, results) => {
+    if (err || results.length === 0) {
+      return res.status(401).json({ error: 'Usuario no encontrado.' });
+    }
+    const user = results[0];
+    res.json({
+      valid: true,
+      id,
+      name: user.name,
+      last_name: user.last_name,
+      email: user.email,
+      phone: user.phone,
+      user_type: user.type,
     });
+    console.log('auth: ', user);
   });
+});
 
   // Buying Power endpoints
 
@@ -630,35 +716,81 @@ app.put('/users/:id', authenticateToken, (req, res) => {
       }
     });
 
-  // Enviar mensaje
-  socket.on('send_message', (data) => {
-    // data = { sender_id, receiver_id, property_id, message }
-    const { sender_id, receiver_id, property_id, message, file_url, file_name } = data;
-    if (!sender_id || !receiver_id || (!message && !file_url)) return;
+    // Enviar mensaje
+    socket.on('send_message', (data) => {
+      // data = { sender_id, receiver_id, property_id, message }
+      const { sender_id, receiver_id, property_id, message, file_url, file_name } = data;
+      if (!sender_id || !receiver_id || (!message && !file_url)) return;
 
-    // Guarda el mensaje en la BD
-    const query = `
-      INSERT INTO chat_messages (property_id, sender_id, receiver_id, message, file_url, file_name )
-      VALUES (?, ?, ?, ?, ?, ?)
-    `;
-    pool.query(query, [property_id || null, sender_id, receiver_id, message, file_url, file_name], (err, result) => {
-      if (err) return;
-      const msgObj = {
-        id: result.insertId,
-        property_id,
-        sender_id,
-        receiver_id,
-        message,
-        file_url,
-        file_name,
-        created_at: new Date().toISOString()
-      };
-      // Emite a ambos usuarios (receptor y emisor)
-      io.to('user_' + sender_id).emit('receive_message', msgObj);
-      io.to('user_' + receiver_id).emit('receive_message', msgObj);
+      // Guarda el mensaje en la BD
+      const query = `
+        INSERT INTO chat_messages (property_id, sender_id, receiver_id, message, file_url, file_name )
+        VALUES (?, ?, ?, ?, ?, ?)
+      `;
+      pool.query(query, [property_id || null, sender_id, receiver_id, message, file_url, file_name], (err, result) => {
+        if (err) return;
+        const msgObj = {
+          id: result.insertId,
+          property_id,
+          sender_id,
+          receiver_id,
+          message,
+          file_url,
+          file_name,
+          created_at: new Date().toISOString()
+        };
+        pool.query(
+          `DELETE FROM hidden_chats
+           WHERE user_id = ? AND chat_with_user_id = ? AND (property_id <=> ?)`,
+          [receiver_id, sender_id, property_id ?? null],
+          (err2) => {
+            if (err2) {
+              console.error('Error limpiando hidden_chats:', err2);
+            }
+          }
+        );
+        // Emite a ambos usuarios (receptor y emisor)
+        io.to('user_' + sender_id).emit('receive_message', msgObj);
+        io.to('user_' + receiver_id).emit('receive_message', msgObj);
+      });
+
+    // Eliminar mensaje
+    socket.on('delete_message', ({ message_id, user_id }) => {
+      if (!message_id || !user_id) return;
+    
+      const q = `
+        SELECT sender_id, receiver_id, property_id
+        FROM chat_messages
+        WHERE id = ?
+        LIMIT 1
+      `;
+      pool.query(q, [message_id], (err, rows) => {
+        if (err || !rows.length) return;
+        const msg = rows[0];
+    
+        // autoriza solo participantes
+        if (String(msg.sender_id) !== String(user_id) &&
+            String(msg.receiver_id) !== String(user_id)) {
+          return;
+        }
+    
+        pool.query(
+          'UPDATE chat_messages SET is_deleted = 1 WHERE id = ?',
+          [message_id],
+          (updErr) => {
+            if (updErr) return;
+    
+            // notifica a ambos
+            io.to('user_' + msg.sender_id).emit('message_deleted', { message_id });
+            io.to('user_' + msg.receiver_id).emit('message_deleted', { message_id });
+          }
+        );
+      });
     });
   });
 });
+
+
 
 // GET Cargar historial entre dos usuarios y por propiedad
 app.get('/api/chat/messages', authenticateToken, (req, res) => {
@@ -667,8 +799,10 @@ app.get('/api/chat/messages', authenticateToken, (req, res) => {
   if (!user_id) return res.status(400).json({ error: 'Faltan campos' });
 
   let query = `
-    SELECT * FROM chat_messages
-    WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+  SELECT *
+  FROM chat_messages
+  WHERE is_deleted = 0
+    AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
   `;
   const params = [me, user_id, user_id, me];
   if (property_id) {
@@ -698,51 +832,83 @@ app.get('/api/chat/messages', authenticateToken, (req, res) => {
 // GET Lista de conversaciones del usuario (resumen, no historial completo)
 app.get('/api/chat/my-chats', authenticateToken, (req, res) => {
   const userId = req.user.id;
-  if (!userId) return res.status(400).json({ error: 'Falta user_id' });
 
-  const query = `
+  const sql = `
     SELECT
-        t.chat_with_user_id,
-        u.name AS chat_with_user_name,
-        t.property_id,
-        p.address AS property_address,
-        p.price AS property_price,
-        p.monthly_pay AS property_monthly_pay,   -- agrega este
-        p.type AS property_type,
-        t.last_message_at,
-        t.last_message,
-        (
-          SELECT COUNT(*) FROM chat_messages m
-          WHERE m.sender_id = t.chat_with_user_id
-            AND m.receiver_id = ?
-            AND (m.property_id = t.property_id OR (m.property_id IS NULL AND t.property_id IS NULL))
-            AND m.is_read = 0
-        ) AS unread_count
+      t.chat_with_user_id,
+      u.name AS chat_with_user_name,
+      t.property_id,
+      p.address AS property_address,
+      p.price        AS property_price,
+      p.monthly_pay  AS property_monthly_pay,
+      p.type         AS property_type,
+      cm.created_at  AS last_message_at,
+      cm.message     AS last_message,
+      (
+        SELECT COUNT(*)
+        FROM chat_messages m
+        WHERE m.sender_id = t.chat_with_user_id
+          AND m.receiver_id = ?
+          AND (m.property_id <=> t.property_id)
+          AND m.is_read = 0
+          AND m.is_deleted = 0
+      ) AS unread_count
     FROM (
-        SELECT
-            IF(sender_id = ?, receiver_id, sender_id) AS chat_with_user_id,
-            property_id,
-            MAX(created_at) AS last_message_at,
-            SUBSTRING_INDEX(GROUP_CONCAT(message ORDER BY created_at DESC), ',', 1) AS last_message
-        FROM chat_messages
-        WHERE sender_id = ? OR receiver_id = ?
-        GROUP BY chat_with_user_id, property_id
+      SELECT
+        IF(sender_id = ?, receiver_id, sender_id) AS chat_with_user_id,
+        property_id,
+        MAX(id) AS last_msg_id
+      FROM chat_messages
+      WHERE (sender_id = ? OR receiver_id = ?)
+        AND is_deleted = 0
+      GROUP BY chat_with_user_id, property_id
     ) t
-    JOIN users u ON u.id = t.chat_with_user_id
-    LEFT JOIN properties p ON t.property_id = p.id
-    ORDER BY t.last_message_at DESC
-    `;
+    JOIN chat_messages cm ON cm.id = t.last_msg_id
+    JOIN users u          ON u.id = t.chat_with_user_id
+    LEFT JOIN properties p ON p.id = t.property_id
+    LEFT JOIN hidden_chats h
+      ON h.user_id = ?
+     AND h.chat_with_user_id = t.chat_with_user_id
+     AND (h.property_id <=> t.property_id)
+    WHERE h.user_id IS NULL
+    ORDER BY cm.created_at DESC
+  `;
 
-  const params = [userId, userId, userId, userId];
+  // Orden: (1) unread_count.receiver_id, (2) IF(...), (3) WHERE sender_id, (4) WHERE receiver_id, (5) h.user_id
+  const params = [userId, userId, userId, userId, userId];
 
-  pool.query(query, params, (err, results) => {
+  pool.query(sql, params, (err, rows) => {
     if (err) {
       console.error('Error en my-chats:', err);
       return res.status(500).json({ error: 'Error fetching chats' });
     }
-    res.json(results);
+    res.json(rows);
   });
 });
+
+// Ocultar chat SOLO para el usuario actual
+app.post('/api/chat/hide-chat', authenticateToken, (req, res) => {
+  const userId = req.user.id;
+  const { chat_with_user_id, property_id } = req.body;
+  if (!chat_with_user_id) return res.status(400).json({ error: 'Faltan campos' });
+
+  const sql = `
+    INSERT INTO hidden_chats (user_id, chat_with_user_id, property_id)
+    VALUES (?, ?, ?)
+    ON DUPLICATE KEY UPDATE hidden_at = CURRENT_TIMESTAMP
+  `;
+  const params = [userId, chat_with_user_id, property_id ?? null];
+
+  pool.query(sql, params, (err, result) => {
+    if (err) {
+      console.error('[hide-chat] INSERT error:', err, { params });
+      return res.status(500).json({ error: 'No se pudo ocultar' });
+    }
+    console.log('[hide-chat] ok', { params, insertId: result.insertId });
+    res.json({ ok: true });
+  });
+});
+
 
 // PUT: Marcar mensajes como leídos
 app.put('/api/chat/mark-read', authenticateToken, (req, res) => {
