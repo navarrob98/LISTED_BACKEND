@@ -654,57 +654,82 @@ app.get('/auth/validate', authenticateToken, (req, res) => {
 
   // Buying Power endpoints
 
-  // POST Guardar Buying Power
-  app.post('/api/buying-power', authenticateToken, (req, res) => {
-    const { user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price_ideal, target_price_max } = req.body;
-    if (!user_id) return res.status(400).json({ error: 'user_id es requerido' });
-  
-    const query = `
-      INSERT INTO buying_power
-        (user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price_ideal, target_price_max)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        annual_income = VALUES(annual_income),
-        down_payment = VALUES(down_payment),
-        monthly_debt = VALUES(monthly_debt),
-        monthly_target = VALUES(monthly_target),
-        loan_years = VALUES(loan_years),
-        target_price_ideal = VALUES(target_price_ideal),
-        target_price_max = VALUES(target_price_max),
-        updated_at = CURRENT_TIMESTAMP
-    `;
-    const values = [user_id, annual_income, down_payment, monthly_debt, monthly_target, loan_years, target_price_ideal, target_price_max];
-  
-    pool.query(query, values, (err, result) => {
-      if (err) {
-        console.error('Error guardando buying power:', err);
-        return res.status(500).json({ error: 'Error guardando datos' });
-      }
-      res.json({ ok: true, message: "Buying power guardado o actualizado" });
-    });
-  });
+// POST: crear/actualizar buying power
+app.post('/api/buying-power', authenticateToken, (req, res) => {
+  const { 
+    user_id,
+    annual_income,
+    down_payment,
+    monthly_debt,
+    monthly_target,
+    annual_interest_rate, // DECIMAL(6,4) guardado como decimal (ej. 0.10 para 10%)
+    loan_years,
+    suggested_price       // DECIMAL(22,2)
+  } = req.body;
 
-// GET Consultar Buying Power de un usuario
-  app.get('/api/buying-power/:user_id', authenticateToken, (req, res) => {
-    const { user_id } = req.params;
+  if (!user_id) {
+    return res.status(400).json({ error: 'user_id es requerido' });
+  }
+  if (suggested_price === undefined || suggested_price === null) {
+    return res.status(400).json({ error: 'suggested_price es requerido' });
+  }
 
-    const query = `
-      SELECT * FROM buying_power
-      WHERE user_id = ?
-      ORDER BY created_at DESC
-      LIMIT 1
-    `;
-    console.log(user_id);
-    pool.query(query, [user_id], (err, results) => {
-      if (err) {
-        console.error('Error consultando buying power:', err);
-        return res.status(500).json({ error: 'Error consultando datos' });
-      }
-      if (results.length === 0) return res.status(404).json({ error: "No encontrado" });
-      console.log(results[0]);
-      res.json(results[0]);
-    });
+  const sql = `
+    INSERT INTO buying_power
+      (user_id, annual_income, down_payment, monthly_debt, monthly_target, annual_interest_rate, loan_years, suggested_price)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      annual_income       = VALUES(annual_income),
+      down_payment        = VALUES(down_payment),
+      monthly_debt        = VALUES(monthly_debt),
+      monthly_target      = VALUES(monthly_target),
+      annual_interest_rate= VALUES(annual_interest_rate),
+      loan_years          = VALUES(loan_years),
+      suggested_price     = VALUES(suggested_price),
+      updated_at          = CURRENT_TIMESTAMP
+  `;
+
+  const params = [
+    user_id,
+    annual_income ?? null,
+    down_payment ?? null,
+    monthly_debt ?? null,
+    monthly_target ?? null,
+    annual_interest_rate ?? null,
+    loan_years ?? null,
+    suggested_price ?? null,
+  ];
+
+  pool.query(sql, params, (err) => {
+    if (err) {
+      console.error('Error guardando buying power:', err);
+      return res.status(500).json({ error: 'Error guardando datos' });
+    }
+    res.json({ ok: true, message: 'Buying power guardado o actualizado' });
   });
+});
+
+// GET: obtener último buying power del usuario (incluye suggested_price y annual_interest_rate)
+app.get('/api/buying-power/:user_id', authenticateToken, (req, res) => {
+  const { user_id } = req.params;
+
+  const sql = `
+    SELECT *
+    FROM buying_power
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `;
+
+  pool.query(sql, [user_id], (err, rows) => {
+    if (err) {
+      console.error('Error consultando buying power:', err);
+      return res.status(500).json({ error: 'Error consultando datos' });
+    }
+    if (!rows.length) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  });
+});
 
   // Chat socket.io endpoints
 
@@ -837,6 +862,7 @@ app.get('/api/chat/my-chats', authenticateToken, (req, res) => {
     SELECT
       t.chat_with_user_id,
       u.name AS chat_with_user_name,
+      u.last_name AS chat_with_user_last_name,
       t.property_id,
       p.address AS property_address,
       p.price        AS property_price,
