@@ -409,7 +409,7 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
     }
     try {
       const hashedPassword = await bcrypt.hash(password, 10);
-      const query = "INSERT INTO users (name, last_name, email, password, type) VALUES (?, ?, ?, ?, ?)";
+      const query = "INSERT INTO users (name, last_name, email, password, agent_type) VALUES (?, ?, ?, ?, ?)";
       pool.query(query, [name, last_name, email, hashedPassword, 'regular'], (err, result) => {
         if (err) {
           if (err.code === 'ER_DUP_ENTRY') {
@@ -427,9 +427,9 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
           user: {
             id: userId,
             name,
-            last_name, // <-- Agregado
+            last_name,
             email, 
-            type: 'regular'
+            agent_type: 'regular'
           },
         });
         console.log('Usuario agregado correctamente');
@@ -441,53 +441,96 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
 
 // Register new agent
 app.post('/agents/register', async (req, res) => {
-  const { name, last_name, email, password, phone, license, work_start, work_end } = req.body;
+  const {
+    name,
+    last_name,
+    email,
+    password,
+    phone,
+    license,
+    work_start,
+    work_end,
+    agent_type,         // 'brokerage' | 'individual' | 'seller'
+    brokerage_name,     // opcional si agent_type === 'brokerage'
+    cities              // array de strings
+  } = req.body;
+
   if (!name || !last_name || !email || !password || !work_start || !work_end) {
     return res.status(400).json({ error: 'Faltan datos obligatorios (incluyendo horario laboral).' });
   }
-  // Validar formato HH:mm
-  const regex = /^([01]\d|2[0-3]):([0-5]\d)$/;
-  if (!regex.test(work_start) || !regex.test(work_end)) {
+
+  const hhmm = /^([01]\d|2[0-3]):([0-5]\d)$/;
+  if (!hhmm.test(work_start) || !hhmm.test(work_end)) {
     return res.status(400).json({ error: 'Horario laboral en formato inválido. Usa HH:mm.' });
   }
+
+  const ALLOWED_TYPES = new Set(['brokerage', 'individual', 'seller']);
+  const finalAgentType = ALLOWED_TYPES.has(agent_type) ? agent_type : 'individual';
+
+  let citiesArr = Array.isArray(cities) ? cities : [];
+  citiesArr = citiesArr
+    .map(c => (typeof c === 'string' ? c.trim() : ''))
+    .filter(Boolean);
+  citiesArr = [...new Set(citiesArr)].slice(0, 30).map(c => c.slice(0, 120));
+
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
-    const query = `
-      INSERT INTO users (name, last_name, email, password, phone, license, type, work_start, work_end)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+    const sql = `
+      INSERT INTO users
+        (name, last_name, email, password, phone, license, work_start, work_end, agent_type, brokerage_name, cities)
+      VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
-    pool.query(query, [name, last_name, email, hashedPassword, phone, license, 'agente', work_start || null, work_end || null], (err, result) => {
+
+    const params = [
+      name,
+      last_name,
+      email,
+      hashedPassword,
+      phone || null,
+      license || null,
+      work_start || null,
+      work_end || null,
+      finalAgentType,
+      finalAgentType === 'brokerage' ? (brokerage_name || null) : null,
+      citiesArr.length ? JSON.stringify(citiesArr) : null
+    ];
+
+    pool.query(sql, params, (err, result) => {
       if (err) {
         if (err.code === 'ER_DUP_ENTRY') {
-          return res.status(400).json({ error: "El email ya existe" });
+          return res.status(400).json({ error: 'El email ya existe' });
         }
-        console.log(err);
-        return res.status(500).json({ error: 'Error al registrar el usuario.', err });
+        console.error('[agents/register] insert error', err);
+        return res.status(500).json({ error: 'Error al registrar el usuario.' });
       }
+
       const userId = result.insertId;
-      const token = jwt.sign({ id: userId, email }, process.env.JWT_SECRET, {
-      expiresIn: '3h',
+      const token = jwt.sign({ id: userId, email }, process.env.JWT_SECRET, { expiresIn: '3h' });
+
+      return res.status(201).json({
+        message: 'Usuario registrado con éxito.',
+        token,
+        user: {
+          id: userId,
+          name,
+          last_name,
+          email,
+          phone: phone || null,
+          license: license || null,
+          work_start: work_start || null,
+          work_end: work_end || null,
+          agent_type: finalAgentType,                  // <- ahora solo esto
+          is_agent: finalAgentType !== 'seller',       // <- útil para el front
+          brokerage_name: finalAgentType === 'brokerage' ? (brokerage_name || null) : null,
+          cities: citiesArr
+        }
       });
-      res.status(201).json({
-          message: 'Usuario registrado con éxito.',
-          token,
-          user: {
-            id: userId,
-            name,
-            last_name,
-            email,
-            phone,
-            license,
-            type: 'agente',
-            work_start: work_start || null,
-            work_end: work_end || null
-          },
-        });
-      console.log('Usuario agregado correctamente')
     });
   } catch (error) {
-    console.log('error:', error);
-    res.status(500).json({ error: 'Error interno del servidor.' });
+    console.error('[agents/register] fatal', error);
+    return res.status(500).json({ error: 'Error interno del servidor.' });
   }
 });
 
@@ -524,7 +567,7 @@ app.put('/agents/:id/work-schedule', authenticateToken, (req, res) => {
 app.get('/agents/:id', (req, res) => {
   const { id } = req.params;
   pool.query(
-    'SELECT id, name, last_name, phone, work_start, work_end FROM users WHERE id = ? AND type = "agente" LIMIT 1',
+    'SELECT id, name, last_name, phone, license, work_start, work_end FROM users WHERE id = ? AND agent_type = "brokerage" OR agent_type = "individual" LIMIT 1',
     [id],
     (err, results) => {
       if (err) return res.status(500).json({ error: 'Error al consultar el horario.' });
@@ -535,41 +578,48 @@ app.get('/agents/:id', (req, res) => {
 });
   
 // User log in
-app.post('/users/login', (req, res) => {
+app.post('/login', (req, res) => {
   const { email, password } = req.body;
-  const query = 'SELECT * FROM users WHERE email = ?';
-
-  pool.query(query, [email], async (err, results) => {
-    if (err) return res.status(500).json({ error: 'Error al buscar el usuario.' });
-
-    if (results.length === 0) {
-      return res.status(400).json({ error: 'Usuario no encontrado.' });
+  const sql = `
+    SELECT id, name, last_name, email, password, phone, license,
+           work_start, work_end, agent_type, brokerage_name, cities
+    FROM users
+    WHERE email = ?
+    LIMIT 1
+  `;
+  pool.query(sql, [email], async (err, rows) => {
+    if (err) {
+      console.error('[login] error', err);
+      return res.status(500).json({ error: 'Error de servidor' });
     }
-
-    const user = results[0];
-    const isValid = await bcrypt.compare(password, user.password);
-
-    if (!isValid) {
-      return res.status(401).json({ error: 'Contraseña incorrecta.' });
+    if (!rows || rows.length === 0) {
+      return res.status(400).json({ error: 'Credenciales inválidas' });
     }
+    const u = rows[0];
+    const ok = await bcrypt.compare(password, u.password);
+    if (!ok) return res.status(400).json({ error: 'Credenciales inválidas' });
 
-    const token = jwt.sign(
-      { id: user.id, email: user.email, user_type: user.type },
-      process.env.JWT_SECRET,
-      { expiresIn: '3h' }
-    );
+    const token = jwt.sign({ id: u.id, email: u.email }, process.env.JWT_SECRET, { expiresIn: '3h' });
 
-    res.json({
-      message: 'Login exitoso.',
+    let citiesArr = null;
+    try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {}
+
+    return res.json({
       token,
       user: {
-        id: user.id,
-        name: user.name,
-        last_name: user.last_name,
-        email: user.email,
-        phone: user.phone ?? null, 
-        user_type: user.type ?? null
-      },
+        id: u.id,
+        name: u.name,
+        last_name: u.last_name,
+        email: u.email,
+        phone: u.phone,
+        license: u.license,
+        work_start: u.work_start,
+        work_end: u.work_end,
+        agent_type: u.agent_type,
+        is_agent: u.agent_type !== 'seller',
+        brokerage_name: u.brokerage_name || null,
+        cities: citiesArr
+      }
     });
   });
 });
@@ -632,8 +682,8 @@ app.put('/users/:id', authenticateToken, (req, res) => {
   //  Auth endpoint
 // Endpoint para validar token
 app.get('/auth/validate', authenticateToken, (req, res) => {
-  const { id, email, type } = req.user;
-  const query = 'SELECT name, last_name, email, phone, type FROM users WHERE id = ? LIMIT 1';
+  const { id, email, agent_type } = req.user;
+  const query = 'SELECT name, last_name, email, phone, agent_type FROM users WHERE id = ? LIMIT 1';
   pool.query(query, [id], (err, results) => {
     if (err || results.length === 0) {
       return res.status(401).json({ error: 'Usuario no encontrado.' });
@@ -646,7 +696,7 @@ app.get('/auth/validate', authenticateToken, (req, res) => {
       last_name: user.last_name,
       email: user.email,
       phone: user.phone,
-      user_type: user.type,
+      user_type: user.agent_type,
     });
     console.log('auth: ', user);
   });
