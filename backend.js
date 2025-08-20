@@ -9,6 +9,9 @@ const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const authenticateToken = require('./middleware/authenticateToken');
+const { OAuth2Client } = require('google-auth-library');
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -26,6 +29,42 @@ app.use(bodyParser.json());
 //   port: process.env.MYSQLPORT,
 // });
 
+const mailer = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    type: 'OAuth2',
+    user: process.env.SMTP_USER,         // tu_correo@gmail.com
+    clientId: process.env.GMAIL_CLIENT_ID,
+    clientSecret: process.env.GMAIL_CLIENT_SECRET,
+    refreshToken: process.env.GMAIL_REFRESH_TOKEN,
+  },
+});
+function gen6() {
+  // Código 6 dígitos
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+async function sendVerificationEmail(to, code) {
+  const from = process.env.MAIL_FROM || 'LISTED <no-reply@listed.app>';
+  const minutes = Number(process.env.VERIFICATION_MINUTES || 15);
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 480px;">
+      <h2>Verifica tu correo</h2>
+      <p>Tu código de verificación es:</p>
+      <div style="font-size: 28px; font-weight: bold; letter-spacing: 6px; margin: 12px 0;">${code}</div>
+      <p>Este código vence en ${minutes} minutos.</p>
+      <p>Si no has solicitado esta verificación, ignora este mensaje.</p>
+    </div>
+  `;
+  await mailer.sendMail({
+    from,
+    to,
+    subject: 'Tu código de verificación',
+    text: `Tu código de verificación es: ${code}. Vence en ${minutes} minutos.`,
+    html,
+  });
+}
+
 const pool = mysql.createPool({
   host: 'localhost',
   user: 'root',
@@ -33,6 +72,13 @@ const pool = mysql.createPool({
   database: 'listed_property_sell',
   connectionLimit: 10
 });
+
+const GOOGLE_CLIENT_IDS = [
+  // '135546956411-cjbk922m8i8qu8bdj8cnor6dj9lusljp.apps.googleusercontent.com', // ANDROID_CLIENT_ID
+  // 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com', // IOS_CLIENT_ID
+  '135546956411-bvujtarl7via811vffpgraijohj1rlqu.apps.googleusercontent.com', // WEB_CLIENT_ID
+];
+const googleClient = new OAuth2Client();
 
 // Test database connection
 pool.getConnection((err, connection) => {
@@ -409,34 +455,149 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
     }
     try {
       const hashedPassword = await bcrypt.hash(password, 10);
-      const query = "INSERT INTO users (name, last_name, email, password, agent_type) VALUES (?, ?, ?, ?, ?)";
-      pool.query(query, [name, last_name, email, hashedPassword, 'regular'], (err, result) => {
-        if (err) {
-          if (err.code === 'ER_DUP_ENTRY') {
-            return res.status(400).json({ error: 'El correo ya está registrado.' });
+  
+      // IMPORTANTE: incluye columnas que tu tabla exige o que son NOT NULL
+      const sql = `
+        INSERT INTO users
+          (name, last_name, email, password, agent_type, email_verified, work_start, work_end)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+      `;
+      pool.query(
+        sql,
+        [name, last_name, email, hashedPassword, 'regular', null, null],
+        async (err, result) => {
+          if (err) {
+            if (err.code === 'ER_DUP_ENTRY') {
+              return res.status(400).json({ error: 'El correo ya está registrado.' });
+            }
+            console.error('[users/register] insert error', err);
+            return res.status(500).json({ error: 'Error al registrar el usuario.' });
           }
-          return res.status(500).json({ error: 'Error al registrar el usuario.' });
+  
+          const userId = result.insertId;
+          const code = gen6();
+          const expires = new Date(Date.now() + (Number(process.env.VERIFICATION_MINUTES || 15) * 60 * 1000));
+  
+          pool.query(
+            'UPDATE users SET email_verif_code = ?, email_verif_expires = ? WHERE id = ?',
+            [code, expires, userId],
+            async (uErr) => {
+              if (uErr) {
+                console.error('[users/register] set code error', uErr);
+                return res.status(500).json({ error: 'Error preparando verificación.' });
+              }
+  
+              try {
+                await sendVerificationEmail(email, code);
+              } catch (mailErr) {
+                console.error('[users/register] mail error', mailErr);
+                return res.status(500).json({ error: 'No se pudo enviar el correo de verificación.' });
+              }
+  
+              // No iniciamos sesión todavía. Exige verificación.
+              return res.status(201).json({
+                message: 'Usuario registrado. Se envió un código de verificación a tu correo.',
+                need_verification: true,
+                email,
+                user_id: userId,
+              });
+            }
+          );
         }
-        const userId = result.insertId;
-        const token = jwt.sign({ id: userId, email }, process.env.JWT_SECRET, {
-          expiresIn: '1h',
-        });
-        res.status(201).json({
-          message: 'Usuario registrado con éxito.',
-          token,
-          user: {
-            id: userId,
-            name,
-            last_name,
-            email, 
-            agent_type: 'regular'
-          },
-        });
-        console.log('Usuario agregado correctamente');
-      });
+      );
     } catch (error) {
+      console.error('[users/register] fatal', error);
       res.status(500).json({ error: 'Error interno del servidor.' });
     }
+  });
+
+  app.post('/users/verify-email', (req, res) => {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: 'Faltan email o código.' });
+  
+    const sql = `
+      SELECT id, email_verif_code, email_verif_expires, name, last_name, phone, license,
+             work_start, work_end, agent_type, brokerage_name, cities
+      FROM users WHERE email = ? LIMIT 1
+    `;
+    pool.query(sql, [email], (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Error de servidor' });
+      if (!rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+  
+      const u = rows[0];
+      if (!u.email_verif_code || !u.email_verif_expires) {
+        return res.status(400).json({ error: 'No hay verificación pendiente.' });
+      }
+      const now = new Date();
+      const exp = new Date(u.email_verif_expires);
+  
+      if (String(code) !== String(u.email_verif_code)) {
+        return res.status(400).json({ error: 'Código inválido.' });
+      }
+      if (now > exp) {
+        return res.status(400).json({ error: 'El código ha expirado.' });
+      }
+  
+      pool.query(
+        'UPDATE users SET email_verified = 1, email_verif_code = NULL, email_verif_expires = NULL WHERE id = ?',
+        [u.id],
+        (uErr) => {
+          if (uErr) return res.status(500).json({ error: 'No se pudo verificar.' });
+  
+          // Listo: da token y user (login inmediato)
+          const token = jwt.sign({ id: u.id, email }, process.env.JWT_SECRET, { expiresIn: '3h' });
+          let citiesArr = null;
+          try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {}
+  
+          return res.json({
+            token,
+            user: {
+              id: u.id,
+              name: u.name,
+              last_name: u.last_name,
+              email,
+              phone: u.phone,
+              license: u.license,
+              work_start: u.work_start,
+              work_end: u.work_end,
+              agent_type: u.agent_type,
+              is_agent: u.agent_type !== 'seller',
+              brokerage_name: u.brokerage_name || null,
+              cities: citiesArr,
+            }
+          });
+        }
+      );
+    });
+  });
+
+  app.post('/users/resend-code', (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Falta email' });
+  
+    pool.query('SELECT id, email_verified FROM users WHERE email = ? LIMIT 1', [email], async (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Error de servidor' });
+      if (!rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+      if (rows[0].email_verified) return res.status(400).json({ error: 'El email ya está verificado.' });
+  
+      const code = gen6();
+      const expires = new Date(Date.now() + (Number(process.env.VERIFICATION_MINUTES || 15) * 60 * 1000));
+  
+      pool.query(
+        'UPDATE users SET email_verif_code = ?, email_verif_expires = ? WHERE id = ?',
+        [code, expires, rows[0].id],
+        async (uErr) => {
+          if (uErr) return res.status(500).json({ error: 'No se pudo generar nuevo código.' });
+          try {
+            await sendVerificationEmail(email, code);
+            res.json({ ok: true, message: 'Código reenviado.' });
+          } catch (mailErr) {
+            console.error('[resend-code] mail error', mailErr);
+            res.status(500).json({ error: 'No se pudo enviar el correo.' });
+          }
+        }
+      );
+    });
   });
 
 // Register new agent
@@ -459,30 +620,37 @@ app.post('/agents/register', async (req, res) => {
     return res.status(400).json({ error: 'Faltan datos obligatorios (incluyendo horario laboral).' });
   }
 
+  // valida HH:mm
   const hhmm = /^([01]\d|2[0-3]):([0-5]\d)$/;
   if (!hhmm.test(work_start) || !hhmm.test(work_end)) {
     return res.status(400).json({ error: 'Horario laboral en formato inválido. Usa HH:mm.' });
   }
 
-  const ALLOWED_TYPES = new Set(['brokerage', 'individual', 'seller']);
+  const ALLOWED_TYPES = new Set(['brokerage', 'individual', 'seller', 'regular']);
   const finalAgentType = ALLOWED_TYPES.has(agent_type) ? agent_type : 'individual';
 
+  // normaliza ciudades
   let citiesArr = Array.isArray(cities) ? cities : [];
-  citiesArr = citiesArr
+  citiesArr = [...new Set((citiesArr || [])
     .map(c => (typeof c === 'string' ? c.trim() : ''))
-    .filter(Boolean);
-  citiesArr = [...new Set(citiesArr)].slice(0, 30).map(c => c.slice(0, 120));
+    .filter(Boolean))]
+    .slice(0, 30)
+    .map(c => c.slice(0, 120));
 
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
+    const minutes = Number(process.env.VERIFICATION_MINUTES || 15);
+    const code = gen6();                                // 6 dígitos
+    const expires = new Date(Date.now() + minutes * 60 * 1000);
 
     const sql = `
       INSERT INTO users
-        (name, last_name, email, password, phone, license, work_start, work_end, agent_type, brokerage_name, cities)
+        (name, last_name, email, password, phone, license, work_start, work_end,
+         agent_type, brokerage_name, cities,
+         email_verified, email_verif_code, email_verif_expires)
       VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
     `;
-
     const params = [
       name,
       last_name,
@@ -490,14 +658,16 @@ app.post('/agents/register', async (req, res) => {
       hashedPassword,
       phone || null,
       license || null,
-      work_start || null,
-      work_end || null,
+      work_start,
+      work_end,
       finalAgentType,
       finalAgentType === 'brokerage' ? (brokerage_name || null) : null,
-      citiesArr.length ? JSON.stringify(citiesArr) : null
+      citiesArr.length ? JSON.stringify(citiesArr) : null,
+      code,
+      expires
     ];
 
-    pool.query(sql, params, (err, result) => {
+    pool.query(sql, params, async (err, result) => {
       if (err) {
         if (err.code === 'ER_DUP_ENTRY') {
           return res.status(400).json({ error: 'El email ya existe' });
@@ -506,26 +676,21 @@ app.post('/agents/register', async (req, res) => {
         return res.status(500).json({ error: 'Error al registrar el usuario.' });
       }
 
-      const userId = result.insertId;
-      const token = jwt.sign({ id: userId, email }, process.env.JWT_SECRET, { expiresIn: '3h' });
+      // enviar código
+      try {
+        await sendVerificationEmail(email, code);
+      } catch (mailErr) {
+        console.error('[agents/register] mail error', mailErr);
+        // Si quieres, puedes responder 201 y permitir reenviar el código luego:
+        // return res.status(201).json({ ok: true, need_verification: true, email, user_id: result.insertId, mail_sent: false });
+      }
 
+      // igual que /users/register: NO token, exige verificación
       return res.status(201).json({
-        message: 'Usuario registrado con éxito.',
-        token,
-        user: {
-          id: userId,
-          name,
-          last_name,
-          email,
-          phone: phone || null,
-          license: license || null,
-          work_start: work_start || null,
-          work_end: work_end || null,
-          agent_type: finalAgentType,                  // <- ahora solo esto
-          is_agent: finalAgentType !== 'seller',       // <- útil para el front
-          brokerage_name: finalAgentType === 'brokerage' ? (brokerage_name || null) : null,
-          cities: citiesArr
-        }
+        ok: true,
+        need_verification: true,
+        email,
+        user_id: result.insertId
       });
     });
   } catch (error) {
@@ -567,7 +732,10 @@ app.put('/agents/:id/work-schedule', authenticateToken, (req, res) => {
 app.get('/agents/:id', (req, res) => {
   const { id } = req.params;
   pool.query(
-    'SELECT id, name, last_name, phone, license, work_start, work_end FROM users WHERE id = ? AND agent_type = "brokerage" OR agent_type = "individual" LIMIT 1',
+    `SELECT id, name, last_name, phone, license, work_start, work_end
+     FROM users
+     WHERE id = ? AND (agent_type = "brokerage" OR agent_type = "individual")
+     LIMIT 1`,
     [id],
     (err, results) => {
       if (err) return res.status(500).json({ error: 'Error al consultar el horario.' });
@@ -578,11 +746,11 @@ app.get('/agents/:id', (req, res) => {
 });
   
 // User log in
-app.post('/login', (req, res) => {
+app.post('/users/login', (req, res) => {
   const { email, password } = req.body;
   const sql = `
     SELECT id, name, last_name, email, password, phone, license,
-           work_start, work_end, agent_type, brokerage_name, cities
+           work_start, work_end, agent_type, brokerage_name, cities, email_verified
     FROM users
     WHERE email = ?
     LIMIT 1
@@ -597,13 +765,23 @@ app.post('/login', (req, res) => {
     }
     const u = rows[0];
     const ok = await bcrypt.compare(password, u.password);
+    if (!u.email_verified) {
+      console.log('here', u.email_verified);
+      return res.status(403).json({
+        error: 'Debes verificar tu correo antes de iniciar sesión.',
+        need_verification: true,
+        email: u.email,
+      });
+    }
     if (!ok) return res.status(400).json({ error: 'Credenciales inválidas' });
 
     const token = jwt.sign({ id: u.id, email: u.email }, process.env.JWT_SECRET, { expiresIn: '3h' });
 
     let citiesArr = null;
-    try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {}
-
+    try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {
+      console.error('here');
+    }
+    console.log(res);
     return res.json({
       token,
       user: {
@@ -616,13 +794,126 @@ app.post('/login', (req, res) => {
         work_start: u.work_start,
         work_end: u.work_end,
         agent_type: u.agent_type,
-        is_agent: u.agent_type !== 'seller',
+        is_agent: u.agent_type,
         brokerage_name: u.brokerage_name || null,
         cities: citiesArr
       }
     });
   });
 });
+
+app.post('/auth/google', async (req, res) => {
+  try {
+    const { id_token } = req.body || {};
+    if (!id_token) return res.status(400).json({ error: 'Falta id_token' });
+
+    // Verificar token
+    const ticket = await googleClient.verifyIdToken({
+      idToken: id_token,
+      audience: GOOGLE_CLIENT_IDS,
+    });
+    const payload = ticket.getPayload();
+    if (!payload) return res.status(401).json({ error: 'Token inválido' });
+
+    const {
+      sub: googleId,
+      email,
+      email_verified,
+      given_name,
+      family_name,
+      name,
+      picture,
+    } = payload;
+
+    if (!email || email_verified === false) {
+      return res.status(400).json({ error: 'Email no verificado en Google' });
+    }
+
+    // Buscar usuario por email
+    const selSql = `
+      SELECT id, name, last_name, email, phone, license, work_start, work_end,
+             agent_type, brokerage_name, cities
+      FROM users
+      WHERE email = ?
+      LIMIT 1
+    `;
+    pool.query(selSql, [email], async (err, rows) => {
+      if (err) {
+        console.error('[auth/google] select error', err);
+        return res.status(500).json({ error: 'Error de servidor' });
+      }
+
+      let userRow;
+      if (rows && rows.length) {
+        userRow = rows[0];
+      } else {
+        // Crear usuario nuevo (password aleatoria encriptada)
+        const randomPass = crypto.randomBytes(18).toString('hex');
+        const hashed = await bcrypt.hash(randomPass, 10);
+
+        const insSql = `
+        INSERT INTO users (name, last_name, email, password, agent_type, email_verified, work_start, work_end)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        `;
+        const vals = [given_name || name || '', family_name || '', email, hashed, 'seller', null, null];
+        pool.query(insSql, vals, (insErr, result) => {
+          if (insErr) {
+            console.error('[auth/google] insert error', insErr);
+            return res.status(500).json({ error: 'No se pudo crear el usuario' });
+          }
+          userRow = {
+            id: result.insertId,
+            name: given_name || name || '',
+            last_name: family_name || '',
+            email,
+            phone: null,
+            license: null,
+            work_start: null,
+            work_end: null,
+            agent_type: 'regular',
+            brokerage_name: null,
+            cities: null,
+          };
+          // devolver token
+          issueToken(res, userRow);
+        });
+        return; // importante cortar aquí: devolvemos en el callback
+      }
+
+      // Usuario ya existía → devolver token
+      issueToken(res, userRow);
+    });
+  } catch (e) {
+    console.error('[auth/google] error', e);
+    return res.status(500).json({ error: 'Error de servidor' });
+  }
+});
+
+// Helper para emitir token con forma homogénea a tu /users/login
+function issueToken(res, u) {
+  const token = jwt.sign({ id: u.id, email: u.email }, process.env.JWT_SECRET, { expiresIn: '3h' });
+
+  let citiesArr = null;
+  try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {}
+
+  return res.json({
+    token,
+    user: {
+      id: u.id,
+      name: u.name,
+      last_name: u.last_name,
+      email: u.email,
+      phone: u.phone,
+      license: u.license,
+      work_start: u.work_start,
+      work_end: u.work_end,
+      agent_type: u.agent_type,
+      is_agent: u.agent_type !== 'regular',
+      brokerage_name: u.brokerage_name || null,
+      cities: citiesArr
+    }
+  });
+}
 
 // Get user name (and optionally more data) by id
 app.get('/users/:id', authenticateToken, (req, res) => {
@@ -637,6 +928,8 @@ app.get('/users/:id', authenticateToken, (req, res) => {
     }
   );
 });
+
+
 
 app.put('/users/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
@@ -1176,4 +1469,10 @@ app.put('/api/tenant-profile/:id', authenticateToken, (req, res) => {
     }
     res.json({ ok: true, message: 'Perfil actualizado correctamente' });
   });
+});
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Error interno del servidor' });
 });
