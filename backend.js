@@ -21,13 +21,13 @@ const dbPassword = process.env.DB_KEY;
 app.use(cors());
 app.use(bodyParser.json());
 
-// const pool = mysql.createPool({
-//   host: process.env.MYSQLHOST,
-//   user: process.env.MYSQLUSER,
-//   password: process.env.MYSQLPASSWORD,
-//   database: process.env.MYSQLDATABASE,
-//   port: process.env.MYSQLPORT,
-// });
+const pool = mysql.createPool({
+  host: process.env.MYSQLHOST,
+  user: process.env.MYSQLUSER,
+  password: process.env.MYSQLPASSWORD,
+  database: process.env.MYSQLDATABASE,
+  port: process.env.MYSQLPORT,
+});
 
 const mailer = nodemailer.createTransport({
   service: 'gmail',
@@ -65,18 +65,17 @@ async function sendVerificationEmail(to, code) {
   });
 }
 
-const pool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: dbPassword,
-  database: 'listed_property_sell',
-  connectionLimit: 10
-});
+// const pool = mysql.createPool({
+//   host: 'localhost',
+//   user: 'root',
+//   password: dbPassword,
+//   database: 'listed_property_sell',
+//   connectionLimit: 10
+// });
 
 const GOOGLE_CLIENT_IDS = [
-  // '135546956411-cjbk922m8i8qu8bdj8cnor6dj9lusljp.apps.googleusercontent.com', // ANDROID_CLIENT_ID
   // 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com', // IOS_CLIENT_ID
-  '135546956411-bvujtarl7via811vffpgraijohj1rlqu.apps.googleusercontent.com', // WEB_CLIENT_ID
+  process.env.GMAIL_CLIENT_ID, // WEB_CLIENT_ID
 ];
 const googleClient = new OAuth2Client();
 
@@ -1469,6 +1468,103 @@ app.put('/api/tenant-profile/:id', authenticateToken, (req, res) => {
     }
     res.json({ ok: true, message: 'Perfil actualizado correctamente' });
   });
+});
+
+app.get('/api/places/autocomplete', async (req, res) => {
+  try {
+    const input = req.query.input?.toString() || '';
+    if (!input) return res.status(400).json({ error: 'input requerido' });
+
+    const url = new URL('https://maps.googleapis.com/maps/api/place/autocomplete/json');
+    url.searchParams.set('input', input);
+    url.searchParams.set('types', '(cities)');
+    url.searchParams.set('components', 'country:mx');
+    url.searchParams.set('language', 'es');
+    url.searchParams.set('key', process.env.MAPS_KEY);
+
+    const r = await fetch(url);
+    const data = await r.json();
+    return res.json(data);
+  } catch (e) {
+    console.error('[places/autocomplete] error', e);
+    res.status(500).json({ error: 'fail' });
+  }
+});
+
+app.get('/api/places/details', async (req, res) => {
+  try {
+    const place_id = req.query.place_id?.toString();
+    if (!place_id) return res.status(400).json({ error: 'place_id requerido' });
+
+    const url = new URL('https://maps.googleapis.com/maps/api/place/details/json');
+    url.searchParams.set('place_id', place_id);
+    url.searchParams.set('fields', 'geometry,formatted_address');
+    url.searchParams.set('key', process.env.MAPS_KEY);
+
+    const r = await fetch(url);
+    const data = await r.json();
+    res.json(data); // result.geometry.location { lat, lng }
+  } catch (e) {
+    console.error('[places/details]', e);
+    res.status(500).json({ error: 'fail' });
+  }
+});
+
+app.get('/api/places/geocode', async (req, res) => {
+  try {
+    const address = req.query.address?.toString() || '';
+    const country = (req.query.country || 'MX').toString();
+    if (!address) return res.status(400).json({ error: 'address requerido' });
+
+    const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
+    url.searchParams.set('address', address);
+    url.searchParams.set('components', `country:${country}`);
+    url.searchParams.set('key', process.env.MAPS_KEY);
+
+    const r = await fetch(url);
+    const data = await r.json();
+
+    // respuesta compacta (pero mantén status para el front)
+    if (data.status === 'OK' && data.results?.length) {
+      const r0 = data.results[0];
+      return res.json({
+        status: 'OK',
+        result: {
+          formatted_address: r0.formatted_address,
+          geometry: { location: r0.geometry.location }
+        }
+      });
+    }
+    res.json({ status: data.status, results: [] });
+  } catch (e) {
+    console.error('[places/geocode]', e);
+    res.status(500).json({ error: 'fail' });
+  }
+});
+
+app.get('/api/places/reverse-geocode', async (req, res) => {
+  try {
+    const lat = req.query.lat?.toString();
+    const lng = req.query.lng?.toString();
+    const lang = (req.query.lang || 'es').toString();
+    if (!lat || !lng) return res.status(400).json({ error: 'lat y lng requeridos' });
+
+    const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
+    url.searchParams.set('latlng', `${lat},${lng}`);
+    url.searchParams.set('language', lang);
+    url.searchParams.set('key', process.env.GOOGLE_PLACES_SERVER_KEY);
+
+    const r = await fetch(url);
+    const data = await r.json();
+    if (data.status === 'OK' && data.results?.length) {
+      const r0 = data.results[0];
+      return res.json({ status: 'OK', result: { formatted_address: r0.formatted_address } });
+    }
+    res.json({ status: data.status, results: [] });
+  } catch (e) {
+    console.error('[places/reverse-geocode]', e);
+    res.status(500).json({ error: 'fail' });
+  }
 });
 
 app.use((err, req, res, next) => {
