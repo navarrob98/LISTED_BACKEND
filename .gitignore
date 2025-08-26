@@ -1,3 +1,2 @@
 *.env
-package*
 node_modules
