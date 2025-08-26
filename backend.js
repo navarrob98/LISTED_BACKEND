@@ -26,15 +26,13 @@ const dbPassword = process.env.DB_KEY;
 app.use(cors());
 app.use(bodyParser.json());
 
-// const pool = mysql.createPool({
-//   host: process.env.MYSQLHOST,
-//   user: process.env.MYSQLUSER,
-//   password: process.env.MYSQLPASSWORD,
-//   database: process.env.MYSQLDATABASE,
-//   port: process.env.MYSQLPORT,
-// });
-
-
+const pool = mysql.createPool({
+  host: process.env.MYSQLHOST,
+  user: process.env.MYSQLUSER,
+  password: process.env.MYSQLPASSWORD,
+  database: process.env.MYSQLDATABASE,
+  port: process.env.MYSQLPORT,
+});
 
 function extFromFilename(name) {
   const m = /(?:\.)([a-z0-9]+)$/i.exec(name || '');
@@ -128,47 +126,6 @@ function buildDeliveryUrlFromSecure(secureUrl, filename, ttlSeconds = 300) {
   });
 }
 
-// Trocea en lotes
-const chunk = (arr, size) =>
-  arr.reduce((acc, _, i) => (i % size ? acc : [...acc, arr.slice(i, i + size)]), []);
-
-// Borra una lista de URLs de Cloudinary (image/video/raw; upload/authenticated/private)
-async function deleteCloudinaryByUrls(urls) {
-  const items = (urls || []).map(parseCloudinary).filter(Boolean);
-
-  // Agrupa por (resource_type, type) porque Cloudinary lo requiere
-  const buckets = {};
-  for (const it of items) {
-    const key = `${it.resource_type}:${it.type || 'upload'}`;
-    if (!buckets[key]) buckets[key] = { resource_type: it.resource_type, type: it.type || 'upload', ids: [] };
-    buckets[key].ids.push(it.public_id);
-  }
-
-  const failures = [];
-  for (const { resource_type, type, ids } of Object.values(buckets)) {
-    for (const group of chunk(ids, 100)) {
-      try {
-        const opts = { resource_type };
-        if (type && type !== 'upload') opts.type = type;
-        const resp = await cloudinary.api.delete_resources(group, opts);
-        Object.entries(resp.deleted || {}).forEach(([pid, status]) => {
-          if (status !== 'deleted' && status !== 'not_found') {
-            failures.push({ public_id: pid, status, resource_type, type });
-          }
-        });
-      } catch (e) {
-        failures.push({ batch: group, resource_type, type, error: String(e) });
-      }
-    }
-  }
-
-  if (failures.length) {
-    const err = new Error('Cloudinary: algunos recursos no se pudieron borrar');
-    err.failures = failures;
-    throw err;
-  }
-}
-
 function gen6() {
   // Código 6 dígitos
   return String(Math.floor(100000 + Math.random() * 900000));
@@ -195,13 +152,13 @@ async function sendVerificationEmail(to, code) {
   });
 }
 
-const pool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: dbPassword,
-  database: 'listed_property_sell',
-  connectionLimit: 10
-});
+// const pool = mysql.createPool({
+//   host: 'localhost',
+//   user: 'root',
+//   password: dbPassword,
+//   database: 'listed_property_sell',
+//   connectionLimit: 10
+// });
 
 const GOOGLE_CLIENT_IDS = [
   // 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com', // IOS_CLIENT_ID
