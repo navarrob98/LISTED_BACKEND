@@ -1,4 +1,8 @@
 require('dotenv').config({ path: 'temporary.env' });
+const {
+  deleteUserChatUploadsByFolder,
+  deleteUserPropertyUploadsByFolder,
+} = require('./cloud-folder-delete');
 
 const express = require('express');
 const http = require('http');
@@ -27,7 +31,44 @@ const pool = mysql.createPool({
   password: process.env.MYSQLPASSWORD,
   database: process.env.MYSQLDATABASE,
   port: process.env.MYSQLPORT,
+const cloudinary = require('cloudinary').v2;
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
 });
+
+function extFromFilename(name) {
+  const m = /(?:\.)([a-z0-9]+)$/i.exec(name || '');
+  return m ? m[1].toLowerCase() : undefined;
+}
+
+function signedDeliveryUrlFromSecure(
+  secureUrl,
+  ttlSeconds = Number(process.env.CLD_DEFAULT_URL_TTL_SECONDS || 300),
+  filename // ← pásalo desde tus endpoints/sockets
+) {
+  const meta = parseCloudinary(secureUrl);
+  if (!meta) return null;
+
+  const resource_type = meta.resource_type || 'raw';
+  const public_id = meta.public_id;
+  const expires_at = Math.floor(Date.now() / 1000) + ttlSeconds;
+
+  // Determina el formato: primero el que venía en la URL de upload; si no, desde file_name
+  let format = meta.format || extFromFilename(filename);
+
+  return cloudinary.url(public_id, {
+    resource_type,
+    type: 'authenticated',  // indispensable para access_mode=authenticated
+    format,                 // ← CLAVE: fuerza .pptx, .pdf, etc.
+    sign_url: true,
+    secure: true,
+    expires_at,
+    attachment: filename || true, // descarga con nombre correcto
+  });
+}
 
 const mailer = nodemailer.createTransport({
   service: 'gmail',
@@ -39,6 +80,103 @@ const mailer = nodemailer.createTransport({
     refreshToken: process.env.GMAIL_REFRESH_TOKEN,
   },
 });
+
+function q(cxn, sql, params, step) {
+  return new Promise((resolve, reject) => {
+    cxn.query(sql, params, (err, rows) => {
+      if (err) {
+        // Anota el paso y el SQL para depurar
+        err._step = step;
+        err._sql = sql;
+        return reject(err);
+      }
+      resolve(rows);
+    });
+  });
+}
+
+// Extrae resource_type, type y public_id desde un secure_url de Cloudinary
+function parseCloudinary(secureUrl) {
+  const re = /^https?:\/\/res\.cloudinary\.com\/([^/]+)\/(image|video|raw)\/(upload|authenticated|private)\/(?:(?:s--[A-Za-z0-9_-]{8,}--\/)?)(?:v(\d+)\/)?(.+?)(?:\.([a-z0-9]+))?(?:[#?].*)?$/i;
+  const m = (secureUrl || '').match(re);
+  if (!m) return null;
+  const [, cloud, resource_type, type, version, public_id, format] = m;
+  return { cloud, resource_type, type, version: version ? Number(version) : undefined, public_id, format };
+}
+
+function extFromFilename(name) {
+  const m = /(?:\.)([a-z0-9]+)$/i.exec(name || '');
+  return m ? m[1].toLowerCase() : undefined;
+}
+
+function buildDeliveryUrlFromSecure(secureUrl, filename, ttlSeconds = 300) {
+  const meta = parseCloudinary(secureUrl);
+  if (!meta) return null;
+
+  const format = meta.format || extFromFilename(filename);
+  const baseOpts = {
+    resource_type: meta.resource_type || 'raw',
+    type: meta.type,
+    version: meta.version,
+    format,
+    secure: true,
+  };
+
+  // Públicos (upload): devuelve tal cual (o añade .ext si falta)
+  if (meta.type === 'upload') {
+    const url = cloudinary.url(meta.public_id, { ...baseOpts, sign_url: false });
+    return url;
+  }
+
+  // private / authenticated → URL firmada
+  return cloudinary.url(meta.public_id, {
+    ...baseOpts,
+    sign_url: true,
+    attachment: filename || true,
+  });
+}
+
+// Trocea en lotes
+const chunk = (arr, size) =>
+  arr.reduce((acc, _, i) => (i % size ? acc : [...acc, arr.slice(i, i + size)]), []);
+
+// Borra una lista de URLs de Cloudinary (image/video/raw; upload/authenticated/private)
+async function deleteCloudinaryByUrls(urls) {
+  const items = (urls || []).map(parseCloudinary).filter(Boolean);
+
+  // Agrupa por (resource_type, type) porque Cloudinary lo requiere
+  const buckets = {};
+  for (const it of items) {
+    const key = `${it.resource_type}:${it.type || 'upload'}`;
+    if (!buckets[key]) buckets[key] = { resource_type: it.resource_type, type: it.type || 'upload', ids: [] };
+    buckets[key].ids.push(it.public_id);
+  }
+
+  const failures = [];
+  for (const { resource_type, type, ids } of Object.values(buckets)) {
+    for (const group of chunk(ids, 100)) {
+      try {
+        const opts = { resource_type };
+        if (type && type !== 'upload') opts.type = type;
+        const resp = await cloudinary.api.delete_resources(group, opts);
+        Object.entries(resp.deleted || {}).forEach(([pid, status]) => {
+          if (status !== 'deleted' && status !== 'not_found') {
+            failures.push({ public_id: pid, status, resource_type, type });
+          }
+        });
+      } catch (e) {
+        failures.push({ batch: group, resource_type, type, error: String(e) });
+      }
+    }
+  }
+
+  if (failures.length) {
+    const err = new Error('Cloudinary: algunos recursos no se pudieron borrar');
+    err.failures = failures;
+    throw err;
+  }
+}
+
 function gen6() {
   // Código 6 dígitos
   return String(Math.floor(100000 + Math.random() * 900000));
@@ -854,7 +992,7 @@ app.post('/auth/google', async (req, res) => {
         INSERT INTO users (name, last_name, email, password, agent_type, email_verified, work_start, work_end)
         VALUES (?, ?, ?, ?, ?, 1, ?, ?)
         `;
-        const vals = [given_name || name || '', family_name || '', email, hashed, 'seller', null, null];
+        const vals = [given_name || name || '', family_name || '', email, hashed, 'regular', null, null];
         pool.query(insSql, vals, (insErr, result) => {
           if (insErr) {
             console.error('[auth/google] insert error', insErr);
@@ -1076,55 +1214,74 @@ app.get('/api/buying-power/:user_id', authenticateToken, (req, res) => {
   // Chat socket.io endpoints
 
   io.on('connection', (socket) => {
-    // Recibe el userId del usuario conectado
+    // El cliente llama: socket.emit('join', { userId })
     socket.on('join', ({ userId }) => {
-      if (userId) {
-        socket.join('user_' + userId); // cada usuario en su sala única
-      }
+      if (userId) socket.join('user_' + userId);
     });
-
-    // Enviar mensaje
+  
+    // Enviar mensaje (texto y/o archivo)
     socket.on('send_message', (data) => {
-      // data = { sender_id, receiver_id, property_id, message }
-      const { sender_id, receiver_id, property_id, message, file_url, file_name } = data;
+      const { sender_id, receiver_id, property_id, message, file_url, file_name } = data || {};
       if (!sender_id || !receiver_id || (!message && !file_url)) return;
 
-      // Guarda el mensaje en la BD
-      const query = `
-        INSERT INTO chat_messages (property_id, sender_id, receiver_id, message, file_url, file_name )
+      const messageSafe = typeof message === 'string' ? message.trim() : '';
+      const fileUrlSafe = file_url || null;
+      const fileNameSafe = file_name || null;
+  
+      const sql = `
+        INSERT INTO chat_messages (property_id, sender_id, receiver_id, message, file_url, file_name)
         VALUES (?, ?, ?, ?, ?, ?)
       `;
-      pool.query(query, [property_id || null, sender_id, receiver_id, message, file_url, file_name], (err, result) => {
-        if (err) return;
+
+      const vals = [
+        property_id || null,
+        sender_id,
+        receiver_id,
+        messageSafe,
+        fileUrlSafe,
+        fileNameSafe,
+      ];
+  
+      pool.query(sql, vals, (err, result) => {
+        if (err) {
+          console.error('[send_message] insert error', err);
+          return;
+        }
+  
         const msgObj = {
           id: result.insertId,
           property_id,
           sender_id,
           receiver_id,
-          message,
-          file_url,
-          file_name,
-          created_at: new Date().toISOString()
+          message: messageSafe,
+          file_url: fileUrlSafe,
+          file_name: fileNameSafe,
+          created_at: new Date().toISOString(),
         };
+  
+        // Limpia hidden_chats del receptor para este hilo
         pool.query(
           `DELETE FROM hidden_chats
            WHERE user_id = ? AND chat_with_user_id = ? AND (property_id <=> ?)`,
           [receiver_id, sender_id, property_id ?? null],
-          (err2) => {
-            if (err2) {
-              console.error('Error limpiando hidden_chats:', err2);
-            }
-          }
+          (e2) => { if (e2) console.error('[send_message] hidden_chats error', e2); }
         );
-        // Emite a ambos usuarios (receptor y emisor)
+
+        if (msgObj.file_url) {
+          msgObj.signed_file_url = buildDeliveryUrlFromSecure(msgObj.file_url, msgObj.file_name);
+        }
+
+        socket.emit('receive_message', msgObj);
+  
         io.to('user_' + sender_id).emit('receive_message', msgObj);
         io.to('user_' + receiver_id).emit('receive_message', msgObj);
       });
-
+    });
+  
     // Eliminar mensaje
     socket.on('delete_message', ({ message_id, user_id }) => {
       if (!message_id || !user_id) return;
-    
+  
       const q = `
         SELECT sender_id, receiver_id, property_id
         FROM chat_messages
@@ -1134,29 +1291,41 @@ app.get('/api/buying-power/:user_id', authenticateToken, (req, res) => {
       pool.query(q, [message_id], (err, rows) => {
         if (err || !rows.length) return;
         const msg = rows[0];
-    
-        // autoriza solo participantes
+  
+        // Solo participantes pueden borrar
         if (String(msg.sender_id) !== String(user_id) &&
             String(msg.receiver_id) !== String(user_id)) {
           return;
         }
-    
-        pool.query(
-          'UPDATE chat_messages SET is_deleted = 1 WHERE id = ?',
-          [message_id],
-          (updErr) => {
-            if (updErr) return;
-    
-            // notifica a ambos
-            io.to('user_' + msg.sender_id).emit('message_deleted', { message_id });
-            io.to('user_' + msg.receiver_id).emit('message_deleted', { message_id });
-          }
-        );
+  
+        pool.query('UPDATE chat_messages SET is_deleted = 1 WHERE id = ?', [message_id], (updErr) => {
+          if (updErr) return;
+          io.to('user_' + msg.sender_id).emit('message_deleted', { message_id });
+          io.to('user_' + msg.receiver_id).emit('message_deleted', { message_id });
+        });
       });
     });
   });
-});
 
+app.get('/api/chat/file-url/:message_id', authenticateToken, (req, res) => {
+  const { message_id } = req.params;
+  const me = req.user.id;
+  const sql = `
+    SELECT id, sender_id, receiver_id, file_url
+    FROM chat_messages
+    WHERE id = ?
+    LIMIT 1
+  `;
+  pool.query(sql, [message_id], (err, rows) => {
+    if (err || !rows.length) return res.status(404).json({ error: 'No encontrado' });
+    const m = rows[0];
+    if (String(m.sender_id) !== String(me) && String(m.receiver_id) !== String(me)) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
+    const signed = m.file_url ? buildDeliveryUrlFromSecure(m.file_url, m.file_name) : null;
+    res.json({ signed_file_url: signed });
+  });
+});
 
 
 // GET Cargar historial entre dos usuarios y por propiedad
@@ -1188,10 +1357,17 @@ app.get('/api/chat/messages', authenticateToken, (req, res) => {
   pool.query(query, params, (err, results) => {
     if (err) return res.status(500).json({ error: 'No se pudo obtener los mensajes' });
 
-    // Marcar como leídos solo si hay property_id (ajusta según tu lógica)
-    pool.query(markAsRead, [me, user_id, property_id || null, property_id || null], (err2) => {
-      // No importa si hay error aquí para mostrar mensajes
-      res.json(results);
+    const ttl = Number(process.env.CLD_DEFAULT_URL_TTL_SECONDS || 300);
+    const mapped = results.map(row => {
+      if (row.file_url) {
+        const signed = signedDeliveryUrlFromSecure(row.file_url, ttl, row.file_name);
+        return { ...row, signed_file_url: signed };
+      }
+      return row;
+    });
+
+    pool.query(markAsRead, [me, user_id, property_id || null, property_id || null], () => {
+      res.json(mapped);
     });
   });
 });
@@ -1301,23 +1477,235 @@ app.put('/api/chat/mark-read', authenticateToken, (req, res) => {
   });
 });
 
-app.delete('/api/chat/delete-chat', authenticateToken, (req, res) => {
-  const { user_id, chat_with_user_id, property_id } = req.body;
-  if (!user_id || !chat_with_user_id || !property_id) {
-    return res.status(400).json({ error: 'Faltan campos' });
-  }
-  const query = `
-    DELETE FROM chat_messages
-    WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
-      AND property_id = ?
+app.get('/users/:id/delete-preview', authenticateToken, (req, res) => {
+  const uid = Number(req.params.id);
+  if (uid !== req.user.id) return res.status(403).json({ error: 'No autorizado' });
+
+  const qProps = `
+    SELECT id, address, price
+    FROM properties
+    WHERE created_by = ?
+    ORDER BY id DESC
+    LIMIT 200
   `;
-  const params = [user_id, chat_with_user_id, chat_with_user_id, user_id, property_id];
-  pool.query(query, params, (err, result) => {
-    if (err) {
-      console.error('Error eliminando chat:', err);
-      return res.status(500).json({ error: 'Error eliminando chat' });
+
+  const qCounts = `
+    SELECT
+      (SELECT COUNT(*) FROM properties WHERE created_by = ?)                          AS properties,
+      (SELECT COUNT(*) FROM property_images pi JOIN properties p ON p.id=pi.property_id WHERE p.created_by = ?) AS property_images,
+      (SELECT COUNT(*) FROM chat_messages WHERE sender_id = ? OR receiver_id = ?)     AS chat_messages,
+      (SELECT COUNT(*) FROM hidden_chats WHERE user_id = ? OR chat_with_user_id = ?)  AS hidden_chats,
+      (SELECT COUNT(*) FROM tenant_profiles WHERE user_id = ?)                        AS tenant_profiles,
+      (SELECT COUNT(*) FROM buying_power WHERE user_id = ?)                           AS buying_power
+  `;
+
+  pool.query(qProps, [uid], (e1, rowsProps=[]) => {
+    if (e1) return res.status(500).json({ error: 'No se pudo obtener propiedades' });
+
+    pool.query(qCounts, [uid, uid, uid, uid, uid, uid, uid, uid], (e2, rowsC=[]) => {
+      if (e2) return res.status(500).json({ error: 'No se pudo obtener conteos' });
+      const counts = rowsC[0] || {
+        properties: 0, property_images: 0, chat_messages: 0,
+        hidden_chats: 0, tenant_profiles: 0, buying_power: 0
+      };
+      res.json({ properties: rowsProps, counts });
+    });
+  });
+});
+
+
+// ========================================
+// DELETE ACCOUNT (transaccional todo-o-nada)
+// ========================================
+app.post('/users/:id/delete-account', authenticateToken, async (req, res) => {
+  const uid = Number(req.params.id);
+  if (uid !== req.user.id) return res.status(403).json({ error: 'No autorizado' });
+
+  // Abre conexión + TX
+  let cxn;
+  try {
+    cxn = await new Promise((resolve, reject) => pool.getConnection((e, c) => e ? reject(e) : resolve(c)));
+  } catch (e) {
+    return res.status(500).json({ error: 'No se pudo abrir transacción', step: 'transaction', details: String(e) });
+  }
+  const began = await new Promise(ok => cxn.beginTransaction(err => ok(!err)));
+  if (!began) {
+    cxn.release();
+    return res.status(500).json({ error: 'No se pudo iniciar transacción', step: 'transaction_begin' });
+  }
+
+  try {
+    // 1) Prepara IDs de propiedades del usuario (evita DELETE ... JOIN)
+    const props = await q(
+      cxn,
+      'SELECT id FROM properties WHERE created_by = ?',
+      [uid],
+      'select_properties'
+    );
+    const propIds = props.map(r => r.id);
+    // 2) chat_messages
+    await q(
+      cxn,
+      'DELETE FROM chat_messages WHERE sender_id = ? OR receiver_id = ?',
+      [uid, uid],
+      'delete_chat_messages'
+    );
+    // 3) hidden_chats
+    await q(
+      cxn,
+      'DELETE FROM hidden_chats WHERE user_id = ? OR chat_with_user_id = ?',
+      [uid, uid],
+      'delete_hidden_chats'
+    );
+    // 4) tenant_profiles
+    await q(
+      cxn,
+      'DELETE FROM tenant_profiles WHERE user_id = ?',
+      [uid],
+      'delete_tenant_profiles'
+    );
+    // 5) buying_power
+    await q(
+      cxn,
+      'DELETE FROM buying_power WHERE user_id = ?',
+      [uid],
+      'delete_buying_power'
+    );
+    // 6) property_images (solo si hay props)
+    if (propIds.length) {
+      // Borra en lotes para no pasar el límite de placeholders
+      const CHUNK = 500;
+      for (let i = 0; i < propIds.length; i += CHUNK) {
+        const slice = propIds.slice(i, i + CHUNK);
+        const placeholders = slice.map(() => '?').join(',');
+        await q(
+          cxn,
+          `DELETE FROM property_images WHERE property_id IN (${placeholders})`,
+          slice,
+          'delete_property_images'
+        );
+      }
     }
-    res.json({ ok: true, deleted: result.affectedRows });
+    // 7) properties
+    await q(
+      cxn,
+      'DELETE FROM properties WHERE created_by = ?',
+      [uid],
+      'delete_properties'
+    );
+
+    // 8A) Cloudinary – borra TODO lo del usuario en CHATS por carpeta u_<uid>
+    try {
+      await deleteUserChatUploadsByFolder(uid);
+    } catch (e) {
+      await new Promise(ok => cxn.rollback(() => ok(null)));
+      cxn.release();
+      return res.status(500).json({
+        error: 'Falló borrar carpetas de chats en Cloudinary',
+        step: 'cloudinary_chats_folders',
+        details: String(e),
+      });
+    }
+
+    // 8B) Cloudinary – borra TODO lo del usuario en PROPIEDADES por carpeta listed/<env>/image/u_<uid>
+    try {
+      await deleteUserPropertyUploadsByFolder(uid);
+    } catch (e) {
+      await new Promise(ok => cxn.rollback(() => ok(null)));
+      cxn.release();
+      return res.status(500).json({
+        error: 'Falló borrar imágenes de propiedades en Cloudinary',
+        step: 'cloud_properties_folders',
+        details: String(e),
+      });
+    }
+
+    // 9) users
+    await q(
+      cxn,
+      'DELETE FROM users WHERE id = ?',
+      [uid],
+      'delete_user'
+    );
+
+    // 10) Commit
+    const committed = await new Promise(ok => cxn.commit(err => ok(!err)));
+    if (!committed) {
+      await new Promise(ok => cxn.rollback(() => ok(null)));
+      cxn.release();
+      return res.status(500).json({ error: 'No se pudo confirmar transacción', step: 'commit' });
+    }
+
+    cxn.release();
+    res.json({ ok: true });
+  } catch (e) {
+    // Rollback + devuelve paso y SQL exacto que falló
+    await new Promise(ok => cxn.rollback(() => ok(null)));
+    cxn.release();
+    return res.status(500).json({
+      error: 'Error durante eliminación',
+      step: e?._step || 'sql',
+      sql: e?._sql,
+      details: e?.sqlMessage || e?.message || String(e),
+      code: e?.code,
+    });
+  }
+});
+
+app.post('/cloudinary/sign-upload', authenticateToken, (req, res) => {
+  const userId = req.user.id;
+  const {
+    resource_type = 'image',
+    folder,
+    tags = [],
+    context = {},              // { file_name: '...' } u otras claves
+    use_filename = true,       // importantísimo: el mismo valor se firmará
+    unique_filename = true,    // idem
+  } = req.body || {};
+
+  const upload_preset = process.env.CLD_PRESET_PRIVATE; // preset "authenticated"
+  if (!upload_preset) {
+    return res.status(500).json({ error: 'Falta configurar CLD_PRESET_PRIVATE' });
+  }
+
+  const baseFolder = process.env.CLD_BASE_FOLDER || 'listed';
+  const envFolder = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+  const rawFolder = folder || `${baseFolder}/${envFolder}/${resource_type}/u_${userId}`;
+  const resolvedFolder = String(rawFolder);
+
+  const ctxEntries = Object.entries(context || {}).map(([k, v]) => [String(k), String(v ?? '')]);
+  ctxEntries.sort(([a], [b]) => a.localeCompare(b));
+  const contextStr = ctxEntries.length ? ctxEntries.map(([k, v]) => `${k}=${v}`).join('|') : '';
+
+  const tagsArr = (Array.isArray(tags) ? tags : []).map(String);
+  const tagsStr = tagsArr.length ? tagsArr.join(',') : '';
+
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  const toSign = {
+    timestamp,
+    upload_preset,
+    folder: resolvedFolder,
+    ...(tagsStr ? { tags: tagsStr } : {}),
+    ...(contextStr ? { context: contextStr } : {}),
+    use_filename: use_filename ? 'true' : 'false',
+    unique_filename: unique_filename ? 'true' : 'false',
+  };
+
+  const signature = cloudinary.utils.api_sign_request(toSign, process.env.CLOUDINARY_API_SECRET);
+
+  return res.json({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    resource_type,
+    upload_preset,
+    timestamp,
+    signature,
+    folder: resolvedFolder,
+    signed_context: contextStr || undefined,
+    signed_tags: tagsStr || undefined,
+    use_filename: !!use_filename,
+    unique_filename: !!unique_filename,
   });
 });
 
@@ -1337,7 +1725,6 @@ app.post('/api/tenant-profile', authenticateToken, (req, res) => {
     pets_count
   } = req.body;
 
-  // Permite valores null (enviados como undefined del frontend)
   const query = `
     INSERT INTO tenant_profiles (
       user_id, preferred_move_date, preferred_contract_duration,
@@ -1477,7 +1864,7 @@ app.get('/api/places/autocomplete', async (req, res) => {
 
     const url = new URL('https://maps.googleapis.com/maps/api/place/autocomplete/json');
     url.searchParams.set('input', input);
-    url.searchParams.set('types', '(cities)');
+    url.searchParams.set('types', 'address');
     url.searchParams.set('components', 'country:mx');
     url.searchParams.set('language', 'es');
     url.searchParams.set('key', process.env.MAPS_KEY);
@@ -1518,6 +1905,7 @@ app.get('/api/places/geocode', async (req, res) => {
 
     const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
     url.searchParams.set('address', address);
+    url.searchParams.set('types', 'address');
     url.searchParams.set('components', `country:${country}`);
     url.searchParams.set('key', process.env.MAPS_KEY);
 
