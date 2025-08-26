@@ -16,6 +16,7 @@ const authenticateToken = require('./middleware/authenticateToken');
 const { OAuth2Client } = require('google-auth-library');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const cloudinary = require('cloudinary').v2;
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -102,11 +103,6 @@ function parseCloudinary(secureUrl) {
   if (!m) return null;
   const [, cloud, resource_type, type, version, public_id, format] = m;
   return { cloud, resource_type, type, version: version ? Number(version) : undefined, public_id, format };
-}
-
-function extFromFilename(name) {
-  const m = /(?:\.)([a-z0-9]+)$/i.exec(name || '');
-  return m ? m[1].toLowerCase() : undefined;
 }
 
 function buildDeliveryUrlFromSecure(secureUrl, filename, ttlSeconds = 300) {
@@ -1307,25 +1303,25 @@ app.get('/api/buying-power/:user_id', authenticateToken, (req, res) => {
     });
   });
 
-app.get('/api/chat/file-url/:message_id', authenticateToken, (req, res) => {
-  const { message_id } = req.params;
-  const me = req.user.id;
-  const sql = `
-    SELECT id, sender_id, receiver_id, file_url
-    FROM chat_messages
-    WHERE id = ?
-    LIMIT 1
-  `;
-  pool.query(sql, [message_id], (err, rows) => {
-    if (err || !rows.length) return res.status(404).json({ error: 'No encontrado' });
-    const m = rows[0];
-    if (String(m.sender_id) !== String(me) && String(m.receiver_id) !== String(me)) {
-      return res.status(403).json({ error: 'No autorizado' });
-    }
-    const signed = m.file_url ? buildDeliveryUrlFromSecure(m.file_url, m.file_name) : null;
-    res.json({ signed_file_url: signed });
+  app.get('/api/chat/file-url/:message_id', authenticateToken, (req, res) => {
+    const { message_id } = req.params;
+    const me = req.user.id;
+    const sql = `
+      SELECT id, sender_id, receiver_id, file_url, file_name
+      FROM chat_messages
+      WHERE id = ?
+      LIMIT 1
+    `;
+    pool.query(sql, [message_id], (err, rows) => {
+      if (err || !rows.length) return res.status(404).json({ error: 'No encontrado' });
+      const m = rows[0];
+      if (String(m.sender_id) !== String(me) && String(m.receiver_id) !== String(me)) {
+        return res.status(403).json({ error: 'No autorizado' });
+      }
+      const signed = m.file_url ? buildDeliveryUrlFromSecure(m.file_url, m.file_name) : null;
+      res.json({ signed_file_url: signed });
+    });
   });
-});
 
 
 // GET Cargar historial entre dos usuarios y por propiedad
