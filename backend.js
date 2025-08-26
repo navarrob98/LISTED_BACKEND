@@ -16,7 +16,7 @@ const authenticateToken = require('./middleware/authenticateToken');
 const { OAuth2Client } = require('google-auth-library');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
-const cloudinary = require('cloudinary').v2;
+const { v2: cloudinary } = require('cloudinary');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -47,7 +47,7 @@ function extFromFilename(name) {
 function signedDeliveryUrlFromSecure(
   secureUrl,
   ttlSeconds = Number(process.env.CLD_DEFAULT_URL_TTL_SECONDS || 300),
-  filename // ← pásalo desde tus endpoints/sockets
+  filename
 ) {
   const meta = parseCloudinary(secureUrl);
   if (!meta) return null;
