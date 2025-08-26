@@ -1,5 +1,4 @@
-const { v2: cloudinary } = require('cloudinary');
-
+const cloudinary = require('./cldnry');
 // --- utilidades comunes ---
 async function listSubfolders(path) {
   const out = [];

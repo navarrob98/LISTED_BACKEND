@@ -16,7 +16,7 @@ const authenticateToken = require('./middleware/authenticateToken');
 const { OAuth2Client } = require('google-auth-library');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
-const { v2: cloudinary } = require('cloudinary');
+const cloudinary = require('./cldnry');
 
 const app = express();
 const port = process.env.PORT || 3000;
