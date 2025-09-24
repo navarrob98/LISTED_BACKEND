@@ -16,23 +16,74 @@ const authenticateToken = require('./middleware/authenticateToken');
 const { OAuth2Client } = require('google-auth-library');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
-const cloudinary = require('./cldnry');
+const cloudinary = require('./cldnry')
 
 const app = express();
 const port = process.env.PORT || 3000;
 const dbPassword = process.env.DB_KEY;
 
+const Stripe = require('stripe');
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+
+// El webhook DEBE usar express.raw y estar definido antes del bodyParser.json
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+  } catch (err) {
+    console.error('[stripe/webhook] constructEvent error:', err?.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === 'payment_intent.succeeded') {
+      const pi = event.data.object; // Stripe.PaymentIntent
+      const [rows] = await pool.promise().query(
+        'SELECT id, property_id FROM promotions WHERE stripe_payment_intent=? LIMIT 1',
+        [pi.id]
+      );
+      const promo = Array.isArray(rows) && rows[0];
+      if (promo) {
+        await pool.promise().query(
+          'UPDATE promotions SET status="paid", expires_at=DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id=?',
+          [promo.id]
+        );
+        await pool.promise().query(
+          'UPDATE properties SET promoted_until=DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id=?',
+          [promo.property_id]
+        );
+      }
+    }
+
+    if (event.type === 'payment_intent.payment_failed') {
+      const pi = event.data.object; // Stripe.PaymentIntent
+      await pool.promise().query(
+        'UPDATE promotions SET status="canceled" WHERE stripe_payment_intent=?',
+        [pi.id]
+      );
+    }
+
+    return res.json({ received: true });
+  } catch (e) {
+    console.error('[stripe/webhook] handler error:', e);
+    return res.status(500).send('Server error');
+  }
+});
+
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
 
-const pool = mysql.createPool({
-  host: process.env.MYSQLHOST,
-  user: process.env.MYSQLUSER,
-  password: process.env.MYSQLPASSWORD,
-  database: process.env.MYSQLDATABASE,
-  port: process.env.MYSQLPORT,
-});
+// const pool = mysql.createPool({
+//   host: process.env.MYSQLHOST,
+//   user: process.env.MYSQLUSER,
+//   password: process.env.MYSQLPASSWORD,
+//   database: process.env.MYSQLDATABASE,
+//   port: process.env.MYSQLPORT,
+// });
 
 function extFromFilename(name) {
   const m = /(?:\.)([a-z0-9]+)$/i.exec(name || '');
@@ -152,13 +203,13 @@ async function sendVerificationEmail(to, code) {
   });
 }
 
-// const pool = mysql.createPool({
-//   host: 'localhost',
-//   user: 'root',
-//   password: dbPassword,
-//   database: 'listed_property_sell',
-//   connectionLimit: 10
-// });
+const pool = mysql.createPool({
+  host: 'localhost',
+  user: 'root',
+  password: dbPassword,
+  database: 'listed_property_sell',
+  connectionLimit: 10
+});
 
 const GOOGLE_CLIENT_IDS = [
   // 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com', // IOS_CLIENT_ID
@@ -189,6 +240,7 @@ app.post('/properties/add', authenticateToken, (req, res) => {
     type,
     address,
     price,
+    price_original,
     monthly_pay,
     bedrooms,
     bathrooms,
@@ -217,7 +269,7 @@ app.post('/properties/add', authenticateToken, (req, res) => {
   const created_by = req.user.id;
   const query = `
     INSERT INTO properties (
-      type, address, price, monthly_pay,
+      type, address, price, price_original, monthly_pay,
       bedrooms, bathrooms, half_bathrooms,
       land, construction, description,
       sell_rent, date_build, estate_type,
@@ -226,11 +278,12 @@ app.post('/properties/add', authenticateToken, (req, res) => {
       water_serv, electricity_serv,
       sewer_serv, garbage_collection_serv,
       solar, ac, laundry_room, lat, lng, created_by
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `;
   const values = [
     type,
     address,
+    price || null, 
     price || null,
     monthly_pay || null,
     bedrooms,
@@ -310,11 +363,11 @@ app.put('/properties/:id', authenticateToken, (req, res) => {
     return res.status(400).json({ error: 'Faltan parámetros' });
   }
 
-  // 1) Manejo de imágenes (arrays opcionales)
-  const imagesAdd = Array.isArray(incoming.images_add) ? incoming.images_add.filter(Boolean) : [];
+  // 1) Imágenes (arrays opcionales)
+  const imagesAdd    = Array.isArray(incoming.images_add) ? incoming.images_add.filter(Boolean) : [];
   const imagesRemove = Array.isArray(incoming.images_remove_urls) ? incoming.images_remove_urls.filter(Boolean) : [];
 
-  // 2) Campos permitidos de la tabla properties (según tu esquema)
+  // 2) Campos permitidos en 'properties'
   const colTypes = {
     address: 'string',
     price: 'number',
@@ -348,9 +401,12 @@ app.put('/properties/:id', authenticateToken, (req, res) => {
   const values = [];
 
   const castValue = (val, type) => {
-    if (val === '' || val === undefined) return null;
+    // Normaliza null-ish
+    if (val === '' || val === undefined || val === null) return null;
+    if (typeof val === 'string' && val.trim().toLowerCase() === 'null') return null;
+
     if (type === 'string') return String(val).trim();
-    if (type === 'int') { const n = parseInt(val, 10); return Number.isFinite(n) ? n : null; }
+    if (type === 'int')    { const n = parseInt(val, 10);    return Number.isFinite(n) ? n : null; }
     if (type === 'float' || type === 'number') { const n = parseFloat(val); return Number.isFinite(n) ? n : null; }
     if (type === 'bool') {
       if (val === true || val === 'true' || val === 1 || val === '1') return 1;
@@ -360,20 +416,22 @@ app.put('/properties/:id', authenticateToken, (req, res) => {
     return val;
   };
 
+  // Crea SET dinámico para todo lo que NO sea precio
   for (const key of Object.keys(incoming)) {
     if (!(key in colTypes)) continue;
+    if (key === 'price') continue; // el precio lo manejamos aparte
     const casted = castValue(incoming[key], colTypes[key]);
     setFragments.push(`${key} = ?`);
     values.push(casted);
   }
 
-  // Verifica que el usuario sea dueño de la propiedad
+  // Verifica dueño
   const checkOwnerSql = `SELECT id FROM properties WHERE id = ? AND created_by = ?`;
   pool.query(checkOwnerSql, [id, req.user.id], (chkErr, chkRows) => {
-    if (chkErr) return res.status(500).json({ error: 'Error de permisos' });
-    if (chkRows.length === 0) return res.status(403).json({ error: 'No autorizado' });
+    if (chkErr)   return res.status(500).json({ error: 'Error de permisos' });
+    if (!chkRows || chkRows.length === 0) return res.status(403).json({ error: 'No autorizado' });
 
-    // Inicia operaciones sobre imágenes
+    // Helpers imágenes
     const doRemovals = (cb) => {
       if (!imagesRemove.length) return cb();
       const placeholders = imagesRemove.map(() => '?').join(',');
@@ -386,9 +444,9 @@ app.put('/properties/:id', authenticateToken, (req, res) => {
 
     const doAdds = (cb) => {
       if (!imagesAdd.length) return cb();
-      const values = imagesAdd.map(url => [id, url]);
+      const vals = imagesAdd.map(url => [id, url]);
       const insSql = `INSERT INTO property_images (property_id, image_url) VALUES ?`;
-      pool.query(insSql, [values], (insErr) => cb(insErr));
+      pool.query(insSql, [vals], (insErr) => cb(insErr));
     };
 
     // Ejecuta: borrar → agregar → update properties
@@ -398,24 +456,59 @@ app.put('/properties/:id', authenticateToken, (req, res) => {
       doAdds((addErr) => {
         if (addErr) return res.status(500).json({ error: 'No se pudieron agregar imágenes' });
 
-        if (setFragments.length === 0) {
-          // No hay update de properties, solo imágenes
+        // Si no hay SET (solo imágenes)
+        const isPriceUpdate = Object.prototype.hasOwnProperty.call(incoming, 'price');
+        if (!isPriceUpdate && setFragments.length === 0) {
           return res.json({ message: 'Actualizada (imágenes)', updatedFields: [] });
         }
 
-        values.push(id, req.user.id);
-        const sql = `
-          UPDATE properties
-          SET ${setFragments.join(', ')}
-          WHERE id = ? AND created_by = ?
-        `;
-        pool.query(sql, values, (err, result) => {
-          if (err) return res.status(500).json({ error: 'No se pudo actualizar', details: err });
-          if (result.affectedRows === 0) return res.status(404).json({ error: 'Propiedad no encontrada o no autorizada' });
-          res.json({
-            message: 'Actualizada',
-            updatedFields: setFragments.map(f => f.split('=')[0].trim()),
-          });
+        let sql, params;
+
+        if (isPriceUpdate) {
+          // Nuevo precio ya casteado
+          const newPrice = castValue(incoming.price, 'number');
+
+          // Orden crítico (MySQL evalúa SET de izq → der):
+          // 1) price_prev = price                 (captura el ANTERIOR)
+          // 2) price_original = COALESCE(price_original, price)  (si venía NULL, fija el BASE al ANTERIOR)
+          // 3) price = ?                          (aplica el NUEVO)
+          const priceBlock = `
+            price_prev = price,
+            price_original = COALESCE(price_original, price),
+            price = ?
+          `;
+
+          sql = `
+            UPDATE properties
+            SET ${setFragments.join(', ')}${setFragments.length ? ',' : ''} ${priceBlock}
+            WHERE id = ? AND created_by = ?
+          `;
+          params = [...values, newPrice, id, req.user.id];
+        } else {
+          // Update normal sin precio
+          sql = `
+            UPDATE properties
+            SET ${setFragments.join(', ')}
+            WHERE id = ? AND created_by = ?
+          `;
+          params = [...values, id, req.user.id];
+        }
+
+        pool.query(sql, params, (err, result) => {
+          if (err) {
+            console.error('[PUT /properties/:id] SQL ERROR', { sql, params, code: err.code, sqlMessage: err.sqlMessage });
+            return res.status(500).json({ error: 'No se pudo actualizar', details: err.sqlMessage || String(err) });
+          }
+          if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Propiedad no encontrada o no autorizada' });
+          }
+
+          const updatedFields = [
+            ...setFragments.map(f => f.split('=')[0].trim()),
+            ...(isPriceUpdate ? ['price_prev', 'price_original', 'price'] : []),
+          ];
+
+          res.json({ message: 'Actualizada', updatedFields });
         });
       });
     });
@@ -431,12 +524,23 @@ app.get('/properties', (req, res) => {
   ) {
     return res.status(400).json({ error: 'Faltan parámetros de región' });
   }
+
   const query = `
-    SELECT p.*, 
-      (SELECT image_url FROM property_images pi WHERE pi.property_id = p.id LIMIT 1) AS images
+    SELECT
+      p.*,
+      (SELECT image_url
+         FROM property_images pi
+        WHERE pi.property_id = p.id
+        ORDER BY pi.id ASC
+        LIMIT 1) AS images,
+      CASE
+        WHEN p.price_original IS NULL OR p.price_original <= 0 OR p.price >= p.price_original THEN 0
+        ELSE ROUND(((p.price_original - p.price) / p.price_original) * 100, 1)
+      END AS discount_percent
     FROM properties p
-    WHERE lat BETWEEN ? AND ?
-      AND lng BETWEEN ? AND ?
+    WHERE p.lat BETWEEN ? AND ?
+      AND p.lng BETWEEN ? AND ?
+    ORDER BY p.id DESC
   `;
 
   pool.query(
@@ -445,10 +549,8 @@ app.get('/properties', (req, res) => {
     (err, results) => {
       if (err) {
         console.error('Error fetching properties:', err);
-        res.status(500).json({ error: 'Failed to fetch properties' });
-        return;
+        return res.status(500).json({ error: 'Failed to fetch properties' });
       }
-      console.log('get properties ping');
       res.json(results);
     }
   );
@@ -458,35 +560,37 @@ app.get('/properties', (req, res) => {
 app.get('/properties/:id', (req, res) => {
   const { id } = req.params;
 
-  pool.query(
-    `
-      SELECT properties.*, users.name as owner_name 
-      FROM properties
-      JOIN users ON properties.created_by = users.id
-      WHERE properties.id = ?
-    `, 
-    [id], 
-    (err, results) => {
-      if (err) return res.status(500).json({ error: 'Error al buscar la propiedad' });
-      if (results.length === 0) return res.status(404).json({ error: 'No encontrada' });
+  const sql = `
+    SELECT 
+      p.*,
+      u.name AS owner_name,
+      CASE
+        WHEN p.price_original IS NULL OR p.price_original <= 0 OR p.price >= p.price_original THEN 0
+        ELSE ROUND(((p.price_original - p.price) / p.price_original) * 100, 1)
+      END AS discount_percent
+    FROM properties p
+    JOIN users u ON p.created_by = u.id
+    WHERE p.id = ?
+    LIMIT 1
+  `;
 
-      const property = results[0];
+  pool.query(sql, [id], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Error al buscar la propiedad' });
+    if (!rows.length) return res.status(404).json({ error: 'No encontrada' });
 
-      // Ahora consulta las imágenes
-      pool.query(
-        `SELECT image_url FROM property_images WHERE property_id = ?`, 
-        [id], 
-        (imgErr, imgResults) => {
-          if (imgErr) {
-            console.error('Error fetching images:', imgErr);
-            return res.json({ ...property, images: [] });
-          }
-          const images = imgResults.map(img => img.image_url);
-          res.json({ ...property, images });
+    const property = rows[0];
+    pool.query(
+      `SELECT image_url FROM property_images WHERE property_id = ? ORDER BY id ASC`,
+      [id],
+      (imgErr, imgRows = []) => {
+        if (imgErr) {
+          console.error('Error fetching images:', imgErr);
+          return res.json({ ...property, images: [] });
         }
-      );
-    }
-  );
+        res.json({ ...property, images: imgRows.map(r => r.image_url) });
+      }
+    );
+  });
 });
 
 app.get('/my-properties', authenticateToken, (req, res) => {
@@ -494,14 +598,16 @@ app.get('/my-properties', authenticateToken, (req, res) => {
 
   const query = `
     SELECT 
-      p.*, 
-      (
-        SELECT image_url 
-        FROM property_images 
-        WHERE property_id = p.id 
-        ORDER BY id ASC 
-        LIMIT 1
-      ) AS images
+      p.*,
+      (SELECT image_url
+         FROM property_images
+        WHERE property_id = p.id
+        ORDER BY id ASC
+        LIMIT 1) AS images,
+      CASE
+        WHEN p.price_original IS NULL OR p.price_original <= 0 OR p.price >= p.price_original THEN 0
+        ELSE ROUND(((p.price_original - p.price) / p.price_original) * 100, 1)
+      END AS discount_percent
     FROM properties p
     WHERE p.created_by = ?
     ORDER BY p.id DESC
@@ -512,7 +618,6 @@ app.get('/my-properties', authenticateToken, (req, res) => {
       console.error('Error getting user properties:', err);
       return res.status(500).json({ error: 'Error al obtener tus propiedades.' });
     }
-    console.log('my properties endpoint ping');
     res.json(results);
   });
 });
@@ -1604,6 +1709,7 @@ app.post('/users/:id/delete-account', authenticateToken, async (req, res) => {
 app.post('/cloudinary/sign-upload', authenticateToken, (req, res) => {
   const userId = req.user.id;
   const {
+    kind = 'public',
     resource_type = 'image',
     folder,
     tags = [],
@@ -1612,7 +1718,10 @@ app.post('/cloudinary/sign-upload', authenticateToken, (req, res) => {
     unique_filename = true,    // idem
   } = req.body || {};
 
-  const upload_preset = process.env.CLD_PRESET_PRIVATE; // preset "authenticated"
+  const upload_preset =
+    kind === 'public'
+      ? process.env.CLD_PRESET_PUBLIC      // preset con access_mode=public
+      : process.env.CLD_PRESET_PRIVATE;    // preset con access_mode=authenticated
   if (!upload_preset) {
     return res.status(500).json({ error: 'Falta configurar CLD_PRESET_PRIVATE' });
   }
@@ -1908,4 +2017,69 @@ app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   if (res.headersSent) return next(err);
   res.status(500).json({ error: 'Error interno del servidor' });
+});
+
+// Stripe
+
+// POST /payments/promote/create-intent
+// Crear PaymentIntent para promocionar (100 MXN por 7 días)
+app.post('/payments/promote/create-intent', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { propertyId } = req.body || {};
+    if (!propertyId) return res.status(400).json({ error: 'Falta propertyId' });
+
+    // 1) Valida que la propiedad sea del usuario
+    const [rows] = await pool.promise().query(
+      'SELECT id, created_by FROM properties WHERE id=? LIMIT 1',
+      [propertyId]
+    );
+    // Verifica si ya está promocionada
+    const [prow] = await pool.promise().query(
+      'SELECT promoted_until FROM properties WHERE id=? LIMIT 1',
+      [propertyId]
+    );
+    const promotedUntil = Array.isArray(prow) && prow[0]?.promoted_until;
+    if (promotedUntil && new Date(promotedUntil).getTime() > Date.now()) {
+      return res.status(409).json({ error: 'already_promoted', message: 'La propiedad ya está promocionada.' });
+    }
+    const prop = Array.isArray(rows) && rows[0];
+    if (!prop) return res.status(404).json({ error: 'Propiedad no encontrada' });
+    if (String(prop.created_by) !== String(userId)) {
+      return res.status(403).json({ error: 'No autorizad@' });
+    }
+
+    // 2) Crea registro en promotions
+    const amount = 10000; // 100 MXN en centavos
+    const currency = 'mxn';
+    const [ins] = await pool.promise().query(
+      `INSERT INTO promotions (property_id, user_id, amount_cents, currency, status)
+       VALUES (?,?,?,?, 'pending')`,
+      [propertyId, userId, amount, currency]
+    );
+    const promoId = ins.insertId;
+
+    // 3) Crea PaymentIntent
+    const intent = await stripe.paymentIntents.create({
+      amount,
+      currency,
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        propertyId: String(propertyId),
+        promotionId: String(promoId),
+        userId: String(userId),
+      },
+    });
+
+    // 4) Guarda el id del PI
+    await pool.promise().query(
+      'UPDATE promotions SET stripe_payment_intent=? WHERE id=?',
+      [intent.id, promoId]
+    );
+
+    return res.json({ clientSecret: intent.client_secret });
+  } catch (e) {
+    console.error('[create-intent] error', e);
+    return res.status(500).json({ error: 'No se pudo crear el intento de pago' });
+  }
 });
