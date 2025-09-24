@@ -77,13 +77,13 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 app.use(cors());
 app.use(bodyParser.json());
 
-// const pool = mysql.createPool({
-//   host: process.env.MYSQLHOST,
-//   user: process.env.MYSQLUSER,
-//   password: process.env.MYSQLPASSWORD,
-//   database: process.env.MYSQLDATABASE,
-//   port: process.env.MYSQLPORT,
-// });
+const pool = mysql.createPool({
+  host: process.env.MYSQLHOST,
+  user: process.env.MYSQLUSER,
+  password: process.env.MYSQLPASSWORD,
+  database: process.env.MYSQLDATABASE,
+  port: process.env.MYSQLPORT,
+});
 
 function extFromFilename(name) {
   const m = /(?:\.)([a-z0-9]+)$/i.exec(name || '');
@@ -203,13 +203,13 @@ async function sendVerificationEmail(to, code) {
   });
 }
 
-const pool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: dbPassword,
-  database: 'listed_property_sell',
-  connectionLimit: 10
-});
+// const pool = mysql.createPool({
+//   host: 'localhost',
+//   user: 'root',
+//   password: dbPassword,
+//   database: 'listed_property_sell',
+//   connectionLimit: 10
+// });
 
 const GOOGLE_CLIENT_IDS = [
   // 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com', // IOS_CLIENT_ID
