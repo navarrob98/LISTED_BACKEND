@@ -16,7 +16,7 @@ const authenticateToken = require('./middleware/authenticateToken');
 const { OAuth2Client } = require('google-auth-library');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
-const cloudinary = require('./cldnry')
+const cloudinary = require('./cldnry');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -25,7 +25,6 @@ const dbPassword = process.env.DB_KEY;
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
-// El webhook DEBE usar express.raw y estar definido antes del bodyParser.json
 app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -120,7 +119,7 @@ const mailer = nodemailer.createTransport({
   service: 'gmail',
   auth: {
     type: 'OAuth2',
-    user: process.env.SMTP_USER,         // tu_correo@gmail.com
+    user: process.env.SMTP_USER,
     clientId: process.env.GMAIL_CLIENT_ID,
     clientSecret: process.env.GMAIL_CLIENT_SECRET,
     refreshToken: process.env.GMAIL_REFRESH_TOKEN,
@@ -957,7 +956,6 @@ app.post('/users/login', (req, res) => {
     const u = rows[0];
     const ok = await bcrypt.compare(password, u.password);
     if (!u.email_verified) {
-      console.log('here', u.email_verified);
       return res.status(403).json({
         error: 'Debes verificar tu correo antes de iniciar sesión.',
         need_verification: true,
@@ -970,9 +968,7 @@ app.post('/users/login', (req, res) => {
 
     let citiesArr = null;
     try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {
-      console.error('here');
     }
-    console.log(res);
     return res.json({
       token,
       user: {
