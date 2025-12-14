@@ -254,13 +254,13 @@ async function sendPushToUser({ userId, title, body, data }) {
   });
 }
 
-const pool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: dbPassword,
-  database: 'listed_property_sell',
-  connectionLimit: 10
-});
+// const pool = mysql.createPool({
+//   host: 'localhost',
+//   user: 'root',
+//   password: dbPassword,
+//   database: 'listed_property_sell',
+//   connectionLimit: 10
+// });
 
 const GOOGLE_CLIENT_IDS = [
   // 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com', // IOS_CLIENT_ID
