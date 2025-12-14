@@ -17,6 +17,9 @@ const { OAuth2Client } = require('google-auth-library');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const cloudinary = require('./cldnry');
+const { Expo } = require('expo-server-sdk');
+const expo = new Expo();
+
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -209,6 +212,62 @@ async function sendVerificationEmail(to, code) {
 //   database: 'listed_property_sell',
 //   connectionLimit: 10
 // });
+function isExpoToken(t) {
+  return typeof t === 'string' && Expo.isExpoPushToken(t);
+}
+
+async function sendPushToUser({ userId, title, body, data }) {
+  return new Promise((resolve) => {
+    pool.query(
+      `SELECT expo_push_token FROM user_push_tokens WHERE user_id = ?`,
+      [userId],
+      async (err, rows) => {
+        if (err) {
+          console.error('[push] db error', err);
+          return resolve(false);
+        }
+
+        const tokens = (rows || [])
+          .map(r => r.expo_push_token)
+          .filter(isExpoToken);
+
+        if (!tokens.length) return resolve(true); // no tokens = nada que mandar
+
+        const messages = tokens.map(token => ({
+          to: token,
+          sound: 'default',
+          title,
+          body,
+          data,
+          // Android: usa el channel "chat" que creaste en la app
+          channelId: 'chat',
+          priority: 'high',
+        }));
+
+        try {
+          const chunks = expo.chunkPushNotifications(messages);
+          for (const chunk of chunks) {
+            const tickets = await expo.sendPushNotificationsAsync(chunk);
+            // opcional: log de tickets si quieres depurar
+            console.log('[push] tickets', tickets);
+          }
+          return resolve(true);
+        } catch (e) {
+          console.error('[push] send error', e);
+          return resolve(false);
+        }
+      }
+    );
+  });
+}
+
+const pool = mysql.createPool({
+  host: 'localhost',
+  user: 'root',
+  password: dbPassword,
+  database: 'listed_property_sell',
+  connectionLimit: 10
+});
 
 const GOOGLE_CLIENT_IDS = [
   // 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com', // IOS_CLIENT_ID
@@ -528,7 +587,7 @@ app.get('/properties', (req, res) => {
     SELECT
       p.*,
       (SELECT image_url
-         FROM property_images pi
+        FROM property_images pi
         WHERE pi.property_id = p.id
         ORDER BY pi.id ASC
         LIMIT 1) AS images,
@@ -539,7 +598,9 @@ app.get('/properties', (req, res) => {
     FROM properties p
     WHERE p.lat BETWEEN ? AND ?
       AND p.lng BETWEEN ? AND ?
-    ORDER BY p.id DESC
+    ORDER BY
+      (p.promoted_until IS NOT NULL AND p.promoted_until > NOW()) DESC,
+      p.id DESC
   `;
 
   pool.query(
@@ -550,6 +611,7 @@ app.get('/properties', (req, res) => {
         console.error('Error fetching properties:', err);
         return res.status(500).json({ error: 'Failed to fetch properties' });
       }
+      console.log(results);
       res.json(results);
     }
   );
@@ -609,7 +671,9 @@ app.get('/my-properties', authenticateToken, (req, res) => {
       END AS discount_percent
     FROM properties p
     WHERE p.created_by = ?
-    ORDER BY p.id DESC
+    ORDER BY
+      (p.promoted_until IS NOT NULL AND p.promoted_until > NOW()) DESC,
+      p.id DESC
   `;
 
   pool.query(query, [userId], (err, results) => {
@@ -1261,101 +1325,125 @@ app.get('/api/buying-power/:user_id', authenticateToken, (req, res) => {
   });
 });
 
-  // Chat socket.io endpoints
+// Chat socket.io endpoints
+io.on('connection', (socket) => {
+  // El cliente llama: socket.emit('join', { userId })
+  socket.on('join', ({ userId }) => {
+    if (userId) socket.join('user_' + userId);
+  });
 
-  io.on('connection', (socket) => {
-    // El cliente llama: socket.emit('join', { userId })
-    socket.on('join', ({ userId }) => {
-      if (userId) socket.join('user_' + userId);
-    });
-  
-    // Enviar mensaje (texto y/o archivo)
-    socket.on('send_message', (data) => {
-      const { sender_id, receiver_id, property_id, message, file_url, file_name } = data || {};
-      if (!sender_id || !receiver_id || (!message && !file_url)) return;
+  // Enviar mensaje (texto y/o archivo)
+  socket.on('send_message', (data) => {
+    const { sender_id, receiver_id, property_id, message, file_url, file_name } = data || {};
+    if (!sender_id || !receiver_id || (!message && !file_url)) return;
 
-      const messageSafe = typeof message === 'string' ? message.trim() : '';
-      const fileUrlSafe = file_url || null;
-      const fileNameSafe = file_name || null;
-  
-      const sql = `
-        INSERT INTO chat_messages (property_id, sender_id, receiver_id, message, file_url, file_name)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `;
+    const messageSafe = typeof message === 'string' ? message.trim() : '';
+    const fileUrlSafe = file_url || null;
+    const fileNameSafe = file_name || null;
 
-      const vals = [
-        property_id || null,
+    const sql = `
+      INSERT INTO chat_messages (property_id, sender_id, receiver_id, message, file_url, file_name)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `;
+    const vals = [
+      property_id || null,
+      sender_id,
+      receiver_id,
+      messageSafe,
+      fileUrlSafe,
+      fileNameSafe,
+    ];
+
+    pool.query(sql, vals, async (err, result) => {
+      if (err) {
+        console.error('[send_message] insert error', err);
+        return;
+      }
+
+      const msgObj = {
+        id: result.insertId,
+        property_id,
         sender_id,
         receiver_id,
-        messageSafe,
-        fileUrlSafe,
-        fileNameSafe,
-      ];
-  
-      pool.query(sql, vals, (err, result) => {
-        if (err) {
-          console.error('[send_message] insert error', err);
-          return;
-        }
-  
-        const msgObj = {
-          id: result.insertId,
-          property_id,
-          sender_id,
-          receiver_id,
-          message: messageSafe,
-          file_url: fileUrlSafe,
-          file_name: fileNameSafe,
-          created_at: new Date().toISOString(),
-        };
-  
-        // Limpia hidden_chats del receptor para este hilo
-        pool.query(
-          `DELETE FROM hidden_chats
-           WHERE user_id = ? AND chat_with_user_id = ? AND (property_id <=> ?)`,
-          [receiver_id, sender_id, property_id ?? null],
-          (e2) => { if (e2) console.error('[send_message] hidden_chats error', e2); }
-        );
+        message: messageSafe,
+        file_url: fileUrlSafe,
+        file_name: fileNameSafe,
+        created_at: new Date().toISOString(),
+      };
 
-        if (msgObj.file_url) {
-          msgObj.signed_file_url = buildDeliveryUrlFromSecure(msgObj.file_url, msgObj.file_name);
+      // Limpia hidden_chats del receptor para este hilo
+      pool.query(
+        `DELETE FROM hidden_chats
+         WHERE user_id = ? AND chat_with_user_id = ? AND (property_id <=> ?)`,
+        [receiver_id, sender_id, property_id ?? null],
+        (e2) => {
+          if (e2) console.error('[send_message] hidden_chats error', e2);
         }
+      );
 
-        socket.emit('receive_message', msgObj);
-  
-        io.to('user_' + sender_id).emit('receive_message', msgObj);
-        io.to('user_' + receiver_id).emit('receive_message', msgObj);
-      });
+      // Si hay adjunto, agrega URL firmada para entrega inmediata (si aplica)
+      if (msgObj.file_url) {
+        msgObj.signed_file_url = buildDeliveryUrlFromSecure(msgObj.file_url, msgObj.file_name);
+      }
+
+      // Socket realtime (lo tuyo)
+      socket.emit('receive_message', msgObj);
+      io.to('user_' + sender_id).emit('receive_message', msgObj);
+      io.to('user_' + receiver_id).emit('receive_message', msgObj);
+
+      // PUSH: mandar al receptor
+      sendPushToUser({
+        userId: receiver_id,
+        title: 'Nuevo mensaje',
+        body: messageSafe
+          ? (messageSafe.length > 110 ? messageSafe.slice(0, 110) + '…' : messageSafe)
+          : (fileUrlSafe ? 'Te enviaron un archivo' : 'Nuevo mensaje'),
+        data: {
+          type: 'chat', // recomendado para que el cliente lo detecte fácil
+          chatParams: {
+            otherUserId: String(sender_id),
+            propertyId: property_id != null ? String(property_id) : undefined,
+          },
+        },
+      }).catch((e) => console.error('[push] error', e));
     });
-  
-    // Eliminar mensaje
-    socket.on('delete_message', ({ message_id, user_id }) => {
-      if (!message_id || !user_id) return;
-  
-      const q = `
-        SELECT sender_id, receiver_id, property_id
-        FROM chat_messages
-        WHERE id = ?
-        LIMIT 1
-      `;
-      pool.query(q, [message_id], (err, rows) => {
-        if (err || !rows.length) return;
-        const msg = rows[0];
-  
-        // Solo participantes pueden borrar
-        if (String(msg.sender_id) !== String(user_id) &&
-            String(msg.receiver_id) !== String(user_id)) {
-          return;
-        }
-  
-        pool.query('UPDATE chat_messages SET is_deleted = 1 WHERE id = ?', [message_id], (updErr) => {
+  });
+
+  // Eliminar mensaje
+  socket.on('delete_message', ({ message_id, user_id }) => {
+    if (!message_id || !user_id) return;
+
+    const q = `
+      SELECT sender_id, receiver_id, property_id
+      FROM chat_messages
+      WHERE id = ?
+      LIMIT 1
+    `;
+
+    pool.query(q, [message_id], (err, rows) => {
+      if (err || !rows.length) return;
+      const msg = rows[0];
+
+      // Solo participantes pueden borrar
+      if (
+        String(msg.sender_id) !== String(user_id) &&
+        String(msg.receiver_id) !== String(user_id)
+      ) {
+        return;
+      }
+
+      pool.query(
+        'UPDATE chat_messages SET is_deleted = 1 WHERE id = ?',
+        [message_id],
+        (updErr) => {
           if (updErr) return;
           io.to('user_' + msg.sender_id).emit('message_deleted', { message_id });
           io.to('user_' + msg.receiver_id).emit('message_deleted', { message_id });
-        });
-      });
+        }
+      );
     });
   });
+});
 
   app.get('/api/chat/file-url/:message_id', authenticateToken, (req, res) => {
     const { message_id } = req.params;
@@ -1420,6 +1508,29 @@ app.get('/api/chat/messages', authenticateToken, (req, res) => {
       res.json(mapped);
     });
   });
+});
+
+app.post('/api/push/register', authenticateToken, (req, res) => {
+  const userId = req.user.id;
+  const { expoPushToken, deviceId, platform } = req.body || {};
+
+  if (!expoPushToken || typeof expoPushToken !== 'string') {
+    return res.status(400).json({ error: 'expoPushToken required' });
+  }
+
+  pool.query(
+    `INSERT INTO user_push_tokens (user_id, expo_push_token, device_id, platform)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE device_id = VALUES(device_id), platform = VALUES(platform), updated_at = CURRENT_TIMESTAMP`,
+    [userId, expoPushToken, deviceId || null, platform || null],
+    (err) => {
+      if (err) {
+        console.error('[push/register] db error', err);
+        return res.status(500).json({ error: 'db error' });
+      }
+      return res.json({ ok: true });
+    }
+  );
 });
 
 // GET Lista de conversaciones del usuario (resumen, no historial completo)
