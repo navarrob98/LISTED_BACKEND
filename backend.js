@@ -205,13 +205,6 @@ async function sendVerificationEmail(to, code) {
   });
 }
 
-// const pool = mysql.createPool({
-//   host: 'localhost',
-//   user: 'root',
-//   password: dbPassword,
-//   database: 'listed_property_sell',
-//   connectionLimit: 10
-// });
 function isExpoToken(t) {
   return typeof t === 'string' && Expo.isExpoPushToken(t);
 }
