@@ -211,8 +211,19 @@ function isExpoToken(t) {
 
 async function sendPushToUser({ userId, title, body, data }) {
   return new Promise((resolve) => {
+    console.log('[push] sendPushToUser', {
+      userId,
+      title,
+      bodyPreview: String(body || '').slice(0, 60),
+    });
+
     pool.query(
-      `SELECT expo_push_token FROM user_push_tokens WHERE user_id = ?`,
+      `
+      SELECT id, expo_push_token
+      FROM user_push_tokens
+      WHERE user_id = ?
+        AND is_active = 1
+      `,
       [userId],
       async (err, rows) => {
         if (err) {
@@ -220,31 +231,64 @@ async function sendPushToUser({ userId, title, body, data }) {
           return resolve(false);
         }
 
-        const tokens = (rows || [])
-          .map(r => r.expo_push_token)
-          .filter(isExpoToken);
+        console.log('[push] tokens_for_user', userId, rows);
 
-        if (!tokens.length) return resolve(true); // no tokens = nada que mandar
+        const tokenRows = Array.isArray(rows) ? rows : [];
+        const tokens = tokenRows
+          .map((r) => ({ id: r.id, token: r.expo_push_token }))
+          .filter((x) => isExpoToken(x.token));
 
-        const messages = tokens.map(token => ({
-          to: token,
+        if (!tokens.length) {
+          console.log('[push] no active expo tokens for user', userId);
+          return resolve(true);
+        }
+
+        const messages = tokens.map((t) => ({
+          to: t.token,
           sound: 'default',
           title,
           body,
-          data,
-          // Android: usa el channel "chat" que creaste en la app
+          data: data || {},
           channelId: 'chat',
           priority: 'high',
         }));
 
         try {
           const chunks = expo.chunkPushNotifications(messages);
+
+          // guardamos relación token -> ticket para poder desactivar si hace falta
+          const ticketMap = []; // [{ tokenId, token, ticket }]
+
           for (const chunk of chunks) {
             const tickets = await expo.sendPushNotificationsAsync(chunk);
-            // opcional: log de tickets si quieres depurar
-            console.log('[push] tickets', tickets);
+
+            for (let i = 0; i < tickets.length; i++) {
+              const ticket = tickets[i];
+              const to = chunk[i]?.to;
+
+              const match = tokens.find((x) => x.token === to);
+              if (match) ticketMap.push({ tokenId: match.id, token: match.token, ticket });
+            }
           }
-          return resolve(true);
+
+          console.log('[push] tickets', ticketMap.map((x) => x.ticket));
+
+          // Desactivar tokens inválidos (DeviceNotRegistered)
+          const invalidTokenIds = ticketMap
+            .filter((x) => x.ticket?.status === 'error' && x.ticket?.details?.error === 'DeviceNotRegistered')
+            .map((x) => x.tokenId);
+
+          if (!invalidTokenIds.length) return resolve(true);
+
+          pool.query(
+            `UPDATE user_push_tokens SET is_active=0, updated_at=NOW() WHERE id IN (?)`,
+            [invalidTokenIds],
+            (e2) => {
+              if (e2) console.error('[push] deactivate invalid tokens error', e2);
+              else console.log('[push] deactivated token ids', invalidTokenIds);
+              return resolve(true);
+            }
+          );
         } catch (e) {
           console.error('[push] send error', e);
           return resolve(false);
@@ -1328,6 +1372,14 @@ io.on('connection', (socket) => {
   // Enviar mensaje (texto y/o archivo)
   socket.on('send_message', (data) => {
     const { sender_id, receiver_id, property_id, message, file_url, file_name } = data || {};
+    console.log('[send_message] incoming', {
+      socketId: socket.id,
+      sender_id,
+      receiver_id,
+      property_id,
+      hasMessage: !!message,
+      hasFile: !!file_url,
+    });
     if (!sender_id || !receiver_id || (!message && !file_url)) return;
 
     const messageSafe = typeof message === 'string' ? message.trim() : '';
@@ -1392,13 +1444,13 @@ io.on('connection', (socket) => {
           ? (messageSafe.length > 110 ? messageSafe.slice(0, 110) + '…' : messageSafe)
           : (fileUrlSafe ? 'Te enviaron un archivo' : 'Nuevo mensaje'),
         data: {
-          type: 'chat', // recomendado para que el cliente lo detecte fácil
+          type: 'chat',
           chatParams: {
             otherUserId: String(sender_id),
             propertyId: property_id != null ? String(property_id) : undefined,
-          },
-        },
-      }).catch((e) => console.error('[push] error', e));
+          }
+        }
+      }).catch(e => console.error('[push] error', e));
     });
   });
 
@@ -1503,27 +1555,55 @@ app.get('/api/chat/messages', authenticateToken, (req, res) => {
   });
 });
 
-app.post('/api/push/register', authenticateToken, (req, res) => {
-  const userId = req.user.id;
-  const { expoPushToken, deviceId, platform } = req.body || {};
+app.post('/api/push/register', authenticateToken, async (req, res) => {
+  const userId = req.user.id; // o como lo tengas
+  const { expoPushToken, platform, deviceId } = req.body || {};
 
-  if (!expoPushToken || typeof expoPushToken !== 'string') {
-    return res.status(400).json({ error: 'expoPushToken required' });
+  if (!expoPushToken || !deviceId) {
+    return res.status(400).json({ ok: false, error: 'expoPushToken y deviceId son requeridos' });
   }
 
-  pool.query(
-    `INSERT INTO user_push_tokens (user_id, expo_push_token, device_id, platform)
-     VALUES (?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE device_id = VALUES(device_id), platform = VALUES(platform), updated_at = CURRENT_TIMESTAMP`,
-    [userId, expoPushToken, deviceId || null, platform || null],
-    (err) => {
-      if (err) {
-        console.error('[push/register] db error', err);
-        return res.status(500).json({ error: 'db error' });
-      }
-      return res.json({ ok: true });
-    }
+  try {
+    // 1) Desactiva todos los devices del usuario (garantiza “solo el actual”)
+    await pool.promise().query(
+      `UPDATE user_push_tokens SET is_active=0, updated_at=NOW() WHERE user_id=?`,
+      [userId]
+    );
+
+    // 2) UPSERT por device_id (mismo teléfono no crea filas nuevas)
+    await pool.promise().query(
+      `
+      INSERT INTO user_push_tokens (user_id, device_id, expo_push_token, platform, is_active, last_seen_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 1, NOW(), NOW(), NOW())
+      ON DUPLICATE KEY UPDATE
+        user_id = VALUES(user_id),
+        expo_push_token = VALUES(expo_push_token),
+        platform = VALUES(platform),
+        is_active = 1,
+        last_seen_at = NOW(),
+        updated_at = NOW()
+      `,
+      [userId, deviceId, expoPushToken, platform || null]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[push/register] error', e);
+    return res.status(500).json({ ok: false });
+  }
+});
+
+app.post('/api/push/logout', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { deviceId } = req.body || {};
+  if (!deviceId) return res.status(400).json({ ok: false });
+
+  await pool.promise().query(
+    `UPDATE user_push_tokens SET is_active=0, updated_at=NOW() WHERE user_id=? AND device_id=?`,
+    [userId, deviceId]
   );
+
+  res.json({ ok: true });
 });
 
 // GET Lista de conversaciones del usuario (resumen, no historial completo)
@@ -1611,23 +1691,33 @@ app.post('/api/chat/hide-chat', authenticateToken, (req, res) => {
 // PUT: Marcar mensajes como leídos
 app.put('/api/chat/mark-read', authenticateToken, (req, res) => {
   const { user_id, chat_with_user_id, property_id } = req.body;
-  if (!user_id || !chat_with_user_id) return res.status(400).json({ error: 'Faltan campos' });
-  let query = `
+
+  if (user_id == null || chat_with_user_id == null) {
+    return res.status(400).json({ error: 'Faltan campos' });
+  }
+
+  // Normaliza property_id: null si viene undefined/''; número si viene string numérica
+  const pid =
+    property_id === undefined || property_id === null || property_id === ''
+      ? null
+      : Number(property_id);
+
+  const query = `
     UPDATE chat_messages
     SET is_read = 1
     WHERE receiver_id = ?
       AND sender_id = ?
+      AND (property_id <=> ?)
   `;
-  const params = [user_id, chat_with_user_id];
-  if (property_id) {
-    query += ' AND property_id = ?';
-    params.push(property_id);
-  } else {
-    query += ' AND property_id IS NULL';
-  }
+
+  const params = [user_id, chat_with_user_id, pid];
+
   pool.query(query, params, (err, result) => {
-    if (err) return res.status(500).json({ error: 'No se pudo marcar como leído' });
-    res.json({ ok: true });
+    if (err) {
+      console.error('[mark-read] error', err);
+      return res.status(500).json({ error: 'No se pudo marcar como leído' });
+    }
+    res.json({ ok: true, affectedRows: result?.affectedRows ?? 0 });
   });
 });
 
