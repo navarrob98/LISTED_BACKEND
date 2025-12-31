@@ -19,6 +19,9 @@ const nodemailer = require('nodemailer');
 const cloudinary = require('./cldnry');
 const { Expo } = require('expo-server-sdk');
 const expo = new Expo();
+const requireAdmin = require('./middleware/requireAdmin');
+const requireVerifiedAgentFactory = require('./middleware/requireVerifiedAgent');
+
 
 
 const app = express();
@@ -330,124 +333,163 @@ server.listen(port, '0.0.0.0', () => {
 
 // Property Endpoints
 // Add property
-app.post('/properties/add', authenticateToken, (req, res) => {
-  const {
-    type,
-    address,
-    price,
-    price_original,
-    monthly_pay,
-    bedrooms,
-    bathrooms,
-    half_bathrooms,
-    land,
-    construction,
-    description,
-    sell_rent,
-    date_build,
-    estate_type,
-    parking_spaces,
-    stories,
-    private_pool,
-    new_construction,
-    water_serv,
-    electricity_serv,
-    sewer_serv,
-    garbage_collection_serv,
-    solar,
-    ac,
-    laundry_room,
-    lat,
-    lng,
-    images
-  } = req.body;
-  const created_by = req.user.id;
-  const query = `
-    INSERT INTO properties (
-      type, address, price, price_original, monthly_pay,
-      bedrooms, bathrooms, half_bathrooms,
-      land, construction, description,
-      sell_rent, date_build, estate_type,
-      parking_spaces, stories,
-      private_pool, new_construction,
-      water_serv, electricity_serv,
-      sewer_serv, garbage_collection_serv,
-      solar, ac, laundry_room, lat, lng, created_by
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `;
-  const values = [
-    type,
-    address,
-    price || null, 
-    price || null,
-    monthly_pay || null,
-    bedrooms,
-    bathrooms,
-    half_bathrooms || null,
-    land,
-    construction,
-    description || null,
-    sell_rent || null,
-    date_build || null,
-    estate_type || null,
-    parking_spaces || null,
-    stories || null,
-    private_pool ? 1 : 0,
-    new_construction ? 1 : 0,
-    water_serv ? 1 : 0,
-    electricity_serv ? 1 : 0,
-    sewer_serv ? 1 : 0,
-    garbage_collection_serv ? 1 : 0,
-    solar ? 1 : 0,
-    ac ? 1 : 0,
-    laundry_room ? 1 : 0,
-    lat || null,
-    lng || null,
-    created_by
-  ];
-  
-  pool.query(query, values, (err, results) => {
-    if (err) {
-      console.error('Error saving property:', err);
-      res.status(500).json({ error: 'Failed to save property' });
-      return;
+app.post("/properties/add", authenticateToken, async (req, res) => {
+  try {
+    const {
+      type,
+      address,
+      price,
+      price_original,
+      monthly_pay,
+      bedrooms,
+      bathrooms,
+      half_bathrooms,
+      land,
+      construction,
+      description,
+      sell_rent,
+      date_build,
+      estate_type,
+      parking_spaces,
+      stories,
+      private_pool,
+      new_construction,
+      water_serv,
+      electricity_serv,
+      sewer_serv,
+      garbage_collection_serv,
+      solar,
+      ac,
+      laundry_room,
+      lat,
+      lng,
+      images,
+    } = req.body || {};
+
+    const created_by = req.user.id;
+
+    // (Opcional pero recomendado) Verifica que el usuario exista
+    // y de paso puedes usarlo después si quieres aplicar reglas por rol.
+    const [uRows] = await pool
+      .promise()
+      .query(
+        `SELECT id, agent_type, agent_verification_status
+         FROM users
+         WHERE id = ?
+         LIMIT 1`,
+        [created_by]
+      );
+
+    if (!uRows || !uRows.length) {
+      return res.status(401).json({ error: "Usuario no encontrado" });
     }
 
-    const propertyId = results.insertId;
-    // Guardar imágenes si existen
-    if (Array.isArray(images) && images.length > 0) {
-      // Prepara los datos
-      const imageValues = images.map(url => [propertyId, url]);
-      // Inserta todas las imágenes en un solo query
-      pool.query(
-        'INSERT INTO property_images (property_id, image_url) VALUES ?',
-        [imageValues],
-        (imgErr, imgResults) => {
-          if (imgErr) {
-            console.error('Error saving images:', imgErr);
-            // Se guarda la propiedad aunque falle una imagen
-            res.status(201).json({ 
-              message: 'Property saved, but failed to save some images', 
-              propertyId 
-            });
-            return;
-          }
-          // Todo OK
-          res.status(201).json({ 
-            message: 'Property and images saved successfully', 
-            propertyId 
-          });
-        }
-      );
-    } else {
-      // Si no hay imágenes, responde normal
-      res.status(201).json({ 
-        message: 'Property saved successfully', 
-        propertyId 
-      });
+    // Nueva regla:
+    // - Todos pueden agregar propiedades (incluye agentes de cualquier tipo).
+    // - Todas las propiedades pasan por revisión de propiedad.
+    const finalReviewStatus = "pending";
+    const finalIsPublished = 0;
+
+    const query = `
+      INSERT INTO properties (
+        type, address, price, price_original, monthly_pay,
+        bedrooms, bathrooms, half_bathrooms,
+        land, construction, description,
+        sell_rent, date_build, estate_type,
+        parking_spaces, stories,
+        private_pool, new_construction,
+        water_serv, electricity_serv,
+        sewer_serv, garbage_collection_serv,
+        solar, ac, laundry_room,
+        lat, lng, created_by,
+        review_status, is_published
+      ) VALUES (
+        ?, ?, ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?
+      )
+    `;
+
+    const values = [
+      type ?? null,
+      address ?? null,
+      price ?? null,
+      // price_original: si no viene, toma price (si existe)
+      price_original ?? price ?? null,
+      monthly_pay ?? null,
+
+      bedrooms ?? null,
+      bathrooms ?? null,
+      half_bathrooms ?? null,
+
+      land ?? null,
+      construction ?? null,
+      description ?? null,
+
+      sell_rent ?? null,
+      date_build ?? null,
+      estate_type ?? null,
+
+      parking_spaces ?? null,
+      stories ?? null,
+
+      private_pool ? 1 : 0,
+      new_construction ? 1 : 0,
+
+      water_serv ? 1 : 0,
+      electricity_serv ? 1 : 0,
+
+      sewer_serv ? 1 : 0,
+      garbage_collection_serv ? 1 : 0,
+
+      solar ? 1 : 0,
+      ac ? 1 : 0,
+      laundry_room ? 1 : 0,
+
+      lat ?? null,
+      lng ?? null,
+
+      created_by,
+
+      finalReviewStatus,
+      finalIsPublished,
+    ];
+
+    const [result] = await pool.promise().query(query, values);
+    const propertyId = result.insertId;
+
+    // Inserta imágenes si vienen
+    const imgs = Array.isArray(images) ? images.map((x) => String(x || "").trim()).filter(Boolean) : [];
+    if (imgs.length) {
+      const imageValues = imgs.map((url) => [propertyId, url]);
+      await pool
+        .promise()
+        .query("INSERT INTO property_images (property_id, image_url) VALUES ?", [imageValues]);
     }
-  });
+
+    return res.status(201).json({
+      message: "Propiedad creada y enviada a revisión",
+      propertyId,
+      review_status: finalReviewStatus,
+      is_published: finalIsPublished,
+    });
+  } catch (err) {
+    console.error("Error saving property:", err);
+    return res.status(500).json({
+      error: "Failed to save property",
+      details: err?.sqlMessage || String(err),
+    });
+  }
 });
+
 
 // Edit property by id (con manejo de imágenes por URL)
 app.put('/properties/:id', authenticateToken, (req, res) => {
@@ -635,6 +677,7 @@ app.get('/properties', (req, res) => {
     FROM properties p
     WHERE p.lat BETWEEN ? AND ?
       AND p.lng BETWEEN ? AND ?
+      AND p.is_published = 1
     ORDER BY
       (p.promoted_until IS NOT NULL AND p.promoted_until > NOW()) DESC,
       p.id DESC
@@ -669,6 +712,7 @@ app.get('/properties/:id', (req, res) => {
     FROM properties p
     JOIN users u ON p.created_by = u.id
     WHERE p.id = ?
+    AND p.is_published = 1
     LIMIT 1
   `;
 
@@ -721,6 +765,49 @@ app.get('/my-properties', authenticateToken, (req, res) => {
     res.json(results);
   });
 });
+
+// Visualizar aunque no este aprobada la propiedad.
+app.get('/my-properties/:id', authenticateToken, (req, res) => {
+  const propertyId = Number(req.params.id);
+  const userId = req.user.id;
+
+  const sql = `
+    SELECT
+      p.*,
+      COALESCE(img.images, JSON_ARRAY()) AS images,
+      CASE
+        WHEN p.price_original IS NULL OR p.price_original <= 0 OR p.price >= p.price_original THEN 0
+        ELSE ROUND(((p.price_original - p.price) / p.price_original) * 100, 1)
+      END AS discount_percent
+    FROM properties p
+    LEFT JOIN (
+      SELECT
+        property_id,
+        CAST(
+          CONCAT(
+            '[',
+            GROUP_CONCAT(JSON_QUOTE(image_url) ORDER BY id ASC SEPARATOR ','),
+            ']'
+          ) AS JSON
+        ) AS images
+      FROM property_images
+      GROUP BY property_id
+    ) img ON img.property_id = p.id
+    WHERE p.id = ?
+      AND p.created_by = ?
+    LIMIT 1
+  `;
+
+  pool.query(sql, [propertyId, userId], (err, rows) => {
+    if (err) {
+      console.error('[GET /my-properties/:id] error', err);
+      return res.status(500).json({ error: 'Error consultando propiedad' });
+    }
+    if (!rows.length) return res.status(404).json({ error: 'No se encontró la propiedad (owner)' });
+    res.json(rows[0]);
+  });
+});
+
 
 // Delete property
 app.delete('/properties/:id', authenticateToken, (req, res) => {
@@ -836,7 +923,11 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
           if (uErr) return res.status(500).json({ error: 'No se pudo verificar.' });
   
           // Listo: da token y user (login inmediato)
-          const token = jwt.sign({ id: u.id, email }, process.env.JWT_SECRET, { expiresIn: '3h' });
+          const token = jwt.sign(
+            { id: u.id, email: u.email, agent_type: u.agent_type },
+            process.env.JWT_SECRET,
+            { expiresIn: '3h' }
+          );
           let citiesArr = null;
           try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {}
   
@@ -937,25 +1028,35 @@ app.post('/agents/register', async (req, res) => {
     const sql = `
       INSERT INTO users
         (name, last_name, email, password, phone, license, work_start, work_end,
-         agent_type, brokerage_name, cities,
-         email_verified, email_verif_code, email_verif_expires)
+        agent_type, brokerage_name, cities,
+        email_verified, email_verif_code, email_verif_expires,
+        agent_verification_status)
       VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
     `;
+    
+    const hasLicense = !!(license && String(license).trim());
+    const normalizedLicense = hasLicense ? String(license).trim() : null;
+
+    const isAgent = ['brokerage','individual','seller'].includes(finalAgentType);
+
+    const agentVerificationStatus = (isAgent && hasLicense) ? 'pending' : 'not_required';
+    
     const params = [
       name,
       last_name,
       email,
       hashedPassword,
       phone || null,
-      license || null,
+      normalizedLicense,
       work_start,
       work_end,
       finalAgentType,
       finalAgentType === 'brokerage' ? (brokerage_name || null) : null,
       citiesArr.length ? JSON.stringify(citiesArr) : null,
       code,
-      expires
+      expires,
+      agentVerificationStatus
     ];
 
     pool.query(sql, params, async (err, result) => {
@@ -1041,7 +1142,8 @@ app.post('/users/login', (req, res) => {
   const { email, password } = req.body;
   const sql = `
     SELECT id, name, last_name, email, password, phone, license,
-           work_start, work_end, agent_type, brokerage_name, cities, email_verified
+          work_start, work_end, agent_type, brokerage_name, cities, email_verified,
+          agent_verification_status
     FROM users
     WHERE email = ?
     LIMIT 1
@@ -1065,7 +1167,11 @@ app.post('/users/login', (req, res) => {
     }
     if (!ok) return res.status(400).json({ error: 'Credenciales inválidas' });
 
-    const token = jwt.sign({ id: u.id, email: u.email }, process.env.JWT_SECRET, { expiresIn: '3h' });
+    const token = jwt.sign(
+      { id: u.id, email: u.email, agent_type: u.agent_type },
+      process.env.JWT_SECRET,
+      { expiresIn: '3h' }
+    );
 
     let citiesArr = null;
     try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {
@@ -1082,6 +1188,7 @@ app.post('/users/login', (req, res) => {
         work_start: u.work_start,
         work_end: u.work_end,
         agent_type: u.agent_type,
+        agent_verification_status: u.agent_verification_status,
         is_agent: u.agent_type,
         brokerage_name: u.brokerage_name || null,
         cities: citiesArr
@@ -1120,7 +1227,7 @@ app.post('/auth/google', async (req, res) => {
     // Buscar usuario por email
     const selSql = `
       SELECT id, name, last_name, email, phone, license, work_start, work_end,
-             agent_type, brokerage_name, cities
+            agent_type, brokerage_name, cities, agent_verification_status
       FROM users
       WHERE email = ?
       LIMIT 1
@@ -1159,6 +1266,7 @@ app.post('/auth/google', async (req, res) => {
             work_start: null,
             work_end: null,
             agent_type: 'regular',
+            agent_verification_status: 'not_required',
             brokerage_name: null,
             cities: null,
           };
@@ -1179,7 +1287,11 @@ app.post('/auth/google', async (req, res) => {
 
 // Helper para emitir token con forma homogénea a tu /users/login
 function issueToken(res, u) {
-  const token = jwt.sign({ id: u.id, email: u.email }, process.env.JWT_SECRET, { expiresIn: '3h' });
+  const token = jwt.sign(
+    { id: u.id, email: u.email, agent_type: u.agent_type },
+    process.env.JWT_SECRET,
+    { expiresIn: '3h' }
+  );
 
   let citiesArr = null;
   try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {}
@@ -1196,6 +1308,7 @@ function issueToken(res, u) {
       work_start: u.work_start,
       work_end: u.work_end,
       agent_type: u.agent_type,
+      agent_verification_status: u.agent_verification_status ?? null,
       is_agent: u.agent_type !== 'regular',
       brokerage_name: u.brokerage_name || null,
       cities: citiesArr
@@ -1436,23 +1549,38 @@ io.on('connection', (socket) => {
       io.to('user_' + sender_id).emit('receive_message', msgObj);
       io.to('user_' + receiver_id).emit('receive_message', msgObj);
 
-      // PUSH: mandar al receptor
-      sendPushToUser({
-        userId: receiver_id,
-        title: 'Nuevo mensaje',
-        body: messageSafe
-          ? (messageSafe.length > 110 ? messageSafe.slice(0, 110) + '…' : messageSafe)
-          : (fileUrlSafe ? 'Te enviaron un archivo' : 'Nuevo mensaje'),
-        data: {
-          type: 'chat',
-          chatParams: {
-            otherUserId: String(sender_id),
-            propertyId: property_id != null ? String(property_id) : undefined,
-          }
+      // PUSH: mandar al receptor (solo si NO está silenciado)
+      try {
+        const pid = property_id ?? null;
+        const muted = await isMutedForReceiver(receiver_id, sender_id, pid);
+
+        if (muted) {
+          console.log('[push] skipped (muted chat)', {
+            receiver_id,
+            sender_id,
+            property_id: pid
+          });
+        } else {
+          await sendPushToUser({
+            userId: receiver_id,
+            title: 'Nuevo mensaje',
+            body: messageSafe
+              ? (messageSafe.length > 110 ? messageSafe.slice(0, 110) + '…' : messageSafe)
+              : (fileUrlSafe ? 'Te enviaron un archivo' : 'Nuevo mensaje'),
+            data: {
+              type: 'chat',
+              chatParams: {
+                otherUserId: String(sender_id),
+                propertyId: pid != null ? String(pid) : undefined,
+              }
+            }
+          });
         }
-      }).catch(e => console.error('[push] error', e));
-    });
+      } catch (e) {
+        console.error('[push] error', e);
+      }
   });
+});
 
   // Eliminar mensaje
   socket.on('delete_message', ({ message_id, user_id }) => {
@@ -1555,6 +1683,112 @@ app.get('/api/chat/messages', authenticateToken, (req, res) => {
   });
 });
 
+function isMutedForReceiver(receiverId, senderId, propertyId) {
+  return new Promise((resolve, reject) => {
+    const q = `
+      SELECT is_muted, muted_until
+      FROM chat_mutes
+      WHERE user_id = ?
+        AND other_user_id = ?
+        AND ((property_id IS NULL AND ? IS NULL) OR property_id = ?)
+      LIMIT 1
+    `;
+    pool.query(q, [receiverId, senderId, propertyId, propertyId], (err, rows) => {
+      if (err) return reject(err);
+      if (!rows?.length) return resolve(false);
+
+      const r = rows[0];
+      if (!r.is_muted) return resolve(false);
+
+      if (r.muted_until && new Date(r.muted_until).getTime() <= Date.now()) {
+        return resolve(false);
+      }
+      resolve(true);
+    });
+  });
+}
+
+function getActivePushTokens(userId) {
+  return new Promise((resolve, reject) => {
+    const q = `
+      SELECT expo_push_token
+      FROM user_push_tokens
+      WHERE user_id = ?
+        AND is_active = 1
+        AND expo_push_token IS NOT NULL
+        AND expo_push_token <> ''
+    `;
+    pool.query(q, [userId], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(r => r.expo_push_token));
+    });
+  });
+}
+
+
+app.get('/api/chat/mute-status', authenticateToken, (req, res) => {
+  const me = req.user?.id || req.userId; // ajusta a tu auth
+  const otherUserId = Number(req.query.other_user_id);
+  const propertyIdRaw = req.query.property_id;
+
+  if (!me || !otherUserId) return res.status(400).json({ error: 'Faltan campos' });
+
+  const propertyId = propertyIdRaw === undefined || propertyIdRaw === '' ? null : Number(propertyIdRaw);
+
+  const q = `
+    SELECT is_muted, muted_until
+    FROM chat_mutes
+    WHERE user_id = ?
+      AND other_user_id = ?
+      AND ((property_id IS NULL AND ? IS NULL) OR property_id = ?)
+    LIMIT 1
+  `;
+
+  pool.query(q, [me, otherUserId, propertyId, propertyId], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'DB error' });
+    if (!rows?.length) return res.json({ is_muted: false, muted_until: null });
+
+    const r = rows[0];
+
+    // Si tiene vencimiento y ya pasó, consideramos no muted (opcional)
+    if (r.muted_until && new Date(r.muted_until).getTime() <= Date.now()) {
+      return res.json({ is_muted: false, muted_until: r.muted_until });
+    }
+
+    res.json({ is_muted: !!r.is_muted, muted_until: r.muted_until ?? null });
+  });
+});
+
+app.put('/api/chat/mute', authenticateToken, (req, res) => {
+  const me = req.user?.id || req.userId; // ajusta a tu auth
+  const { other_user_id, property_id, is_muted, muted_until } = req.body;
+
+  if (!me || !other_user_id || typeof is_muted !== 'boolean') {
+    return res.status(400).json({ error: 'Faltan campos' });
+  }
+
+  const otherUserId = Number(other_user_id);
+  const propertyId = property_id == null ? null : Number(property_id);
+
+  const q = `
+    INSERT INTO chat_mutes (user_id, other_user_id, property_id, is_muted, muted_until)
+    VALUES (?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      is_muted = VALUES(is_muted),
+      muted_until = VALUES(muted_until),
+      updated_at = NOW()
+  `;
+
+  pool.query(
+    q,
+    [me, otherUserId, propertyId, is_muted ? 1 : 0, muted_until ?? null],
+    (err) => {
+      if (err) return res.status(500).json({ error: 'No se pudo actualizar' });
+      res.json({ ok: true });
+    }
+  );
+});
+
 app.post('/api/push/register', authenticateToken, async (req, res) => {
   const userId = req.user.id; // o como lo tengas
   const { expoPushToken, platform, deviceId } = req.body || {};
@@ -1607,6 +1841,7 @@ app.post('/api/push/logout', authenticateToken, async (req, res) => {
 });
 
 // GET Lista de conversaciones del usuario (resumen, no historial completo)
+// GET Lista de conversaciones del usuario (resumen, no historial completo)
 app.get('/api/chat/my-chats', authenticateToken, (req, res) => {
   const userId = req.user.id;
 
@@ -1630,7 +1865,13 @@ app.get('/api/chat/my-chats', authenticateToken, (req, res) => {
           AND (m.property_id <=> t.property_id)
           AND m.is_read = 0
           AND m.is_deleted = 0
-      ) AS unread_count
+      ) AS unread_count,
+      CASE
+        WHEN cmute.is_muted = 1
+          AND (cmute.muted_until IS NULL OR cmute.muted_until > NOW())
+        THEN 1
+        ELSE 0
+      END AS is_muted
     FROM (
       SELECT
         IF(sender_id = ?, receiver_id, sender_id) AS chat_with_user_id,
@@ -1644,6 +1885,10 @@ app.get('/api/chat/my-chats', authenticateToken, (req, res) => {
     JOIN chat_messages cm ON cm.id = t.last_msg_id
     JOIN users u          ON u.id = t.chat_with_user_id
     LEFT JOIN properties p ON p.id = t.property_id
+    LEFT JOIN chat_mutes cmute
+      ON cmute.user_id = ?
+     AND cmute.other_user_id = t.chat_with_user_id
+     AND (cmute.property_id <=> t.property_id)
     LEFT JOIN hidden_chats h
       ON h.user_id = ?
      AND h.chat_with_user_id = t.chat_with_user_id
@@ -1652,17 +1897,29 @@ app.get('/api/chat/my-chats', authenticateToken, (req, res) => {
     ORDER BY cm.created_at DESC
   `;
 
-  // Orden: (1) unread_count.receiver_id, (2) IF(...), (3) WHERE sender_id, (4) WHERE receiver_id, (5) h.user_id
-  const params = [userId, userId, userId, userId, userId];
+  // 6 placeholders -> 6 params (en el orden exacto del SQL)
+  const params = [
+    userId, // unread_count: m.receiver_id = ?
+    userId, // IF(sender_id = ?, ...)
+    userId, // WHERE sender_id = ?
+    userId, // WHERE receiver_id = ?
+    userId, // cmute.user_id = ?
+    userId, // h.user_id = ?
+  ];
 
   pool.query(sql, params, (err, rows) => {
     if (err) {
-      console.error('Error en my-chats:', err);
-      return res.status(500).json({ error: 'Error fetching chats' });
+      console.error('[my-chats] SQL ERROR', {
+        code: err.code,
+        sqlMessage: err.sqlMessage,
+        sql: err.sql,
+      });
+      return res.status(500).json({ error: 'Error fetching chats', details: err.sqlMessage || String(err) });
     }
     res.json(rows);
   });
 });
+
 
 // Ocultar chat SOLO para el usuario actual
 app.post('/api/chat/hide-chat', authenticateToken, (req, res) => {
@@ -2272,4 +2529,151 @@ app.post('/payments/promote/create-intent', authenticateToken, async (req, res) 
     console.error('[create-intent] error', e);
     return res.status(500).json({ error: 'No se pudo crear el intento de pago' });
   }
+});
+
+// ===============================
+// ADMIN REVIEW SYSTEM (Listed)
+// agent_type='admin' requerido
+// ===============================
+
+app.get('/admin/agents/pending', authenticateToken, requireAdmin, (req, res) => {
+  pool.query(
+    `SELECT id, name, last_name, email, phone, license, agent_type,
+            agent_verification_status, created_at
+     FROM users
+     WHERE agent_type IN ('brokerage','individual','seller')
+     AND agent_verification_status='pending'
+     AND license IS NOT NULL AND license <> ''
+     ORDER BY id DESC
+     LIMIT 500`,
+    [],
+    (err, rows) => {
+      if (err) return res.status(500).json({ error: 'Error consultando agentes' });
+      res.json(rows);
+    }
+  );
+});
+
+app.post('/admin/agents/:id/approve', authenticateToken, requireAdmin, (req, res) => {
+  const agentId = Number(req.params.id);
+  const adminId = req.user.id;
+
+  pool.query(
+    `UPDATE users
+      SET agent_verification_status='verified',
+          agent_verified_at=NOW(),
+          agent_verified_by=?,
+          agent_verification_notes=NULL
+     WHERE id=? AND agent_type!='regular' AND agent_type!='admin'`,
+    [adminId, agentId],
+    (err, r) => {
+      if (err) return res.status(500).json({ error: 'Error aprobando agente' });
+      if (!r.affectedRows) return res.status(404).json({ error: 'Agente no encontrado' });
+      res.json({ ok: true });
+    }
+  );
+});
+
+app.post('/admin/agents/:id/reject', authenticateToken, requireAdmin, (req, res) => {
+  const agentId = Number(req.params.id);
+  const adminId = req.user.id;
+  const { reason } = req.body || {};
+
+  pool.query(
+    `UPDATE users
+     SET agent_verification_status='rejected',
+         agent_verified_at=NOW(),
+         agent_verified_by=?,
+         agent_rejection_reason=?
+     WHERE id=? AND agent_type!='regular' AND agent_type!='admin'`,
+    [adminId, reason || null, agentId],
+    (err, r) => {
+      if (err) return res.status(500).json({ error: 'Error rechazando agente' });
+      if (!r.affectedRows) return res.status(404).json({ error: 'Agente no encontrado' });
+      res.json({ ok: true });
+    }
+  );
+});
+
+
+app.get('/admin/properties/pending', authenticateToken, requireAdmin, (req, res) => {
+  const sql = `
+    SELECT
+      p.*,
+      u.name AS owner_name,
+      u.last_name AS owner_last_name,
+      u.email AS owner_email,
+      -- images como JSON (o string JSON si tu MySQL no soporta CAST AS JSON)
+      COALESCE(img.images, '[]') AS images
+    FROM properties p
+    JOIN users u ON u.id = p.created_by
+    LEFT JOIN (
+      SELECT
+        property_id,
+        CONCAT(
+          '[',
+          GROUP_CONCAT(JSON_QUOTE(image_url) ORDER BY id ASC SEPARATOR ','),
+          ']'
+        ) AS images
+      FROM property_images
+      WHERE image_url IS NOT NULL AND image_url <> ''
+      GROUP BY property_id
+    ) img ON img.property_id = p.id
+    WHERE p.review_status = 'pending'
+      AND p.is_published = 0
+    ORDER BY p.id DESC
+    LIMIT 500
+  `;
+
+  pool.query(sql, [], (err, rows) => {
+    if (err) {
+      console.error('[admin/properties/pending] error', err);
+      return res.status(500).json({ error: 'Error consultando propiedades' });
+    }
+    res.json(rows);
+  });
+});
+
+app.post('/admin/properties/:id/approve', authenticateToken, requireAdmin, (req, res) => {
+  const propertyId = Number(req.params.id);
+  const adminId = req.user.id;
+  const { notes } = req.body || {};
+
+  pool.query(
+    `UPDATE properties
+     SET review_status='approved',
+         is_published=1,
+         reviewed_at=NOW(),
+         reviewed_by=?,
+         review_notes=?
+     WHERE id=? AND review_status='pending'`,
+    [adminId, notes || null, propertyId],
+    (err, r) => {
+      if (err) return res.status(500).json({ error: 'Error aprobando propiedad' });
+      if (!r.affectedRows) return res.status(404).json({ error: 'Propiedad no encontrada o no está pending' });
+      res.json({ ok: true });
+    }
+  );
+});
+
+app.post('/admin/properties/:id/reject', authenticateToken, requireAdmin, (req, res) => {
+  const propertyId = Number(req.params.id);
+  const adminId = req.user.id;
+  const { notes } = req.body || {};
+
+  pool.query(
+    `UPDATE properties
+     SET review_status='rejected',
+         is_published=0,
+         reviewed_at=NOW(),
+         reviewed_by=?,
+         review_notes=?
+     WHERE id=? AND review_status='pending'`,
+    [adminId, notes || null, propertyId],
+    (err, r) => {
+      if (err) return res.status(500).json({ error: 'Error rechazando propiedad' });
+      if (!r.affectedRows) return res.status(404).json({ error: 'Propiedad no encontrada o no está pending' });
+      res.json({ ok: true });
+    }
+  );
 });
