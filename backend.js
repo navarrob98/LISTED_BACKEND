@@ -79,8 +79,27 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 });
 
 // Middleware
-app.use(cors());
-app.use(bodyParser.json());
+const allowedOrigins = [
+  'https://listed.com.mx',
+  'https://www.listed.com.mx',
+  'http://localhost:19006',
+  'http://localhost:3000',
+];
+
+app.use(cors({
+  origin: function(origin, cb) {
+    // requests sin origin (Postman, server-to-server) deben pasar
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: false,
+}));
+
+app.options(/.*/, cors());
+app.use(express.json());
 
 const pool = mysql.createPool({
   host: process.env.MYSQLHOST,
@@ -208,6 +227,44 @@ async function sendVerificationEmail(to, code) {
   });
 }
 
+async function sendResetPasswordEmail(to, resetUrl) {
+  const from = process.env.MAIL_FROM || 'LISTED <no-reply@listed.app>';
+  const minutes = Number(process.env.RESET_PASSWORD_MINUTES || 60);
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 520px; line-height: 1.35;">
+      <h2>Restablecer contraseña</h2>
+      <p>Recibimos una solicitud para restablecer tu contraseña.</p>
+      <p>
+        <a href="${resetUrl}" style="display:inline-block;padding:10px 14px;background:#0b0b0b;color:#fff;text-decoration:none;border-radius:10px;">
+          Cambiar contraseña
+        </a>
+      </p>
+      <p>Este enlace expira en ${minutes} minutos.</p>
+      <p>Si tú no solicitaste este cambio, puedes ignorar este correo.</p>
+    </div>
+  `;
+
+  await mailer.sendMail({
+    from,
+    to,
+    subject: 'Restablecer contraseña',
+    text: `Restablece tu contraseña aquí: ${resetUrl} (expira en ${minutes} minutos).`,
+    html,
+  });
+}
+
+
+function getPublicWebBaseUrl() {
+  return String(process.env.PUBLIC_WEB_BASE_URL || '').replace(/\/+$/, '');
+}
+
+function buildResetWebUrl(token) {
+  const base = getPublicWebBaseUrl();
+  if (!base) return null;
+  return `${base}/reset-password/?token=${encodeURIComponent(token)}`;
+}
+
 function isExpoToken(t) {
   return typeof t === 'string' && Expo.isExpoPushToken(t);
 }
@@ -310,7 +367,6 @@ async function sendPushToUser({ userId, title, body, data }) {
 // });
 
 const GOOGLE_CLIENT_IDS = [
-  // 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com', // IOS_CLIENT_ID
   process.env.GMAIL_CLIENT_ID, // WEB_CLIENT_ID
 ];
 const googleClient = new OAuth2Client();
@@ -1394,6 +1450,159 @@ app.get('/auth/validate', authenticateToken, (req, res) => {
     });
     console.log('auth: ', user);
   });
+});
+
+app.post('/auth/forgot-password', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    // Respuesta siempre "ok" para no filtrar si existe o no el usuario
+    if (!email) return res.status(200).json({ ok: true });
+
+    const [rows] = await pool.promise().query(
+      'SELECT id, email FROM users WHERE LOWER(email) = ? LIMIT 1',
+      [email]
+    );
+
+    if (!rows || !rows.length) {
+      return res.status(200).json({ ok: true });
+    }
+
+    const user = rows[0];
+
+    // 1) genera token y hash
+    const token = crypto.randomBytes(32).toString('hex'); // token real (solo para email)
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+
+    // 2) expira en X minutos
+    const minutes = Number(process.env.RESET_PASSWORD_MINUTES || 60);
+    const expiresAt = new Date(Date.now() + minutes * 60 * 1000);
+
+    // 3) opcional: invalida resets anteriores no usados de ese user
+    await pool.promise().query(
+      'UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL',
+      [user.id]
+    );
+
+    // 4) inserta reset
+    await pool.promise().query(
+      `INSERT INTO password_resets (user_id, token_hash, expires_at)
+       VALUES (?, ?, ?)`,
+      [user.id, tokenHash, expiresAt]
+    );
+
+    // 5) email con deep link
+    const resetUrl = buildResetWebUrl(token);
+    if (resetUrl) {
+      await sendResetPasswordEmail(user.email, resetUrl);
+    }
+    
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('[auth/forgot-password] error', e);
+    // Por seguridad, también responde ok
+    return res.status(200).json({ ok: true });
+  }
+});
+
+app.post('/auth/reset-password', async (req, res) => {
+  try {
+    const token = String(req.body?.token || '').trim();
+    const newPassword = String(req.body?.password || '');
+
+    if (!token || newPassword.length < 8) {
+      return res.status(400).json({ error: 'Token y password (mínimo 8 caracteres) son requeridos.' });
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+
+    const [rows] = await pool.promise().query(
+      `
+      SELECT id, user_id, expires_at, used_at
+      FROM password_resets
+      WHERE token_hash = ?
+      LIMIT 1
+      `,
+      [tokenHash]
+    );
+
+    if (!rows || !rows.length) {
+      return res.status(400).json({ error: 'Token inválido.' });
+    }
+
+    const pr = rows[0];
+
+    if (pr.used_at) {
+      return res.status(400).json({ error: 'Este enlace ya fue usado.' });
+    }
+
+    if (new Date(pr.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ error: 'Este enlace ya expiró. Solicita uno nuevo.' });
+    }
+
+    // Hash password
+    const hashed = await bcrypt.hash(newPassword, 10);
+
+    // Transacción: marcar usado + cambiar password
+    const cxn = await pool.promise().getConnection();
+    try {
+      await cxn.beginTransaction();
+
+      const [u] = await cxn.query(
+        'UPDATE users SET password = ? WHERE id = ?',
+        [hashed, pr.user_id]
+      );
+
+      if (!u.affectedRows) {
+        await cxn.rollback();
+        cxn.release();
+        return res.status(404).json({ error: 'Usuario no encontrado.' });
+      }
+
+      await cxn.query(
+        'UPDATE password_resets SET used_at = NOW() WHERE id = ?',
+        [pr.id]
+      );
+
+      await cxn.commit();
+      cxn.release();
+
+      return res.json({ ok: true });
+    } catch (txErr) {
+      await cxn.rollback();
+      cxn.release();
+      console.error('[auth/reset-password] tx error', txErr);
+      return res.status(500).json({ error: 'No se pudo restablecer la contraseña.' });
+    }
+  } catch (e) {
+    console.error('[auth/reset-password] error', e);
+    return res.status(500).json({ error: 'Error de servidor.' });
+  }
+});
+
+
+app.post('/auth/reset-password/validate', async (req, res) => {
+  try {
+    const token = String(req.body?.token || '').trim();
+    if (!token) return res.status(400).json({ valid: false });
+
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+
+    const [rows] = await pool.promise().query(
+      `SELECT expires_at, used_at FROM password_resets WHERE token_hash=? LIMIT 1`,
+      [tokenHash]
+    );
+
+    if (!rows?.length) return res.json({ valid: false });
+
+    const r = rows[0];
+    if (r.used_at) return res.json({ valid: false, reason: 'used' });
+    if (new Date(r.expires_at).getTime() < Date.now()) return res.json({ valid: false, reason: 'expired' });
+
+    res.json({ valid: true });
+  } catch (e) {
+    console.error('[reset-password/validate] error', e);
+    res.json({ valid: false });
+  }
 });
 
   // Buying Power endpoints
