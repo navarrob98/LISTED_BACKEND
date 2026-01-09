@@ -1475,7 +1475,6 @@ app.post('/auth/forgot-password', async (req, res) => {
 
     // 2) expira en X minutos
     const minutes = Number(process.env.RESET_PASSWORD_MINUTES || 60);
-    const expiresAt = new Date(Date.now() + minutes * 60 * 1000);
 
     // 3) opcional: invalida resets anteriores no usados de ese user
     await pool.promise().query(
@@ -1485,9 +1484,11 @@ app.post('/auth/forgot-password', async (req, res) => {
 
     // 4) inserta reset
     await pool.promise().query(
-      `INSERT INTO password_resets (user_id, token_hash, expires_at)
-       VALUES (?, ?, ?)`,
-      [user.id, tokenHash, expiresAt]
+      `
+      INSERT INTO password_resets (user_id, token_hash, expires_at)
+      VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE))
+      `,
+      [user.id, tokenHash, minutes]
     );
 
     // 5) email con deep link
@@ -1517,28 +1518,20 @@ app.post('/auth/reset-password', async (req, res) => {
 
     const [rows] = await pool.promise().query(
       `
-      SELECT id, user_id
+      SELECT id, user_id, used_at,
+             (expires_at <= NOW()) AS is_expired
       FROM password_resets
       WHERE token_hash = ?
-        AND used_at IS NULL
-        AND expires_at > NOW()
       LIMIT 1
       `,
       [tokenHash]
     );
     
-    if (!rows?.length) {
-      return res.status(400).json({ error: 'Token inválido o expirado.' });
-    }
+    if (!rows?.length) return res.status(400).json({ error: 'Token inválido.' });
     
-
     const pr = rows[0];
-
-    if (pr.used_at) {
-      return res.status(400).json({ error: 'Este enlace ya fue usado.' });
-    }
-
-    if (new Date(pr.expires_at).getTime() < Date.now()) {
+    if (pr.used_at) return res.status(400).json({ error: 'Este enlace ya fue usado.' });
+    if (Number(pr.is_expired) === 1) {
       return res.status(400).json({ error: 'Este enlace ya expiró. Solicita uno nuevo.' });
     }
 
@@ -1590,9 +1583,12 @@ app.post('/auth/reset-password/validate', async (req, res) => {
 
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
 
+    // Traemos 1 fila y dejamos que SQL decida si expiró
     const [rows] = await pool.promise().query(
       `
-      SELECT used_at, expires_at
+      SELECT
+        used_at,
+        (expires_at <= NOW()) AS is_expired
       FROM password_resets
       WHERE token_hash = ?
       LIMIT 1
@@ -1603,31 +1599,16 @@ app.post('/auth/reset-password/validate', async (req, res) => {
     if (!rows?.length) return res.json({ valid: false });
 
     const r = rows[0];
-
-    // 1) si ya se usó
     if (r.used_at) return res.json({ valid: false, reason: 'used' });
-
-    // 2) si expiró (SQL)
-    const [expRows] = await pool.promise().query(
-      `
-      SELECT 1
-      FROM password_resets
-      WHERE token_hash = ?
-        AND used_at IS NULL
-        AND expires_at > NOW()
-      LIMIT 1
-      `,
-      [tokenHash]
-    );
-
-    if (!expRows?.length) return res.json({ valid: false, reason: 'expired' });
+    if (Number(r.is_expired) === 1) return res.json({ valid: false, reason: 'expired' });
 
     return res.json({ valid: true });
   } catch (e) {
     console.error('[reset-password/validate] error', e);
-    return res.json({ valid: false });
+    res.json({ valid: false });
   }
 });
+
 
   // Buying Power endpoints
 
