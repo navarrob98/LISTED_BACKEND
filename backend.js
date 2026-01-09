@@ -1517,17 +1517,20 @@ app.post('/auth/reset-password', async (req, res) => {
 
     const [rows] = await pool.promise().query(
       `
-      SELECT id, user_id, expires_at, used_at
+      SELECT id, user_id
       FROM password_resets
       WHERE token_hash = ?
+        AND used_at IS NULL
+        AND expires_at > NOW()
       LIMIT 1
       `,
       [tokenHash]
     );
-
-    if (!rows || !rows.length) {
-      return res.status(400).json({ error: 'Token inválido.' });
+    
+    if (!rows?.length) {
+      return res.status(400).json({ error: 'Token inválido o expirado.' });
     }
+    
 
     const pr = rows[0];
 
@@ -1588,20 +1591,41 @@ app.post('/auth/reset-password/validate', async (req, res) => {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
 
     const [rows] = await pool.promise().query(
-      `SELECT expires_at, used_at FROM password_resets WHERE token_hash=? LIMIT 1`,
+      `
+      SELECT used_at, expires_at
+      FROM password_resets
+      WHERE token_hash = ?
+      LIMIT 1
+      `,
       [tokenHash]
     );
 
     if (!rows?.length) return res.json({ valid: false });
 
     const r = rows[0];
-    if (r.used_at) return res.json({ valid: false, reason: 'used' });
-    if (new Date(r.expires_at).getTime() < Date.now()) return res.json({ valid: false, reason: 'expired' });
 
-    res.json({ valid: true });
+    // 1) si ya se usó
+    if (r.used_at) return res.json({ valid: false, reason: 'used' });
+
+    // 2) si expiró (SQL)
+    const [expRows] = await pool.promise().query(
+      `
+      SELECT 1
+      FROM password_resets
+      WHERE token_hash = ?
+        AND used_at IS NULL
+        AND expires_at > NOW()
+      LIMIT 1
+      `,
+      [tokenHash]
+    );
+
+    if (!expRows?.length) return res.json({ valid: false, reason: 'expired' });
+
+    return res.json({ valid: true });
   } catch (e) {
     console.error('[reset-password/validate] error', e);
-    res.json({ valid: false });
+    return res.json({ valid: false });
   }
 });
 
