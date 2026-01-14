@@ -141,15 +141,15 @@ function signedDeliveryUrlFromSecure(
 }
 
 const mailer = nodemailer.createTransport({
-  service: 'gmail',
+  host: process.env.SMTP_HOST,          // ej: mail.listed.com.mx
+  port: Number(process.env.SMTP_PORT),  // 465 o 587
+  secure: Number(process.env.SMTP_PORT) === 465, // true si 465
   auth: {
-    type: 'OAuth2',
-    user: process.env.SMTP_USER,
-    clientId: process.env.GMAIL_CLIENT_ID,
-    clientSecret: process.env.GMAIL_CLIENT_SECRET,
-    refreshToken: process.env.GMAIL_REFRESH_TOKEN,
+    user: process.env.SMTP_USER,        // support@listed.com.mx
+    pass: process.env.SMTP_PASS,        // password del mailbox
   },
 });
+
 
 function q(cxn, sql, params, step) {
   return new Promise((resolve, reject) => {
