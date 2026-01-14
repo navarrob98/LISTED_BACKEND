@@ -15,7 +15,7 @@ const jwt = require('jsonwebtoken');
 const authenticateToken = require('./middleware/authenticateToken');
 const { OAuth2Client } = require('google-auth-library');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 const cloudinary = require('./cldnry');
 const { Expo } = require('expo-server-sdk');
 const expo = new Expo();
@@ -140,15 +140,7 @@ function signedDeliveryUrlFromSecure(
   });
 }
 
-const mailer = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,          // ej: mail.listed.com.mx
-  port: Number(process.env.SMTP_PORT),  // 465 o 587
-  secure: Number(process.env.SMTP_PORT) === 465, // true si 465
-  auth: {
-    user: process.env.SMTP_USER,        // support@listed.com.mx
-    pass: process.env.SMTP_PASS,        // password del mailbox
-  },
-});
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 
 function q(cxn, sql, params, step) {
@@ -207,8 +199,9 @@ function gen6() {
 }
 
 async function sendVerificationEmail(to, code) {
-  const from = process.env.MAIL_FROM || 'LISTED <no-reply@listed.app>';
+  const from = process.env.MAIL_FROM || 'LISTED <support@listed.com.mx>';
   const minutes = Number(process.env.VERIFICATION_MINUTES || 15);
+
   const html = `
     <div style="font-family: Arial, sans-serif; max-width: 480px;">
       <h2>Verifica tu correo</h2>
@@ -218,17 +211,30 @@ async function sendVerificationEmail(to, code) {
       <p>Si no has solicitado esta verificación, ignora este mensaje.</p>
     </div>
   `;
-  await mailer.sendMail({
-    from,
-    to,
-    subject: 'Tu código de verificación',
-    text: `Tu código de verificación es: ${code}. Vence en ${minutes} minutos.`,
-    html,
-  });
+
+  try {
+    const resp = await resend.emails.send({
+      from,
+      to: [to],
+      subject: 'Tu código de verificación',
+      html,
+      text: `Tu código de verificación es: ${code}. Vence en ${minutes} minutos.`,
+    });
+
+    if (resp?.error) {
+      console.error('[mail/resend] verification error', resp.error);
+      throw new Error(resp.error.message || 'Resend error');
+    }
+
+    return true;
+  } catch (e) {
+    console.error('[mail/resend] verification exception', e);
+    throw e;
+  }
 }
 
 async function sendResetPasswordEmail(to, resetUrl) {
-  const from = process.env.MAIL_FROM || 'LISTED <no-reply@listed.app>';
+  const from = process.env.MAIL_FROM || 'LISTED <support@listed.com.mx>';
   const minutes = Number(process.env.RESET_PASSWORD_MINUTES || 60);
 
   const html = `
@@ -245,13 +251,25 @@ async function sendResetPasswordEmail(to, resetUrl) {
     </div>
   `;
 
-  await mailer.sendMail({
-    from,
-    to,
-    subject: 'Restablecer contraseña',
-    text: `Restablece tu contraseña aquí: ${resetUrl} (expira en ${minutes} minutos).`,
-    html,
-  });
+  try {
+    const resp = await resend.emails.send({
+      from,
+      to: [to],
+      subject: 'Restablecer contraseña',
+      html,
+      text: `Restablece tu contraseña aquí: ${resetUrl} (expira en ${minutes} minutos).`,
+    });
+
+    if (resp?.error) {
+      console.error('[mail/resend] reset error', resp.error);
+      throw new Error(resp.error.message || 'Resend error');
+    }
+
+    return true;
+  } catch (e) {
+    console.error('[mail/resend] reset exception', e);
+    throw e;
+  }
 }
 
 
