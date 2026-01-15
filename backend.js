@@ -21,10 +21,12 @@ const { Expo } = require('expo-server-sdk');
 const expo = new Expo();
 const requireAdmin = require('./middleware/requireAdmin');
 const requireVerifiedAgentFactory = require('./middleware/requireVerifiedAgent');
+const rateLimit = require('express-rate-limit');
 
 
 
 const app = express();
+app.set('trust proxy', 1);
 const port = process.env.PORT || 3000;
 const dbPassword = process.env.DB_KEY;
 
@@ -1027,7 +1029,17 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
     });
   });
 
-  app.post('/users/resend-code', (req, res) => {
+  const resendCodeIpLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => res.status(429).json({ ok: true }),
+  });
+  
+  const resendCodeEmailCooldown = createEmailCooldown({ windowMs: 30_000 });
+
+  app.post('/users/resend-code', resendCodeIpLimiter, resendCodeEmailCooldown, (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Falta email' });
   
@@ -1470,58 +1482,104 @@ app.get('/auth/validate', authenticateToken, (req, res) => {
   });
 });
 
-app.post('/auth/forgot-password', async (req, res) => {
-  try {
+const forgotPasswordIpLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 min
+  max: 5,                   // 5 requests por IP en la ventana
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ ok: true }),
+});
+
+// 2) Cooldown por email (30s) in-memory
+function createEmailCooldown({ windowMs = 30_000, maxEntries = 50_000 } = {}) {
+  const map = new Map(); // email -> lastTimestampMs
+  let lastSweep = Date.now();
+
+  function sweep() {
+    const now = Date.now();
+    // barrido cada 5 min
+    if (now - lastSweep < 5 * 60_000) return;
+    lastSweep = now;
+
+    for (const [k, ts] of map.entries()) {
+      if (now - ts > windowMs) map.delete(k);
+    }
+
+    // hard cap para evitar crecimiento de memoria por ataque
+    if (map.size > maxEntries) map.clear();
+  }
+
+  return function emailCooldown(req, res, next) {
+    sweep();
+
     const email = String(req.body?.email || '').trim().toLowerCase();
-    // Respuesta siempre "ok" para no filtrar si existe o no el usuario
-    if (!email) return res.status(200).json({ ok: true });
+    if (!email || !email.includes('@')) return next();
 
-    const [rows] = await pool.promise().query(
-      'SELECT id, email FROM users WHERE LOWER(email) = ? LIMIT 1',
-      [email]
-    );
+    const now = Date.now();
+    const last = map.get(email);
 
-    if (!rows || !rows.length) {
+    if (last && now - last < windowMs) {
+      return res.status(429).json({ ok: true });
+    }
+
+    map.set(email, now);
+    return next();
+  };
+}
+
+const forgotPasswordEmailCooldown = createEmailCooldown({ windowMs: 30_000 });
+
+app.post(
+  '/auth/forgot-password',
+  forgotPasswordIpLimiter,
+  forgotPasswordEmailCooldown,
+  async (req, res) => {
+    try {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      // Respuesta siempre "ok" para no filtrar si existe o no el usuario
+      if (!email) return res.status(200).json({ ok: true });
+
+      const [rows] = await pool.promise().query(
+        'SELECT id, email FROM users WHERE LOWER(email) = ? LIMIT 1',
+        [email]
+      );
+
+      if (!rows || !rows.length) {
+        return res.status(200).json({ ok: true });
+      }
+
+      const user = rows[0];
+
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+
+      const minutes = Number(process.env.RESET_PASSWORD_MINUTES || 60);
+
+      await pool.promise().query(
+        'UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL',
+        [user.id]
+      );
+
+      await pool.promise().query(
+        `
+        INSERT INTO password_resets (user_id, token_hash, expires_at)
+        VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE))
+        `,
+        [user.id, tokenHash, minutes]
+      );
+
+      const resetUrl = buildResetWebUrl(token);
+      if (resetUrl) {
+        await sendResetPasswordEmail(user.email, resetUrl);
+      }
+
+      return res.status(200).json({ ok: true });
+    } catch (e) {
+      console.error('[auth/forgot-password] error', e);
       return res.status(200).json({ ok: true });
     }
-
-    const user = rows[0];
-
-    // 1) genera token y hash
-    const token = crypto.randomBytes(32).toString('hex'); // token real (solo para email)
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-
-    // 2) expira en X minutos
-    const minutes = Number(process.env.RESET_PASSWORD_MINUTES || 60);
-
-    // 3) opcional: invalida resets anteriores no usados de ese user
-    await pool.promise().query(
-      'UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL',
-      [user.id]
-    );
-
-    // 4) inserta reset
-    await pool.promise().query(
-      `
-      INSERT INTO password_resets (user_id, token_hash, expires_at)
-      VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE))
-      `,
-      [user.id, tokenHash, minutes]
-    );
-
-    // 5) email con deep link
-    const resetUrl = buildResetWebUrl(token);
-    if (resetUrl) {
-      await sendResetPasswordEmail(user.email, resetUrl);
-    }
-    
-    return res.status(200).json({ ok: true });
-  } catch (e) {
-    console.error('[auth/forgot-password] error', e);
-    // Por seguridad, también responde ok
-    return res.status(200).json({ ok: true });
   }
-});
+);
 
 app.post('/auth/reset-password', async (req, res) => {
   try {
