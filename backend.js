@@ -2849,15 +2849,25 @@ app.post('/admin/agents/:id/approve', authenticateToken, requireAdmin, (req, res
   const adminId = req.user.id;
 
   pool.query(
-    `UPDATE users
-      SET agent_verification_status='verified',
-          agent_verified_at=NOW(),
-          agent_verified_by=?,
-          agent_verification_notes=NULL
-     WHERE id=? AND agent_type!='regular' AND agent_type!='admin'`,
+    `
+    UPDATE users
+    SET agent_verification_status = 'verified',
+        agent_verified_at = NOW(),
+        agent_verified_by = ?,
+        agent_rejection_reason = NULL
+    WHERE id = ?
+      AND agent_type NOT IN ('regular', 'admin')
+    `,
     [adminId, agentId],
     (err, r) => {
-      if (err) return res.status(500).json({ error: 'Error aprobando agente' });
+      if (err) {
+        console.error('[admin/agents/approve] SQL error', {
+          code: err.code,
+          sqlMessage: err.sqlMessage,
+          sql: err.sql,
+        });
+        return res.status(500).json({ error: 'Error aprobando agente' });
+      }
       if (!r.affectedRows) return res.status(404).json({ error: 'Agente no encontrado' });
       res.json({ ok: true });
     }
@@ -2870,13 +2880,16 @@ app.post('/admin/agents/:id/reject', authenticateToken, requireAdmin, (req, res)
   const { reason } = req.body || {};
 
   pool.query(
-    `UPDATE users
-     SET agent_verification_status='rejected',
-         agent_verified_at=NOW(),
-         agent_verified_by=?,
-         agent_rejection_reason=?
-     WHERE id=? AND agent_type!='regular' AND agent_type!='admin'`,
-    [adminId, reason || null, agentId],
+    `
+    UPDATE users
+    SET agent_verification_status='rejected',
+        agent_verified_at = NULL,
+        agent_verified_by = NULL,
+        agent_rejection_reason = ?
+    WHERE id=?
+      AND agent_type NOT IN ('regular', 'admin')
+    `,
+    [reason || null, agentId],
     (err, r) => {
       if (err) return res.status(500).json({ error: 'Error rechazando agente' });
       if (!r.affectedRows) return res.status(404).json({ error: 'Agente no encontrado' });
