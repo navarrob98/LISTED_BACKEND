@@ -1206,11 +1206,10 @@ app.put('/agents/:id/work-schedule', authenticateToken, (req, res) => {
   );
 });
 
-// Obtener horario laboral de un agente
 app.get('/agents/:id', (req, res) => {
   const { id } = req.params;
   pool.query(
-    `SELECT id, name, last_name, phone, license, work_start, work_end
+    `SELECT id, name, last_name, phone, license, work_start, work_end, agent_verification_status
      FROM users
      WHERE id = ? AND (agent_type = "brokerage" OR agent_type = "individual")
      LIMIT 1`,
@@ -1460,46 +1459,107 @@ app.get('/users/:id', authenticateToken, (req, res) => {
 
 
 
-app.put('/users/:id', authenticateToken, (req, res) => {
-  const { id } = req.params;
-  const { phone, email, password, work_start, work_end, name, last_name } = req.body;
-  let updates = [];
-  let values = [];
+app.put('/users/:id', authenticateToken, async (req, res) => {
+  const id = Number(req.params.id);
+  if (id !== req.user.id) return res.status(403).json({ error: 'No autorizado' });
 
-  if (phone !== undefined) { updates.push('phone = ?'); values.push(phone); }
-  if (email !== undefined) { updates.push('email = ?'); values.push(email); }
+  const {
+    phone,
+    email,
+    password,
+    work_start,
+    work_end,
+    name,
+    last_name,
+    license
+  } = req.body || {};
+
+  // Bloquear cambio de email
+  if (email !== undefined) {
+    return res.status(400).json({ error: 'El correo no se puede cambiar.' });
+  }
+
+  // Traer usuario actual (para detectar cambios)
+  let current;
+  try {
+    const [rows] = await pool.promise().query(
+      `SELECT id, agent_type, name, last_name, license
+       FROM users
+       WHERE id = ?
+       LIMIT 1`,
+      [id]
+    );
+    if (!rows?.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+    current = rows[0];
+  } catch (e) {
+    return res.status(500).json({ error: 'Error consultando usuario' });
+  }
+
+  const updates = [];
+  const values = [];
+
+  // Helpers para comparar limpio
+  const clean = (v) => (v === undefined || v === null) ? undefined : String(v).trim();
+  const currName = clean(current.name) || '';
+  const currLast = clean(current.last_name) || '';
+  const currLic = clean(current.license) || '';
+
+  const newName = clean(name);
+  const newLast = clean(last_name);
+  const newLic = clean(license);
+
+  const nameChanged = (newName !== undefined) && (newName !== currName);
+  const lastChanged = (newLast !== undefined) && (newLast !== currLast);
+  const licenseChanged = (newLic !== undefined) && (newLic !== currLic);
+
+  if (phone !== undefined) { updates.push('phone = ?'); values.push(phone || null); }
+
   if (password !== undefined) {
-    const hashedPassword = bcrypt.hashSync(password, 10);
+    if (String(password).length < 6) return res.status(400).json({ error: 'Contraseña muy corta' });
+    const hashedPassword = bcrypt.hashSync(String(password), 10);
     updates.push('password = ?');
     values.push(hashedPassword);
   }
-  if (work_start !== undefined) { updates.push('work_start = ?'); values.push(work_start); }
-  if (work_end !== undefined) { updates.push('work_end = ?'); values.push(work_end); }
-  if (name !== undefined) { updates.push('name = ?'); values.push(name); }
-  if (last_name !== undefined) { updates.push('last_name = ?'); values.push(last_name); }
 
-  if (updates.length === 0) return res.status(400).json({ error: 'Nada que actualizar' });
+  if (work_start !== undefined) { updates.push('work_start = ?'); values.push(work_start || null); }
+  if (work_end !== undefined)   { updates.push('work_end = ?'); values.push(work_end || null); }
+
+  if (newName !== undefined) { updates.push('name = ?'); values.push(newName); }
+  if (newLast !== undefined) { updates.push('last_name = ?'); values.push(newLast); }
+  if (newLic !== undefined)  { updates.push('license = ?'); values.push(newLic || null); }
+
+  const isVerifiableAgent = ['brokerage', 'individual'].includes(current.agent_type);
+
+  if (isVerifiableAgent && (nameChanged || lastChanged || licenseChanged)) {
+    updates.push(`agent_verification_status = 'pending'`);
+    updates.push(`agent_rejection_reason = NULL`);
+    updates.push(`agent_verified_at = NULL`);
+    updates.push(`agent_verified_by = NULL`);
+  }
+
+  if (!updates.length) return res.status(400).json({ error: 'Nada que actualizar' });
 
   values.push(id);
 
-  pool.query(
-    `UPDATE users SET ${updates.join(', ')} WHERE id = ?`,
-    values,
-    (err, results) => {
-      if (err) {
-        console.log(err);
-        return res.status(500).json({ error: 'No se pudo actualizar' });}
-      pool.query(
-        'SELECT id, name, last_name, email, phone, work_start, work_end FROM users WHERE id = ?', 
-        [id], 
-        (err2, rows) => {
-          if (err2 || !rows[0]) return res.json({ message: 'Actualizado' });
-          res.json(rows[0]);
-        }
-      );
-    }
-  );
+  try {
+    await pool.promise().query(
+      `UPDATE users SET ${updates.join(', ')} WHERE id = ?`,
+      values
+    );
+
+    const [rows2] = await pool.promise().query(
+      `SELECT id, name, last_name, email, phone, work_start, work_end, license, agent_verification_status, agent_rejection_reason
+       FROM users WHERE id = ? LIMIT 1`,
+      [id]
+    );
+    return res.json(rows2?.[0] || { ok: true });
+  } catch (err) {
+    console.log(err);
+    return res.status(500).json({ error: 'No se pudo actualizar' });
+  }
 });
+
+
 
   //  Auth endpoint
 // Endpoint para validar token
