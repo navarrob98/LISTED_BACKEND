@@ -1222,6 +1222,48 @@ app.get('/agents/:id', (req, res) => {
     }
   );
 });
+
+app.post('/agents/me/resubmit-verification', authenticateToken, async (req, res) => {
+  try {
+    const uid = req.user.id;
+
+    const [rows] = await pool.promise().query(
+      `SELECT agent_type, license, agent_verification_status
+       FROM users
+       WHERE id = ?
+       LIMIT 1`,
+      [uid]
+    );
+
+    if (!rows?.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    const u = rows[0];
+    const isAgent = ['brokerage', 'individual'].includes(u.agent_type);
+
+    if (!isAgent) return res.status(403).json({ error: 'No aplica para este tipo de usuario' });
+    if (!u.license) return res.status(400).json({ error: 'Falta licencia para verificación' });
+
+    // Solo permitimos re-submit si fue rejected (si quieres permitir desde pending, lo ajustamos)
+    if (u.agent_verification_status !== 'rejected') {
+      return res.status(400).json({ error: 'No puedes reenviar en este estado' });
+    }
+
+    await pool.promise().query(
+      `UPDATE users
+       SET agent_verification_status = 'pending',
+           agent_rejection_reason = NULL,
+           agent_verified_at = NULL,
+           agent_verified_by = NULL
+       WHERE id = ?`,
+      [uid]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[resubmit-verification] error', e);
+    return res.status(500).json({ error: 'Error de servidor' });
+  }
+});
   
 // User log in
 app.post('/users/login', (req, res) => {
@@ -1463,12 +1505,23 @@ app.put('/users/:id', authenticateToken, (req, res) => {
 // Endpoint para validar token
 app.get('/auth/validate', authenticateToken, (req, res) => {
   const { id, email, agent_type } = req.user;
-  const query = 'SELECT name, last_name, email, phone, agent_type FROM users WHERE id = ? LIMIT 1';
+
+  const query = `
+    SELECT
+      name, last_name, email, phone, agent_type,
+      agent_verification_status,
+      agent_rejection_reason
+    FROM users
+    WHERE id = ?
+    LIMIT 1
+  `;
+
   pool.query(query, [id], (err, results) => {
     if (err || results.length === 0) {
       return res.status(401).json({ error: 'Usuario no encontrado.' });
     }
     const user = results[0];
+
     res.json({
       valid: true,
       id,
@@ -1477,8 +1530,9 @@ app.get('/auth/validate', authenticateToken, (req, res) => {
       email: user.email,
       phone: user.phone,
       user_type: user.agent_type,
+      agent_verification_status: user.agent_verification_status ?? null,
+      agent_rejection_reason: user.agent_rejection_reason ?? null,
     });
-    console.log('auth: ', user);
   });
 });
 
