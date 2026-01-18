@@ -3200,20 +3200,21 @@ app.post('/payments/promote/create-intent', authenticateToken, async (req, res) 
 app.get('/admin/agents/pending', authenticateToken, requireAdmin, (req, res) => {
   const sql = `
     SELECT
-      u.id,
-      u.name,
-      u.last_name,
-      u.email,
-      u.phone,
-      u.agent_type,
-      u.agent_verification_status,
-      u.created_at,
+      u.id AS id,
+      u.name AS name,
+      u.last_name AS lastName,
+      u.email AS email,
+      u.phone AS phone,
+      u.agent_type AS agentType,
+      u.agent_verification_status AS agentVerificationStatus,
+      u.created_at AS createdAt,
 
-      ac.type AS credential_type,
-      ac.state AS credential_state,
-      ac.credential_id,
-      ac.issuer,
-      ac.verification_url
+      ac.type AS credentialType,
+      ac.state AS credentialState,
+      ac.credential_id AS credentialId,
+      ac.issuer AS issuer,
+      ac.verification_url AS verificationUrl
+
     FROM users u
     JOIN agent_credentials ac
       ON ac.id = (
@@ -3236,6 +3237,7 @@ app.get('/admin/agents/pending', authenticateToken, requireAdmin, (req, res) => 
     res.json(rows);
   });
 });
+
 
 
 app.post('/admin/agents/:id/approve', authenticateToken, requireAdmin, (req, res) => {
