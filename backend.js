@@ -781,6 +781,7 @@ app.get('/properties/:id', (req, res) => {
     SELECT 
       p.*,
       u.name AS owner_name,
+      u.last_name AS owner_last_name,
       CASE
         WHEN p.price_original IS NULL OR p.price_original <= 0 OR p.price >= p.price_original THEN 0
         ELSE ROUND(((p.price_original - p.price) / p.price_original) * 100, 1)
@@ -970,8 +971,9 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
     if (!email || !code) return res.status(400).json({ error: 'Faltan email o código.' });
   
     const sql = `
-      SELECT id, email_verif_code, email_verif_expires, name, last_name, phone, license,
-             work_start, work_end, agent_type, brokerage_name, cities
+      SELECT id, email_verif_code, email_verif_expires, name, last_name, phone,
+       work_start, work_end, agent_type, brokerage_name, cities,
+       agent_verification_status, agent_rejection_reason
       FROM users WHERE email = ? LIMIT 1
     `;
     pool.query(sql, [email], (err, rows) => {
@@ -1015,13 +1017,14 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
               last_name: u.last_name,
               email,
               phone: u.phone,
-              license: u.license,
               work_start: u.work_start,
               work_end: u.work_end,
               agent_type: u.agent_type,
               is_agent: u.agent_type !== 'seller',
               brokerage_name: u.brokerage_name || null,
               cities: citiesArr,
+              agent_verification_status: u.agent_verification_status ?? null,
+              agent_rejection_reason: u.agent_rejection_reason ?? null,
             }
           });
         }
@@ -1076,12 +1079,14 @@ app.post('/agents/register', async (req, res) => {
     email,
     password,
     phone,
-    license,
     work_start,
     work_end,
     agent_type,         // 'brokerage' | 'individual' | 'seller'
     brokerage_name,     // opcional si agent_type === 'brokerage'
-    cities              // array de strings
+    cities,             // array de strings
+
+    // NUEVO:
+    credential          // { type, state, credential_id, issuer, verification_url } | null
   } = req.body;
 
   if (!name || !last_name || !email || !password || !work_start || !work_end) {
@@ -1105,72 +1110,173 @@ app.post('/agents/register', async (req, res) => {
     .slice(0, 30)
     .map(c => c.slice(0, 120));
 
+  // ===== Validación / normalización de credential =====
+  const isVerifiableAgent = ['brokerage', 'individual'].includes(finalAgentType);
+  const allowedCredTypes = new Set(['state_registry', 'ampi_ccie', 'other_verifiable']);
+
+  let normalizedCredential = null;
+
+  if (credential && typeof credential === 'object') {
+    const type = String(credential.type || '').trim();
+    const state = credential.state != null ? String(credential.state).trim() : null;
+    const credential_id = String(credential.credential_id || '').trim();
+    const issuer = credential.issuer != null ? String(credential.issuer).trim() : null;
+    const verification_url = credential.verification_url != null ? String(credential.verification_url).trim() : null;
+
+    if (!allowedCredTypes.has(type)) {
+      return res.status(400).json({ error: 'Tipo de credencial inválido.' });
+    }
+    if (!credential_id) {
+      return res.status(400).json({ error: 'Falta el folio/matrícula/código de la credencial.' });
+    }
+
+    // Reglas por tipo
+    if (type === 'state_registry') {
+      if (!state || !/^MX-[A-Z]{3}$/.test(state)) {
+        return res.status(400).json({ error: 'Estado inválido para registro estatal (usa formato MX-XXX).' });
+      }
+      // issuer opcional, url opcional
+    }
+
+    if (type === 'ampi_ccie') {
+      // issuer recomendado: AMPI o CCIE (pero no lo forzamos al 100% si quieres flexibilidad)
+      // Si sí lo quieres forzar, descomenta:
+      // if (!issuer || !['AMPI','CCIE'].includes(issuer)) {
+      //   return res.status(400).json({ error: 'Issuer inválido. Debe ser AMPI o CCIE.' });
+      // }
+    }
+
+    if (type === 'other_verifiable') {
+      if (!issuer) {
+        return res.status(400).json({ error: 'Falta el emisor para "Otro registro verificable".' });
+      }
+      if (!verification_url) {
+        return res.status(400).json({ error: 'Falta el enlace público de verificación.' });
+      }
+    }
+
+    normalizedCredential = {
+      type,
+      state: type === 'state_registry' ? state : null,
+      credential_id: credential_id.slice(0, 120),
+      issuer: issuer ? issuer.slice(0, 120) : null,
+      verification_url: verification_url ? verification_url.slice(0, 512) : null,
+    };
+  }
+
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const minutes = Number(process.env.VERIFICATION_MINUTES || 15);
     const code = gen6();                                // 6 dígitos
     const expires = new Date(Date.now() + minutes * 60 * 1000);
 
-    const sql = `
-      INSERT INTO users
-        (name, last_name, email, password, phone, license, work_start, work_end,
-        agent_type, brokerage_name, cities,
-        email_verified, email_verif_code, email_verif_expires,
-        agent_verification_status)
-      VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-    `;
-    
-    const hasLicense = !!(license && String(license).trim());
-    const normalizedLicense = hasLicense ? String(license).trim() : null;
+    // Verificación: solo aplica si es agente verificable y mandó credencial
+    const agentVerificationStatus =
+      (isVerifiableAgent && normalizedCredential) ? 'pending' : 'not_required';
 
-    const isAgent = ['brokerage','individual','seller'].includes(finalAgentType);
-
-    const agentVerificationStatus = (isAgent && hasLicense) ? 'pending' : 'not_required';
-    
-    const params = [
-      name,
-      last_name,
-      email,
-      hashedPassword,
-      phone || null,
-      normalizedLicense,
-      work_start,
-      work_end,
-      finalAgentType,
-      finalAgentType === 'brokerage' ? (brokerage_name || null) : null,
-      citiesArr.length ? JSON.stringify(citiesArr) : null,
-      code,
-      expires,
-      agentVerificationStatus
-    ];
-
-    pool.query(sql, params, async (err, result) => {
-      if (err) {
-        if (err.code === 'ER_DUP_ENTRY') {
-          return res.status(400).json({ error: 'El email ya existe' });
-        }
-        console.error('[agents/register] insert error', err);
-        return res.status(500).json({ error: 'Error al registrar el usuario.' });
+    // Usamos conexión para transacción
+    pool.getConnection(async (connErr, conn) => {
+      if (connErr) {
+        console.error('[agents/register] getConnection error', connErr);
+        return res.status(500).json({ error: 'Error interno del servidor.' });
       }
 
-      // enviar código
+      const rollbackAndRelease = (status, payload) => {
+        conn.rollback(() => {
+          conn.release();
+          res.status(status).json(payload);
+        });
+      };
+
       try {
-        await sendVerificationEmail(email, code);
-      } catch (mailErr) {
-        console.error('[agents/register] mail error', mailErr);
-        // Si quieres, puedes responder 201 y permitir reenviar el código luego:
-        // return res.status(201).json({ ok: true, need_verification: true, email, user_id: result.insertId, mail_sent: false });
-      }
+        await new Promise((resolve, reject) => conn.beginTransaction(err => err ? reject(err) : resolve()));
 
-      // igual que /users/register: NO token, exige verificación
-      return res.status(201).json({
-        ok: true,
-        need_verification: true,
-        email,
-        user_id: result.insertId
-      });
+        const sqlUser = `
+          INSERT INTO users
+            (name, last_name, email, password, phone,
+             work_start, work_end,
+             agent_type, brokerage_name, cities,
+             email_verified, email_verif_code, email_verif_expires,
+             agent_verification_status)
+          VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+        `;
+
+        const paramsUser = [
+          name,
+          last_name,
+          email,
+          hashedPassword,
+          phone || null,
+          work_start,
+          work_end,
+          finalAgentType,
+          finalAgentType === 'brokerage' ? (brokerage_name || null) : null,
+          citiesArr.length ? JSON.stringify(citiesArr) : null,
+          code,
+          expires,
+          agentVerificationStatus
+        ];
+
+        const userResult = await new Promise((resolve, reject) => {
+          conn.query(sqlUser, paramsUser, (err, result) => err ? reject(err) : resolve(result));
+        });
+
+        const userId = userResult.insertId;
+
+        // Insert credencial si aplica (solo brokerage/individual)
+        if (isVerifiableAgent && normalizedCredential) {
+          const sqlCred = `
+            INSERT INTO agent_credentials
+              (user_id, type, state, credential_id, issuer, verification_url)
+            VALUES
+              (?, ?, ?, ?, ?, ?)
+          `;
+          const paramsCred = [
+            userId,
+            normalizedCredential.type,
+            normalizedCredential.state,
+            normalizedCredential.credential_id,
+            normalizedCredential.issuer,
+            normalizedCredential.verification_url
+          ];
+
+          await new Promise((resolve, reject) => {
+            conn.query(sqlCred, paramsCred, (err, result) => err ? reject(err) : resolve(result));
+          });
+        }
+
+        await new Promise((resolve, reject) => conn.commit(err => err ? reject(err) : resolve()));
+        conn.release();
+
+        // Enviar código (fuera de la transacción)
+        try {
+          await sendVerificationEmail(email, code);
+        } catch (mailErr) {
+          console.error('[agents/register] mail error', mailErr);
+          // Decide si esto debe fallar el registro o no.
+          // Mantengo tu comportamiento: no falla la creación; el usuario puede reintentar envío.
+        }
+
+        return res.status(201).json({
+          ok: true,
+          need_verification: true,
+          email,
+          user_id: userId
+        });
+
+      } catch (err) {
+        console.error('[agents/register] tx error', err);
+
+        // Duplicado email
+        if (err && err.code === 'ER_DUP_ENTRY') {
+          return rollbackAndRelease(400, { error: 'El email ya existe' });
+        }
+
+        return rollbackAndRelease(500, { error: 'Error al registrar el usuario.' });
+      }
     });
+
   } catch (error) {
     console.error('[agents/register] fatal', error);
     return res.status(500).json({ error: 'Error interno del servidor.' });
@@ -1191,33 +1297,20 @@ app.put('/agents/:id/work-schedule', authenticateToken, (req, res) => {
     return res.status(400).json({ error: 'Horario laboral en formato inválido. Usa HH:mm.' });
   }
 
-  if (parseInt(id) !== req.user.id) {
+  if (Number(id) !== req.user.id) {
     return res.status(403).json({ error: 'No autorizado.' });
   }
 
   pool.query(
-    'UPDATE users SET work_start = ?, work_end = ? WHERE id = ? AND type = "agente"',
-    [work_start, work_end, id],
+    `UPDATE users
+     SET work_start = ?, work_end = ?
+     WHERE id = ?
+       AND agent_type IN ('brokerage','individual','seller','regular')`,
+    [work_start, work_end, Number(id)],
     (err, result) => {
       if (err) return res.status(500).json({ error: 'Error actualizando horario.' });
-      if (result.affectedRows === 0) return res.status(404).json({ error: 'No se actualizó (id no encontrado o no es agente).' });
-      res.json({ message: 'Horario actualizado correctamente.' });
-    }
-  );
-});
-
-app.get('/agents/:id', (req, res) => {
-  const { id } = req.params;
-  pool.query(
-    `SELECT id, name, last_name, phone, license, work_start, work_end, agent_verification_status
-     FROM users
-     WHERE id = ? AND (agent_type = "brokerage" OR agent_type = "individual")
-     LIMIT 1`,
-    [id],
-    (err, results) => {
-      if (err) return res.status(500).json({ error: 'Error al consultar el horario.' });
-      if (!results.length) return res.status(404).json({ error: 'Agente no encontrado.' });
-      res.json(results[0]);
+      if (!result.affectedRows) return res.status(404).json({ error: 'No se actualizó.' });
+      res.json({ ok: true });
     }
   );
 });
@@ -1227,7 +1320,7 @@ app.post('/agents/me/resubmit-verification', authenticateToken, async (req, res)
     const uid = req.user.id;
 
     const [rows] = await pool.promise().query(
-      `SELECT agent_type, license, agent_verification_status
+      `SELECT agent_type, agent_verification_status
        FROM users
        WHERE id = ?
        LIMIT 1`,
@@ -1240,12 +1333,22 @@ app.post('/agents/me/resubmit-verification', authenticateToken, async (req, res)
     const isAgent = ['brokerage', 'individual'].includes(u.agent_type);
 
     if (!isAgent) return res.status(403).json({ error: 'No aplica para este tipo de usuario' });
-    if (!u.license) return res.status(400).json({ error: 'Falta licencia para verificación' });
 
-    // Solo permitimos re-submit si fue rejected (si quieres permitir desde pending, lo ajustamos)
     if (u.agent_verification_status !== 'rejected') {
       return res.status(400).json({ error: 'No puedes reenviar en este estado' });
     }
+
+    const [cRows] = await pool.promise().query(
+      `SELECT credential_id
+       FROM agent_credentials
+       WHERE user_id = ?
+       ORDER BY id DESC
+       LIMIT 1`,
+      [uid]
+    );
+
+    const credId = cRows?.[0]?.credential_id ? String(cRows[0].credential_id).trim() : '';
+    if (!credId) return res.status(400).json({ error: 'Falta credencial para verificación' });
 
     await pool.promise().query(
       `UPDATE users
@@ -1263,14 +1366,15 @@ app.post('/agents/me/resubmit-verification', authenticateToken, async (req, res)
     return res.status(500).json({ error: 'Error de servidor' });
   }
 });
+
   
 // User log in
 app.post('/users/login', (req, res) => {
   const { email, password } = req.body;
   const sql = `
-    SELECT id, name, last_name, email, password, phone, license,
-          work_start, work_end, agent_type, brokerage_name, cities, email_verified,
-          agent_verification_status
+  SELECT id, name, last_name, email, password, phone,
+        work_start, work_end, agent_type, brokerage_name, cities, email_verified,
+        agent_verification_status, agent_rejection_reason
     FROM users
     WHERE email = ?
     LIMIT 1
@@ -1311,14 +1415,14 @@ app.post('/users/login', (req, res) => {
         last_name: u.last_name,
         email: u.email,
         phone: u.phone,
-        license: u.license,
         work_start: u.work_start,
         work_end: u.work_end,
         agent_type: u.agent_type,
         agent_verification_status: u.agent_verification_status,
         is_agent: u.agent_type,
         brokerage_name: u.brokerage_name || null,
-        cities: citiesArr
+        cities: citiesArr,
+        agent_rejection_reason: u.agent_rejection_reason ?? null,
       }
     });
   });
@@ -1353,8 +1457,8 @@ app.post('/auth/google', async (req, res) => {
 
     // Buscar usuario por email
     const selSql = `
-      SELECT id, name, last_name, email, phone, license, work_start, work_end,
-            agent_type, brokerage_name, cities, agent_verification_status
+      SELECT id, name, last_name, email, phone, work_start, work_end,
+            agent_type, brokerage_name, cities, agent_verification_status, agent_rejection_reason
       FROM users
       WHERE email = ?
       LIMIT 1
@@ -1389,7 +1493,6 @@ app.post('/auth/google', async (req, res) => {
             last_name: family_name || '',
             email,
             phone: null,
-            license: null,
             work_start: null,
             work_end: null,
             agent_type: 'regular',
@@ -1431,7 +1534,6 @@ function issueToken(res, u) {
       last_name: u.last_name,
       email: u.email,
       phone: u.phone,
-      license: u.license,
       work_start: u.work_start,
       work_end: u.work_end,
       agent_type: u.agent_type,
@@ -1463,16 +1565,7 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
   const id = Number(req.params.id);
   if (id !== req.user.id) return res.status(403).json({ error: 'No autorizado' });
 
-  const {
-    phone,
-    email,
-    password,
-    work_start,
-    work_end,
-    name,
-    last_name,
-    license
-  } = req.body || {};
+  const { phone, email, password, work_start, work_end, name, last_name } = req.body || {};
 
   // Bloquear cambio de email
   if (email !== undefined) {
@@ -1483,7 +1576,7 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
   let current;
   try {
     const [rows] = await pool.promise().query(
-      `SELECT id, agent_type, name, last_name, license
+      `SELECT id, agent_type, name, last_name
        FROM users
        WHERE id = ?
        LIMIT 1`,
@@ -1502,15 +1595,12 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
   const clean = (v) => (v === undefined || v === null) ? undefined : String(v).trim();
   const currName = clean(current.name) || '';
   const currLast = clean(current.last_name) || '';
-  const currLic = clean(current.license) || '';
 
   const newName = clean(name);
   const newLast = clean(last_name);
-  const newLic = clean(license);
 
   const nameChanged = (newName !== undefined) && (newName !== currName);
   const lastChanged = (newLast !== undefined) && (newLast !== currLast);
-  const licenseChanged = (newLic !== undefined) && (newLic !== currLic);
 
   if (phone !== undefined) { updates.push('phone = ?'); values.push(phone || null); }
 
@@ -1526,11 +1616,10 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
 
   if (newName !== undefined) { updates.push('name = ?'); values.push(newName); }
   if (newLast !== undefined) { updates.push('last_name = ?'); values.push(newLast); }
-  if (newLic !== undefined)  { updates.push('license = ?'); values.push(newLic || null); }
 
   const isVerifiableAgent = ['brokerage', 'individual'].includes(current.agent_type);
 
-  if (isVerifiableAgent && (nameChanged || lastChanged || licenseChanged)) {
+  if (isVerifiableAgent && (nameChanged || lastChanged )) {
     updates.push(`agent_verification_status = 'pending'`);
     updates.push(`agent_rejection_reason = NULL`);
     updates.push(`agent_verified_at = NULL`);
@@ -1548,7 +1637,7 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
     );
 
     const [rows2] = await pool.promise().query(
-      `SELECT id, name, last_name, email, phone, work_start, work_end, license, agent_verification_status, agent_rejection_reason
+      `SELECT id, name, last_name, email, phone, work_start, work_end, agent_verification_status, agent_rejection_reason
        FROM users WHERE id = ? LIMIT 1`,
       [id]
     );
@@ -1559,16 +1648,181 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
   }
 });
 
+app.get('/agents/me/credentials/latest', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const [rows] = await pool.promise().query(
+      `SELECT id, type, state, credential_id, issuer, verification_url, created_at, updated_at
+       FROM agent_credentials
+       WHERE user_id = ?
+       ORDER BY id DESC
+       LIMIT 1`,
+      [userId]
+    );
+    res.json({ credential: rows?.[0] || null });
+  } catch (e) {
+    console.error('[agents/me/credentials/latest] error', e);
+    res.status(500).json({ error: 'No se pudo cargar credencial' });
+  }
+});
 
+app.put('/agents/me/credentials', authenticateToken, async (req, res) => {
+  try {
+    const uid = req.user.id;
+
+    const {
+      type,            // 'state_registry' | 'ampi_ccie' | 'other_verifiable'
+      state,           // 'MX-BCN' etc (solo state_registry)
+      credential_id,   // folio/matrícula
+      issuer,          // opcional, requerido en other_verifiable
+      verification_url // opcional, requerido en other_verifiable
+    } = req.body || {};
+
+    // 1) usuario y tipo
+    const [uRows] = await pool.promise().query(
+      `SELECT id, agent_type, agent_verification_status
+       FROM users
+       WHERE id = ?
+       LIMIT 1`,
+      [uid]
+    );
+    if (!uRows?.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    const u = uRows[0];
+    const isVerifiableAgent = ['brokerage', 'individual'].includes(u.agent_type);
+    if (!isVerifiableAgent) {
+      return res.status(403).json({ error: 'Este usuario no puede registrar credenciales' });
+    }
+
+    // 2) validaciones (idénticas a registro)
+    const allowedCredTypes = new Set(['state_registry', 'ampi_ccie', 'other_verifiable']);
+    const t = String(type || '').trim();
+    if (!allowedCredTypes.has(t)) return res.status(400).json({ error: 'Tipo de credencial inválido.' });
+
+    const cid = String(credential_id || '').trim();
+    if (!cid) return res.status(400).json({ error: 'Falta el folio/matrícula/código de la credencial.' });
+
+    const st = state != null ? String(state).trim() : null;
+    const iss = issuer != null ? String(issuer).trim() : null;
+    const url = verification_url != null ? String(verification_url).trim() : null;
+
+    if (t === 'state_registry') {
+      if (!st || !/^MX-[A-Z]{3}$/.test(st)) {
+        return res.status(400).json({ error: 'Estado inválido para registro estatal (usa formato MX-XXX).' });
+      }
+    }
+
+    if (t === 'other_verifiable') {
+      if (!iss) return res.status(400).json({ error: 'Falta el emisor para "Otro registro verificable".' });
+      if (!url) return res.status(400).json({ error: 'Falta el enlace público de verificación.' });
+    }
+
+    // 3) comparar con la última credencial (para decidir resetear verificación)
+    const [cRows] = await pool.promise().query(
+      `SELECT id, type, state, credential_id, issuer, verification_url
+       FROM agent_credentials
+       WHERE user_id=?
+       ORDER BY id DESC
+       LIMIT 1`,
+      [uid]
+    );
+
+    const prev = cRows?.[0] || null;
+
+    const normalized = {
+      type: t,
+      state: t === 'state_registry' ? st : null,
+      credential_id: cid.slice(0, 120),
+      issuer: iss ? iss.slice(0, 120) : null,
+      verification_url: url ? url.slice(0, 512) : null,
+    };
+
+    const changed =
+      !prev ||
+      String(prev.type || '') !== normalized.type ||
+      String(prev.state || '') !== String(normalized.state || '') ||
+      String(prev.credential_id || '') !== normalized.credential_id ||
+      String(prev.issuer || '') !== String(normalized.issuer || '') ||
+      String(prev.verification_url || '') !== String(normalized.verification_url || '');
+
+    // 4) transacción: insertar credencial + reset status si cambió
+    const cxn = await pool.promise().getConnection();
+    try {
+      await cxn.beginTransaction();
+
+      await cxn.query(
+        `INSERT INTO agent_credentials (user_id, type, state, credential_id, issuer, verification_url)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          uid,
+          normalized.type,
+          normalized.state,
+          normalized.credential_id,
+          normalized.issuer,
+          normalized.verification_url,
+        ]
+      );
+
+      if (changed) {
+        await cxn.query(
+          `UPDATE users
+           SET agent_verification_status='pending',
+               agent_rejection_reason=NULL,
+               agent_verified_at=NULL,
+               agent_verified_by=NULL
+           WHERE id=?`,
+          [uid]
+        );
+      }
+
+      await cxn.commit();
+      cxn.release();
+
+      return res.json({ ok: true, credential: normalized, changed });
+    } catch (e) {
+      await cxn.rollback();
+      cxn.release();
+      console.error('[PUT /agents/me/credentials] tx error', e);
+      return res.status(500).json({ error: 'No se pudo actualizar credencial' });
+    }
+  } catch (e) {
+    console.error('[PUT /agents/me/credentials] error', e);
+    return res.status(500).json({ error: 'Error de servidor' });
+  }
+});
+
+app.get('/agents/:id', (req, res) => {
+  const { id } = req.params;
+
+  pool.query(
+    `SELECT id, name, last_name, phone, work_start, work_end, agent_verification_status
+     FROM users
+     WHERE id = ?
+       AND agent_type IN ('brokerage','individual')
+     LIMIT 1`,
+    [id],
+    (err, results) => {
+      if (err) return res.status(500).json({ error: 'Error al consultar el agente.' });
+      if (!results || !results.length) return res.status(404).json({ error: 'Agente no encontrado.' });
+      return res.json(results[0]);
+    }
+  );
+});
 
   //  Auth endpoint
 // Endpoint para validar token
 app.get('/auth/validate', authenticateToken, (req, res) => {
-  const { id, email, agent_type } = req.user;
+  const { id } = req.user;
 
   const query = `
     SELECT
-      name, last_name, email, phone, agent_type,
+      name,
+      last_name,
+      email,
+      phone,
+      agent_type,
+      work_start,
+      work_end,
       agent_verification_status,
       agent_rejection_reason
     FROM users
@@ -1577,7 +1831,7 @@ app.get('/auth/validate', authenticateToken, (req, res) => {
   `;
 
   pool.query(query, [id], (err, results) => {
-    if (err || results.length === 0) {
+    if (err || !results?.length) {
       return res.status(401).json({ error: 'Usuario no encontrado.' });
     }
     const user = results[0];
@@ -1590,11 +1844,14 @@ app.get('/auth/validate', authenticateToken, (req, res) => {
       email: user.email,
       phone: user.phone,
       user_type: user.agent_type,
+      work_start: user.work_start,
+      work_end: user.work_end,
       agent_verification_status: user.agent_verification_status ?? null,
       agent_rejection_reason: user.agent_rejection_reason ?? null,
     });
   });
 });
+
 
 const forgotPasswordIpLimiter = rateLimit({
   windowMs: 10 * 60 * 1000, // 10 min
@@ -2941,22 +3198,45 @@ app.post('/payments/promote/create-intent', authenticateToken, async (req, res) 
 // ===============================
 
 app.get('/admin/agents/pending', authenticateToken, requireAdmin, (req, res) => {
-  pool.query(
-    `SELECT id, name, last_name, email, phone, license, agent_type,
-            agent_verification_status, created_at
-     FROM users
-     WHERE agent_type IN ('brokerage','individual','seller')
-     AND agent_verification_status='pending'
-     AND license IS NOT NULL AND license <> ''
-     ORDER BY id DESC
-     LIMIT 500`,
-    [],
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: 'Error consultando agentes' });
-      res.json(rows);
-    }
-  );
+  const sql = `
+    SELECT
+      u.id,
+      u.name,
+      u.last_name,
+      u.email,
+      u.phone,
+      u.agent_type,
+      u.agent_verification_status,
+      u.created_at,
+
+      ac.type AS credential_type,
+      ac.state AS credential_state,
+      ac.credential_id,
+      ac.issuer,
+      ac.verification_url
+    FROM users u
+    JOIN agent_credentials ac
+      ON ac.id = (
+        SELECT id
+        FROM agent_credentials
+        WHERE user_id = u.id
+        ORDER BY id DESC
+        LIMIT 1
+      )
+    WHERE u.agent_type IN ('brokerage','individual','seller')
+      AND u.agent_verification_status = 'pending'
+      AND ac.credential_id IS NOT NULL
+      AND ac.credential_id <> ''
+    ORDER BY u.id DESC
+    LIMIT 500
+  `;
+
+  pool.query(sql, [], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Error consultando agentes' });
+    res.json(rows);
+  });
 });
+
 
 app.post('/admin/agents/:id/approve', authenticateToken, requireAdmin, (req, res) => {
   const agentId = Number(req.params.id);
