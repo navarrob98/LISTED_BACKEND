@@ -3942,7 +3942,7 @@ app.post('/api/reports', authenticateToken, async (req, res) => {
 });
 
 // GET: Obtener todos los reportes (ADMIN ONLY)
-app.get('/admin/reports', authenticateToken, async (req, res) => {
+app.get('/admin/reports', authenticateToken, requireAdmin, async (req, res) => {
   try {
     // Verificar que sea admin
     if (req.user.type !== 'admin') {
@@ -3993,7 +3993,7 @@ app.get('/admin/reports', authenticateToken, async (req, res) => {
 });
 
 // PUT: Actualizar estado de reporte (ADMIN ONLY)
-app.put('/admin/reports/:id/status', authenticateToken, async (req, res) => {
+app.put('/admin/reports/:id/status', authenticateToken, requireAdmin, async (req, res) => {
   try {
     // Verificar que sea admin
     if (req.user.type !== 'admin') {
@@ -4020,7 +4020,7 @@ app.put('/admin/reports/:id/status', authenticateToken, async (req, res) => {
 });
 
 // DELETE: Eliminar reporte (ADMIN ONLY)
-app.delete('/admin/reports/:id', authenticateToken, async (req, res) => {
+app.delete('/admin/reports/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
     // Verificar que sea admin
     if (req.user.type !== 'admin') {
