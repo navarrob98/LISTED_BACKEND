@@ -3942,7 +3942,7 @@ app.post('/api/reports', authenticateToken, async (req, res) => {
 });
 
 // GET: Obtener todos los reportes (ADMIN ONLY)
-app.get('/admin/reports', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/admin/reports', authenticateToken, async (req, res) => {
   try {
     // Verificar que sea admin
     if (req.user.agent_type !== 'admin') {
@@ -3962,19 +3962,51 @@ app.get('/admin/reports', authenticateToken, requireAdmin, async (req, res) => {
     const sql = `
       SELECT 
         r.*,
+        
         reporter.name AS reporter_name,
         reporter.last_name AS reporter_last_name,
         reporter.email AS reporter_email,
+        reporter.phone AS reporter_phone,
+        reporter.agent_type AS reporter_type,
+        reporter.created_at AS reporter_created_at,
+        
+        p.id AS property_id,
         p.address AS property_address,
         p.type AS property_type,
+        p.estate_type AS property_estate_type,
         p.price AS property_price,
+        p.monthly_pay AS property_monthly_pay,
+        p.bedrooms AS property_bedrooms,
+        p.bathrooms AS property_bathrooms,
+        p.land AS property_land,
+        p.construction AS property_construction,
+        p.description AS property_description,
+        p.created_at AS property_created_at,
+        p.is_published AS property_is_published,
         p.created_by AS property_owner_id,
+
         owner.name AS property_owner_name,
         owner.last_name AS property_owner_last_name,
+        owner.email AS property_owner_email,
+        owner.phone AS property_owner_phone,
+        owner.agent_type AS property_owner_type,
+        
+        agent.id AS agent_id,
         agent.name AS agent_name,
         agent.last_name AS agent_last_name,
         agent.email AS agent_email,
-        agent.phone AS agent_phone
+        agent.phone AS agent_phone,
+        agent.agent_type AS agent_type,
+        agent.agent_verification_status AS agent_verification_status,
+        agent.work_start AS agent_work_start,
+        agent.work_end AS agent_work_end,
+        agent.created_at AS agent_created_at,
+        
+        (SELECT COUNT(*) FROM chat_messages 
+         WHERE (sender_id = r.reporter_id AND receiver_id = r.reported_agent_id)
+            OR (sender_id = r.reported_agent_id AND receiver_id = r.reporter_id)
+        ) AS chat_messages_count
+        
       FROM reports r
       LEFT JOIN users reporter ON reporter.id = r.reporter_id
       LEFT JOIN properties p ON p.id = r.reported_property_id
@@ -3992,8 +4024,115 @@ app.get('/admin/reports', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
+app.get('/admin/reports/:id/chat-export', authenticateToken, async (req, res) => {
+  try {
+    // Verificar que sea admin
+    if (req.user.agent_type !== 'admin') {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
+
+    const reportId = req.params.id;
+
+    // Obtener el reporte
+    const [reportRows] = await pool.promise().query(
+      `SELECT r.*, 
+              reporter.name AS reporter_name, 
+              reporter.last_name AS reporter_last_name,
+              agent.name AS agent_name,
+              agent.last_name AS agent_last_name
+       FROM reports r
+       LEFT JOIN users reporter ON reporter.id = r.reporter_id
+       LEFT JOIN users agent ON agent.id = r.reported_agent_id
+       WHERE r.id = ? LIMIT 1`,
+      [reportId]
+    );
+
+    if (!reportRows.length) {
+      return res.status(404).json({ error: 'Reporte no encontrado' });
+    }
+
+    const report = reportRows[0];
+
+    if (report.report_type !== 'agent') {
+      return res.status(400).json({ error: 'Solo se pueden exportar chats de reportes de agentes' });
+    }
+
+    // Obtener todos los mensajes entre el reportador y el agente reportado
+    const [messages] = await pool.promise().query(
+      `SELECT 
+        cm.*,
+        sender.name AS sender_name,
+        sender.last_name AS sender_last_name,
+        receiver.name AS receiver_name,
+        receiver.last_name AS receiver_last_name,
+        p.address AS property_address
+       FROM chat_messages cm
+       LEFT JOIN users sender ON sender.id = cm.sender_id
+       LEFT JOIN users receiver ON receiver.id = cm.receiver_id
+       LEFT JOIN properties p ON p.id = cm.property_id
+       WHERE (cm.sender_id = ? AND cm.receiver_id = ?)
+          OR (cm.sender_id = ? AND cm.receiver_id = ?)
+       ORDER BY cm.created_at ASC`,
+      [report.reporter_id, report.reported_agent_id, report.reported_agent_id, report.reporter_id]
+    );
+
+    // Generar el contenido del archivo TXT
+    let txtContent = '';
+    txtContent += '='.repeat(80) + '\n';
+    txtContent += 'EXPORTACIÓN DE CHAT - REPORTE #' + reportId + '\n';
+    txtContent += '='.repeat(80) + '\n\n';
+    
+    txtContent += 'INFORMACIÓN DEL REPORTE:\n';
+    txtContent += '-'.repeat(80) + '\n';
+    txtContent += `Fecha del reporte: ${new Date(report.created_at).toLocaleString('es-MX')}\n`;
+    txtContent += `Estado: ${report.status}\n`;
+    txtContent += `Motivo: ${report.reason}\n`;
+    txtContent += `Descripción: ${report.description}\n\n`;
+    
+    txtContent += 'PARTICIPANTES:\n';
+    txtContent += '-'.repeat(80) + '\n';
+    txtContent += `Reportador: ${report.reporter_name} ${report.reporter_last_name} (ID: ${report.reporter_id})\n`;
+    txtContent += `Reportado: ${report.agent_name} ${report.agent_last_name} (ID: ${report.reported_agent_id})\n\n`;
+    
+    txtContent += 'MENSAJES (' + messages.length + ' total):\n';
+    txtContent += '='.repeat(80) + '\n\n';
+
+    if (messages.length === 0) {
+      txtContent += 'No hay mensajes entre estos usuarios.\n';
+    } else {
+      for (const msg of messages) {
+        const senderName = `${msg.sender_name} ${msg.sender_last_name}`;
+        const timestamp = new Date(msg.created_at).toLocaleString('es-MX');
+        const property = msg.property_address ? ` [Propiedad: ${msg.property_address}]` : '';
+        
+        txtContent += `[${timestamp}]${property}\n`;
+        txtContent += `${senderName}: ${msg.message || '[Archivo adjunto]'}\n`;
+        
+        if (msg.file_url) {
+          txtContent += `   📎 Archivo: ${msg.file_name || 'archivo'}\n`;
+          txtContent += `   URL: ${msg.file_url}\n`;
+        }
+        
+        txtContent += '\n';
+      }
+    }
+
+    txtContent += '\n' + '='.repeat(80) + '\n';
+    txtContent += 'FIN DEL CHAT\n';
+    txtContent += '='.repeat(80) + '\n';
+
+    // Enviar como descarga
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="chat_reporte_${reportId}_${Date.now()}.txt"`);
+    res.send(txtContent);
+  } catch (e) {
+    console.error('[GET /admin/reports/:id/chat-export] error', e);
+    res.status(500).json({ error: 'Error al exportar chat' });
+  }
+});
+
 // PUT: Actualizar estado de reporte (ADMIN ONLY)
-app.put('/admin/reports/:id/status', authenticateToken, requireAdmin, async (req, res) => {
+app.put('/admin/reports/:id/status', authenticateToken, async (req, res) => {
   try {
     // Verificar que sea admin
     if (req.user.agent_type !== 'admin') {
@@ -4018,9 +4157,8 @@ app.put('/admin/reports/:id/status', authenticateToken, requireAdmin, async (req
     res.status(500).json({ error: 'Error al actualizar reporte' });
   }
 });
-
 // DELETE: Eliminar reporte (ADMIN ONLY)
-app.delete('/admin/reports/:id', authenticateToken, requireAdmin, async (req, res) => {
+app.delete('/admin/reports/:id', authenticateToken, async (req, res) => {
   try {
     // Verificar que sea admin
     if (req.user.agent_type !== 'admin') {
