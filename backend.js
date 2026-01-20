@@ -3945,7 +3945,7 @@ app.post('/api/reports', authenticateToken, async (req, res) => {
 app.get('/admin/reports', authenticateToken, requireAdmin, async (req, res) => {
   try {
     // Verificar que sea admin
-    if (req.user.type !== 'admin') {
+    if (req.user.agent_type !== 'admin') {
       return res.status(403).json({ error: 'No autorizado' });
     }
 
@@ -3996,7 +3996,7 @@ app.get('/admin/reports', authenticateToken, requireAdmin, async (req, res) => {
 app.put('/admin/reports/:id/status', authenticateToken, requireAdmin, async (req, res) => {
   try {
     // Verificar que sea admin
-    if (req.user.type !== 'admin') {
+    if (req.user.agent_type !== 'admin') {
       return res.status(403).json({ error: 'No autorizado' });
     }
 
@@ -4023,7 +4023,7 @@ app.put('/admin/reports/:id/status', authenticateToken, requireAdmin, async (req
 app.delete('/admin/reports/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
     // Verificar que sea admin
-    if (req.user.type !== 'admin') {
+    if (req.user.agent_type !== 'admin') {
       return res.status(403).json({ error: 'No autorizado' });
     }
 
