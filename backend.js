@@ -973,7 +973,7 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
     const sql = `
       SELECT id, email_verif_code, email_verif_expires, name, last_name, phone,
        work_start, work_end, agent_type, brokerage_name, cities,
-       agent_verification_status, agent_rejection_reason
+       agent_verification_status, agent_rejection_reason, profile_photo
       FROM users WHERE email = ? LIMIT 1
     `;
     pool.query(sql, [email], (err, rows) => {
@@ -1025,6 +1025,7 @@ app.delete('/properties/:id', authenticateToken, (req, res) => {
               cities: citiesArr,
               agent_verification_status: u.agent_verification_status ?? null,
               agent_rejection_reason: u.agent_rejection_reason ?? null,
+              profile_photo: u.profile_photo ?? null,
             }
           });
         }
@@ -1315,6 +1316,64 @@ app.put('/agents/:id/work-schedule', authenticateToken, (req, res) => {
   );
 });
 
+// POST: Reenviar propiedad rechazada a revisión
+app.post('/properties/:id/resubmit', authenticateToken, async (req, res) => {
+  try {
+    const propertyId = Number(req.params.id);
+    const userId = req.user.id;
+
+    // Verificar que la propiedad existe y pertenece al usuario
+    const [rows] = await pool.promise().query(
+      `SELECT id, created_by, review_status, is_published
+       FROM properties
+       WHERE id = ?
+       LIMIT 1`,
+      [propertyId]
+    );
+
+    if (!rows?.length) {
+      return res.status(404).json({ error: 'Propiedad no encontrada' });
+    }
+
+    const property = rows[0];
+
+    // Verificar que es el dueño
+    if (String(property.created_by) !== String(userId)) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
+
+    // Solo se puede reenviar si está rechazada
+    if (property.review_status !== 'rejected') {
+      return res.status(400).json({ 
+        error: 'Solo puedes reenviar publicaciones rechazadas',
+        current_status: property.review_status 
+      });
+    }
+
+    // Actualizar el estado a 'pending' y limpiar notas de rechazo
+    await pool.promise().query(
+      `UPDATE properties
+       SET review_status = 'pending',
+           is_published = 0,
+           review_notes = NULL,
+           reviewed_at = NULL,
+           reviewed_by = NULL
+       WHERE id = ?`,
+      [propertyId]
+    );
+
+    return res.json({ 
+      ok: true, 
+      message: 'Publicación reenviada para revisión',
+      review_status: 'pending'
+    });
+
+  } catch (e) {
+    console.error('[POST /properties/:id/resubmit] error', e);
+    return res.status(500).json({ error: 'Error al reenviar la publicación' });
+  }
+});
+
 app.post('/agents/me/resubmit-verification', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.id;
@@ -1372,9 +1431,9 @@ app.post('/agents/me/resubmit-verification', authenticateToken, async (req, res)
 app.post('/users/login', (req, res) => {
   const { email, password } = req.body;
   const sql = `
-  SELECT id, name, last_name, email, password, phone,
-        work_start, work_end, agent_type, brokerage_name, cities, email_verified,
-        agent_verification_status, agent_rejection_reason
+    SELECT id, name, last_name, email, password, phone,
+          work_start, work_end, agent_type, brokerage_name, cities, email_verified,
+          agent_verification_status, agent_rejection_reason, profile_photo
     FROM users
     WHERE email = ?
     LIMIT 1
@@ -1405,8 +1464,8 @@ app.post('/users/login', (req, res) => {
     );
 
     let citiesArr = null;
-    try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {
-    }
+    try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {}
+    
     return res.json({
       token,
       user: {
@@ -1423,6 +1482,7 @@ app.post('/users/login', (req, res) => {
         brokerage_name: u.brokerage_name || null,
         cities: citiesArr,
         agent_rejection_reason: u.agent_rejection_reason ?? null,
+        profile_photo: u.profile_photo ?? null,
       }
     });
   });
@@ -1540,7 +1600,8 @@ function issueToken(res, u) {
       agent_verification_status: u.agent_verification_status ?? null,
       is_agent: u.agent_type !== 'regular',
       brokerage_name: u.brokerage_name || null,
-      cities: citiesArr
+      cities: citiesArr,
+      profile_photo: u.profile_photo ?? null,
     }
   });
 }
@@ -1619,7 +1680,7 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
 
   const isVerifiableAgent = ['brokerage', 'individual'].includes(current.agent_type);
 
-  if (isVerifiableAgent && (nameChanged || lastChanged )) {
+  if (isVerifiableAgent && (nameChanged || lastChanged)) {
     updates.push(`agent_verification_status = 'pending'`);
     updates.push(`agent_rejection_reason = NULL`);
     updates.push(`agent_verified_at = NULL`);
@@ -1637,7 +1698,8 @@ app.put('/users/:id', authenticateToken, async (req, res) => {
     );
 
     const [rows2] = await pool.promise().query(
-      `SELECT id, name, last_name, email, phone, work_start, work_end, agent_verification_status, agent_rejection_reason
+      `SELECT id, name, last_name, email, phone, work_start, work_end, 
+              agent_verification_status, agent_rejection_reason, profile_photo
        FROM users WHERE id = ? LIMIT 1`,
       [id]
     );
@@ -1652,7 +1714,7 @@ app.get('/agents/me/credentials/latest', authenticateToken, async (req, res) => 
   const userId = req.user.id;
   try {
     const [rows] = await pool.promise().query(
-      `SELECT id, type, state, credential_id, issuer, verification_url, created_at, updated_at
+      `SELECT id, type, state, credential_id, issuer, verification_url, certificate_url, certificate_public_id, created_at, updated_at
        FROM agent_credentials
        WHERE user_id = ?
        ORDER BY id DESC
@@ -1719,7 +1781,7 @@ app.put('/agents/me/credentials', authenticateToken, async (req, res) => {
 
     // 3) comparar con la última credencial (para decidir resetear verificación)
     const [cRows] = await pool.promise().query(
-      `SELECT id, type, state, credential_id, issuer, verification_url
+      `SELECT id, type, state, credential_id, issuer, verification_url, certificate_url
        FROM agent_credentials
        WHERE user_id=?
        ORDER BY id DESC
@@ -1745,23 +1807,48 @@ app.put('/agents/me/credentials', authenticateToken, async (req, res) => {
       String(prev.issuer || '') !== String(normalized.issuer || '') ||
       String(prev.verification_url || '') !== String(normalized.verification_url || '');
 
-    // 4) transacción: insertar credencial + reset status si cambió
+    // 4) transacción: UPDATE si existe, INSERT si es nuevo + reset status si cambió
     const cxn = await pool.promise().getConnection();
     try {
       await cxn.beginTransaction();
 
-      await cxn.query(
-        `INSERT INTO agent_credentials (user_id, type, state, credential_id, issuer, verification_url)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-          uid,
-          normalized.type,
-          normalized.state,
-          normalized.credential_id,
-          normalized.issuer,
-          normalized.verification_url,
-        ]
-      );
+      if (prev) {
+        // ✅ ACTUALIZAR credencial existente (en lugar de INSERT)
+        await cxn.query(
+          `UPDATE agent_credentials 
+           SET type = ?,
+               state = ?,
+               credential_id = ?,
+               issuer = ?,
+               verification_url = ?,
+               updated_at = NOW()
+           WHERE id = ?`,
+          [
+            normalized.type,
+            normalized.state,
+            normalized.credential_id,
+            normalized.issuer,
+            normalized.verification_url,
+            prev.id  // ← Actualizar el registro existente
+          ]
+        );
+        console.log(`[PUT /agents/me/credentials] Credencial actualizada para usuario ${uid}`);
+      } else {
+        // ✅ INSERTAR nueva credencial (solo si no existe)
+        await cxn.query(
+          `INSERT INTO agent_credentials (user_id, type, state, credential_id, issuer, verification_url)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            uid,
+            normalized.type,
+            normalized.state,
+            normalized.credential_id,
+            normalized.issuer,
+            normalized.verification_url,
+          ]
+        );
+        console.log(`[PUT /agents/me/credentials] Nueva credencial creada para usuario ${uid}`);
+      }
 
       if (changed) {
         await cxn.query(
@@ -1791,11 +1878,92 @@ app.put('/agents/me/credentials', authenticateToken, async (req, res) => {
   }
 });
 
+// POST: Actualizar certificado de credencial del agente
+// POST: Actualizar certificado de credencial del agente
+app.post('/agents/update-credential-certificate', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { certificate_url, certificate_public_id } = req.body; // ← AGREGAR certificate_public_id
+
+    if (!certificate_url || typeof certificate_url !== 'string') {
+      return res.status(400).json({ error: 'URL del certificado inválida' });
+    }
+
+    // Validar que sea una URL de Cloudinary válida
+    if (!certificate_url.includes('cloudinary.com')) {
+      return res.status(400).json({ error: 'Solo se permiten URLs de Cloudinary' });
+    }
+
+    // Validar que el archivo esté en la carpeta correcta del usuario
+    const expectedFolder = `listed/${process.env.NODE_ENV === 'production' ? 'prod' : 'dev'}/raw/u_${userId}`;
+    
+    if (!certificate_url.includes(expectedFolder)) {
+      console.warn('[POST /agents/update-credential-certificate] archivo en ruta sospechosa', {
+        userId,
+        certificate_url,
+        expectedFolder
+      });
+    }
+
+    // Verificar que el usuario tiene credenciales y es un agente verificable
+    const [userRows] = await pool.promise().query(
+      `SELECT id, agent_type FROM users WHERE id = ? LIMIT 1`,
+      [userId]
+    );
+
+    if (!userRows || !userRows.length) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    const user = userRows[0];
+    const isVerifiableAgent = ['brokerage', 'individual'].includes(user.agent_type);
+
+    if (!isVerifiableAgent) {
+      return res.status(403).json({ error: 'Solo agentes verificables pueden subir certificados' });
+    }
+
+    // Buscar la credencial más reciente del usuario
+    const [credRows] = await pool.promise().query(
+      `SELECT id FROM agent_credentials 
+       WHERE user_id = ? 
+       ORDER BY id DESC 
+       LIMIT 1`,
+      [userId]
+    );
+
+    if (!credRows || !credRows.length) {
+      return res.status(404).json({ error: 'No se encontró credencial para este usuario' });
+    }
+
+    const credentialId = credRows[0].id;
+
+    // Actualizar el certificate_url Y certificate_public_id en la credencial
+    await pool.promise().query(
+      `UPDATE agent_credentials 
+       SET certificate_url = ?, 
+           certificate_public_id = ?,
+           updated_at = NOW() 
+       WHERE id = ?`,
+      [certificate_url, certificate_public_id || null, credentialId]
+    );
+
+    res.json({ 
+      ok: true, 
+      certificate_url,
+      certificate_public_id,
+      message: 'Certificado actualizado correctamente' 
+    });
+  } catch (e) {
+    console.error('[POST /agents/update-credential-certificate] error', e);
+    res.status(500).json({ error: 'Error al actualizar certificado' });
+  }
+});
+
 app.get('/agents/:id', (req, res) => {
   const { id } = req.params;
 
   pool.query(
-    `SELECT id, name, last_name, phone, work_start, work_end, agent_verification_status
+    `SELECT id, name, last_name, phone, work_start, work_end, agent_verification_status, profile_photo
      FROM users
      WHERE id = ?
        AND agent_type IN ('brokerage','individual')
@@ -1824,7 +1992,8 @@ app.get('/auth/validate', authenticateToken, (req, res) => {
       work_start,
       work_end,
       agent_verification_status,
-      agent_rejection_reason
+      agent_rejection_reason,
+      profile_photo
     FROM users
     WHERE id = ?
     LIMIT 1
@@ -1848,6 +2017,7 @@ app.get('/auth/validate', authenticateToken, (req, res) => {
       work_end: user.work_end,
       agent_verification_status: user.agent_verification_status ?? null,
       agent_rejection_reason: user.agent_rejection_reason ?? null,
+      profile_photo: user.profile_photo ?? null,
     });
   });
 });
@@ -2875,6 +3045,225 @@ app.post('/cloudinary/sign-upload', authenticateToken, (req, res) => {
   });
 });
 
+// POST: Eliminar archivo de Cloudinary
+app.post('/cloudinary/delete', authenticateToken, async (req, res) => {
+  try {
+    const { public_id, resource_type = 'raw' } = req.body;
+
+    if (!public_id) {
+      return res.status(400).json({ error: 'public_id es requerido' });
+    }
+
+    const userId = req.user.id;
+    const baseFolder = process.env.CLD_BASE_FOLDER || 'listed';
+    const envFolder = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+    
+    // Validar que el public_id pertenezca al usuario
+    const expectedPrefix = `${baseFolder}/${envFolder}`;
+    if (!public_id.startsWith(expectedPrefix) || !public_id.includes(`u_${userId}`)) {
+      console.warn('[POST /cloudinary/delete] Permiso denegado', { userId, public_id });
+      return res.status(403).json({ error: 'No tienes permiso para eliminar este archivo' });
+    }
+
+    console.log('[POST /cloudinary/delete] Eliminando archivo:', public_id);
+    console.log('[POST /cloudinary/delete] Resource type:', resource_type);
+
+    // Eliminar de Cloudinary (sin modificar el public_id)
+    const result = await cloudinary.uploader.destroy(public_id, {
+      resource_type: resource_type,
+      invalidate: true,
+    });
+
+    console.log('[POST /cloudinary/delete] Resultado:', result);
+
+    if (result.result === 'ok' || result.result === 'not found') {
+      return res.json({ 
+        ok: true, 
+        result: result.result,
+        message: result.result === 'ok' ? 'Archivo eliminado correctamente' : 'Archivo no encontrado'
+      });
+    } else {
+      return res.status(500).json({ 
+        error: 'No se pudo eliminar el archivo',
+        cloudinary_result: result 
+      });
+    }
+
+  } catch (e) {
+    console.error('[POST /cloudinary/delete] error:', e);
+    res.status(500).json({ error: 'Error al eliminar archivo de Cloudinary' });
+  }
+});
+
+// ===============================
+// PROFILE PHOTO ENDPOINTS
+// ===============================
+
+// POST: Obtener firma para subir foto de perfil
+app.post('/users/me/profile-photo/sign-upload', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { file_name } = req.body || {};
+
+    if (!file_name) {
+      return res.status(400).json({ error: 'Falta file_name' });
+    }
+
+    const timestamp = Math.floor(Date.now() / 1000);
+    
+    const baseFolder = process.env.CLD_BASE_FOLDER || 'listed';
+    const envFolder = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+    const folder = `${baseFolder}/${envFolder}/image/u_${userId}`;
+
+    const upload_preset = process.env.CLD_PRESET_PUBLIC;
+    if (!upload_preset) {
+      return res.status(500).json({ error: 'Falta configurar CLD_PRESET_PUBLIC' });
+    }
+
+    const toSign = {
+      timestamp,
+      upload_preset,
+      folder,
+      use_filename: 'true',
+      unique_filename: 'false',
+    };
+
+    const signature = cloudinary.utils.api_sign_request(toSign, process.env.CLOUDINARY_API_SECRET);
+
+    return res.json({
+      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+      api_key: process.env.CLOUDINARY_API_KEY,
+      timestamp,
+      signature,
+      upload_preset,
+      folder,
+      use_filename: true,
+      unique_filename: false,
+      resource_type: 'image',
+    });
+  } catch (e) {
+    console.error('[POST /users/me/profile-photo/sign-upload] error', e);
+    res.status(500).json({ error: 'Error al obtener firma para upload' });
+  }
+});
+
+// PUT: Actualizar foto de perfil
+app.put('/users/me/profile-photo', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { profile_photo } = req.body;
+
+    if (!profile_photo || typeof profile_photo !== 'string') {
+      return res.status(400).json({ error: 'URL de foto inválida' });
+    }
+
+    // Validar que sea una URL de Cloudinary válida
+    if (!profile_photo.includes('cloudinary.com')) {
+      return res.status(400).json({ error: 'Solo se permiten URLs de Cloudinary' });
+    }
+
+    // Validar que la imagen esté en la carpeta correcta del usuario
+    const expectedFolder = `listed/${process.env.NODE_ENV === 'production' ? 'prod' : 'dev'}/image/u_${userId}`;
+    if (!profile_photo.includes(expectedFolder)) {
+      console.warn('[PUT /users/me/profile-photo] imagen en ruta sospechosa', {
+        userId,
+        profile_photo,
+        expectedFolder
+      });
+      // Nota: Permitimos por flexibilidad, pero lo registramos
+    }
+
+    await pool.promise().query(
+      'UPDATE users SET profile_photo = ?, updated_at = NOW() WHERE id = ?',
+      [profile_photo, userId]
+    );
+
+    res.json({ ok: true, profile_photo });
+  } catch (e) {
+    console.error('[PUT /users/me/profile-photo] error', e);
+    res.status(500).json({ error: 'Error al actualizar foto de perfil' });
+  }
+});
+
+// DELETE: Eliminar foto de perfil
+app.delete('/users/me/profile-photo', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // 1. Obtener la URL actual de la foto
+    const [rows] = await pool.promise().query(
+      'SELECT profile_photo FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    );
+
+    if (!rows || !rows.length) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    const currentPhoto = rows[0].profile_photo;
+
+    // 2. Eliminar de Cloudinary si existe
+    if (currentPhoto && currentPhoto.includes('cloudinary.com')) {
+      try {
+        // Extraer public_id de la URL
+        const urlParts = currentPhoto.split('/');
+        const uploadIndex = urlParts.indexOf('upload');
+        if (uploadIndex !== -1 && uploadIndex + 2 < urlParts.length) {
+          // Obtener todo después de /upload/v{timestamp}/
+          const pathAfterVersion = urlParts.slice(uploadIndex + 2).join('/');
+          // Quitar la extensión del archivo
+          const publicId = pathAfterVersion.replace(/\.[^/.]+$/, '');
+          
+          const cloudinary = require('cloudinary').v2;
+          cloudinary.config({
+            cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+            api_key: process.env.CLOUDINARY_API_KEY,
+            api_secret: process.env.CLOUDINARY_API_SECRET,
+          });
+
+          await cloudinary.uploader.destroy(publicId);
+          console.log('[DELETE profile-photo] Imagen eliminada de Cloudinary:', publicId);
+        }
+      } catch (cloudinaryError) {
+        console.error('[DELETE profile-photo] Error eliminando de Cloudinary:', cloudinaryError);
+        // Continuar aunque falle la eliminación de Cloudinary
+      }
+    }
+
+    // 3. Eliminar de la base de datos
+    await pool.promise().query(
+      'UPDATE users SET profile_photo = NULL WHERE id = ?',
+      [userId]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[DELETE /users/me/profile-photo] error', e);
+    res.status(500).json({ error: 'Error al eliminar foto de perfil' });
+  }
+});
+
+// GET: Obtener foto de perfil de un usuario específico
+app.get('/users/:id/profile-photo', async (req, res) => {
+  try {
+    const userId = req.params.id;
+
+    const [rows] = await pool.promise().query(
+      'SELECT profile_photo FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    );
+
+    if (!rows || !rows.length) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    res.json({ profile_photo: rows[0].profile_photo || null });
+  } catch (e) {
+    console.error('[GET /users/:id/profile-photo] error', e);
+    res.status(500).json({ error: 'Error al obtener foto de perfil' });
+  }
+});
+
 // Tenant profile Endpoints
 
 // POST Crear o actualizar perfil de rentero
@@ -3213,7 +3602,8 @@ app.get('/admin/agents/pending', authenticateToken, requireAdmin, (req, res) => 
       ac.state AS credentialState,
       ac.credential_id AS credentialId,
       ac.issuer AS issuer,
-      ac.verification_url AS verificationUrl
+      ac.verification_url AS verificationUrl,
+      ac.certificate_url AS certificateUrl
 
     FROM users u
     JOIN agent_credentials ac
@@ -3237,8 +3627,6 @@ app.get('/admin/agents/pending', authenticateToken, requireAdmin, (req, res) => 
     res.json(rows);
   });
 });
-
-
 
 app.post('/admin/agents/:id/approve', authenticateToken, requireAdmin, (req, res) => {
   const agentId = Number(req.params.id);
