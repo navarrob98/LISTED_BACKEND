@@ -440,12 +440,36 @@ app.post("/properties/add", authenticateToken, async (req, res) => {
       lat,
       lng,
       images,
+      gated_community,
+      condo_horizontal,
+      surveillance_24_7,
+      controlled_access,
+      cctv,
+      alarm,
+      clubhouse,
+      gym,
+      common_pool,
+      playground,
+      park_garden,
+      sports_court,
+      event_room,
+      bbq_area,
+      maintenance_fee,
+      service_room,
+      roof_garden,
+      private_garden,
+      storage_room,
+      study_office,
+      fitted_kitchen,
+      closets,
+      cistern,
+      water_heater,
+      furnished,
+      pets_allowed,
     } = req.body || {};
 
     const created_by = req.user.id;
 
-    // (Opcional pero recomendado) Verifica que el usuario exista
-    // y de paso puedes usarlo después si quieres aplicar reglas por rol.
     const [uRows] = await pool
       .promise()
       .query(
@@ -478,7 +502,13 @@ app.post("/properties/add", authenticateToken, async (req, res) => {
         sewer_serv, garbage_collection_serv,
         solar, ac, laundry_room,
         lat, lng, created_by,
-        review_status, is_published
+        review_status, is_published,
+        gated_community, condo_horizontal,
+        surveillance_24_7, controlled_access, cctv, alarm,
+        clubhouse, gym, common_pool, playground, park_garden, sports_court, event_room, bbq_area,
+        maintenance_fee,
+        service_room, roof_garden, private_garden, storage_room, study_office, fitted_kitchen, closets, cistern, water_heater,
+        furnished, pets_allowed
       ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?,
@@ -490,6 +520,12 @@ app.post("/properties/add", authenticateToken, async (req, res) => {
         ?, ?,
         ?, ?, ?,
         ?, ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?,
+        ?,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?,
         ?, ?
       )
     `;
@@ -537,6 +573,39 @@ app.post("/properties/add", authenticateToken, async (req, res) => {
 
       finalReviewStatus,
       finalIsPublished,
+
+      gated_community ? 1 : 0,
+      condo_horizontal ? 1 : 0,
+
+      surveillance_24_7 ? 1 : 0,
+      controlled_access ? 1 : 0,
+      cctv ? 1 : 0,
+      alarm ? 1 : 0,
+
+      clubhouse ? 1 : 0,
+      gym ? 1 : 0,
+      common_pool ? 1 : 0,
+      playground ? 1 : 0,
+      park_garden ? 1 : 0,
+      sports_court ? 1 : 0,
+      event_room ? 1 : 0,
+      bbq_area ? 1 : 0,
+
+      maintenance_fee ?? null,
+
+      service_room ? 1 : 0,
+      roof_garden ? 1 : 0,
+      private_garden ? 1 : 0,
+      storage_room ? 1 : 0,
+      study_office ? 1 : 0,
+      fitted_kitchen ? 1 : 0,
+      closets ? 1 : 0,
+      cistern ? 1 : 0,
+      water_heater ? 1 : 0,
+
+      // Extras
+      furnished ? 1 : 0,
+      pets_allowed ? 1 : 0,
     ];
 
     const [result] = await pool.promise().query(query, values);
@@ -608,6 +677,38 @@ app.put('/properties/:id', authenticateToken, (req, res) => {
     laundry_room: 'bool',
     lat: 'float',
     lng: 'float',
+    // Nuevos campos: Tipo de desarrollo
+    gated_community: 'bool',
+    condo_horizontal: 'bool',
+    // Nuevos campos: Seguridad
+    surveillance_24_7: 'bool',
+    controlled_access: 'bool',
+    cctv: 'bool',
+    alarm: 'bool',
+    // Nuevos campos: Amenidades del desarrollo
+    clubhouse: 'bool',
+    gym: 'bool',
+    common_pool: 'bool',
+    playground: 'bool',
+    park_garden: 'bool',
+    sports_court: 'bool',
+    event_room: 'bool',
+    bbq_area: 'bool',
+    // Cuota de mantenimiento
+    maintenance_fee: 'number',
+    // Nuevos campos: Características de la propiedad
+    service_room: 'bool',
+    roof_garden: 'bool',
+    private_garden: 'bool',
+    storage_room: 'bool',
+    study_office: 'bool',
+    fitted_kitchen: 'bool',
+    closets: 'bool',
+    cistern: 'bool',
+    water_heater: 'bool',
+    // Nuevos campos: Extras
+    furnished: 'bool',
+    pets_allowed: 'bool',
   };
 
   const setFragments = [];
@@ -4561,5 +4662,103 @@ app.delete('/admin/reports/:id', authenticateToken, async (req, res) => {
   } catch (e) {
     console.error('[DELETE /admin/reports/:id] error', e);
     res.status(500).json({ error: 'Error al eliminar reporte' });
+  }
+});
+
+// ============ GET /api/infonavit/:userId ============
+app.get('/api/infonavit/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // Verificar que el usuario solo acceda a sus datos
+    if (req.user.id !== parseInt(userId)) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
+    
+    const [rows] = await pool.promise().query(
+      'SELECT * FROM infonavit_calculations WHERE user_id = ?',
+      [userId]
+    );
+    
+    if (!rows || rows.length === 0) {
+      return res.json(null);
+    }
+    
+    res.json(rows[0]);
+  } catch (error) {
+    console.error('Error fetching infonavit data:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+// ============ POST /api/infonavit ============
+app.post('/api/infonavit', authenticateToken, async (req, res) => {
+  try {
+    const {
+      user_id,
+      edad,
+      salario_mensual,
+      bimestres_cotizados,
+      saldo_subcuenta,
+      tipo_contrato,
+      plazo_anios,
+      tipo_credito,
+      puntos_estimados,
+      monto_credito_estimado,
+      tasa_interes,
+      pago_mensual_estimado,
+    } = req.body;
+    
+    // Verificar que el usuario solo guarde sus datos
+    if (req.user.id !== parseInt(user_id)) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
+    
+    // Validaciones básicas
+    if (!edad || !salario_mensual) {
+      return res.status(400).json({ error: 'Edad y salario son requeridos' });
+    }
+    
+    // UPSERT - insertar o actualizar si ya existe
+    const query = `
+      INSERT INTO infonavit_calculations (
+        user_id, edad, salario_mensual, bimestres_cotizados,
+        saldo_subcuenta, tipo_contrato, plazo_anios, tipo_credito,
+        puntos_estimados, monto_credito_estimado, tasa_interes, pago_mensual_estimado
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        edad = VALUES(edad),
+        salario_mensual = VALUES(salario_mensual),
+        bimestres_cotizados = VALUES(bimestres_cotizados),
+        saldo_subcuenta = VALUES(saldo_subcuenta),
+        tipo_contrato = VALUES(tipo_contrato),
+        plazo_anios = VALUES(plazo_anios),
+        tipo_credito = VALUES(tipo_credito),
+        puntos_estimados = VALUES(puntos_estimados),
+        monto_credito_estimado = VALUES(monto_credito_estimado),
+        tasa_interes = VALUES(tasa_interes),
+        pago_mensual_estimado = VALUES(pago_mensual_estimado),
+        updated_at = CURRENT_TIMESTAMP
+    `;
+    
+    await pool.promise().query(query, [
+      user_id,
+      edad,
+      salario_mensual,
+      bimestres_cotizados || 4,
+      saldo_subcuenta || 0,
+      tipo_contrato || 'permanente',
+      plazo_anios || 20,
+      tipo_credito || 'individual',
+      puntos_estimados,
+      monto_credito_estimado,
+      tasa_interes,
+      pago_mensual_estimado,
+    ]);
+    
+    res.json({ success: true, message: 'Datos guardados correctamente' });
+  } catch (error) {
+    console.error('Error saving infonavit data:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
