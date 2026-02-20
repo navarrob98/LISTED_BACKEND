@@ -16,4 +16,5 @@ module.exports = function registerRoutes(app) {
   app.use('/', require('./chat'));
   app.use('/', require('./appointments'));
   app.use('/', require('./misc'));
+  app.use('/', require('./favorites'));
 };
