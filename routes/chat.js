@@ -29,20 +29,32 @@ router.get('/api/chat/file-url/:message_id', authenticateToken, (req, res) => {
 router.get('/api/chat/messages', authenticateToken, (req, res) => {
   const { user_id, property_id } = req.query;
   const me = req.user.id;
+  console.log('[chat/messages] req', { me, user_id, property_id });
   if (!user_id) return res.status(400).json({ error: 'Faltan campos' });
 
   let query = `
-  SELECT *
-  FROM chat_messages
-  WHERE is_deleted = 0
-    AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+  SELECT
+    cm.*,
+    CASE WHEN cm.message_type = 'property_card' THEN p.id END as cp_id,
+    CASE WHEN cm.message_type = 'property_card' THEN p.address END as cp_address,
+    CASE WHEN cm.message_type = 'property_card' THEN p.type END as cp_type,
+    CASE WHEN cm.message_type = 'property_card' THEN p.price END as cp_price,
+    CASE WHEN cm.message_type = 'property_card' THEN p.monthly_pay END as cp_monthly_pay,
+    CASE WHEN cm.message_type = 'property_card' THEN p.estate_type END as cp_estate_type,
+    CASE WHEN cm.message_type = 'property_card'
+      THEN (SELECT image_url FROM property_images WHERE property_id = p.id ORDER BY id ASC LIMIT 1)
+    END as cp_first_image
+  FROM chat_messages cm
+  LEFT JOIN properties p ON cm.shared_property_id = p.id AND cm.message_type = 'property_card'
+  WHERE cm.is_deleted = 0
+    AND ((cm.sender_id = ? AND cm.receiver_id = ?) OR (cm.sender_id = ? AND cm.receiver_id = ?))
   `;
   const params = [me, user_id, user_id, me];
   if (property_id) {
-    query += ' AND property_id = ?';
+    query += ' AND cm.property_id = ?';
     params.push(property_id);
   }
-  query += ' ORDER BY created_at ASC';
+  query += ' ORDER BY cm.created_at ASC';
 
   // Marca los mensajes recibidos como leídos
   const markAsRead = `
@@ -51,16 +63,44 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
     WHERE receiver_id = ? AND sender_id = ? AND (property_id = ? OR ? IS NULL)
   `;
 
+  console.log('[chat/messages] params', params);
   pool.query(query, params, (err, results) => {
-    if (err) return res.status(500).json({ error: 'No se pudo obtener los mensajes' });
+    if (err) {
+      console.error('[chat/messages] DB ERROR', { code: err.code, sqlMessage: err.sqlMessage });
+      return res.status(500).json({ error: 'No se pudo obtener los mensajes', detail: err.sqlMessage });
+    }
+    console.log('[chat/messages] rows returned:', results.length);
 
     const ttl = Number(process.env.CLD_DEFAULT_URL_TTL_SECONDS || 300);
     const mapped = results.map(row => {
-      if (row.file_url) {
-        const signed = signedDeliveryUrlFromSecure(row.file_url, ttl, row.file_name);
-        return { ...row, signed_file_url: signed };
+      const msg = { ...row };
+
+      if (row.message_type === 'property_card' && row.cp_id) {
+        msg.card_property = {
+          id: row.cp_id,
+          address: row.cp_address,
+          type: row.cp_type,
+          price: row.cp_price,
+          monthly_pay: row.cp_monthly_pay,
+          estate_type: row.cp_estate_type,
+          first_image: row.cp_first_image,
+        };
+      } else if (row.message_type === 'property_card') {
+        msg.card_property = null;
       }
-      return row;
+
+      delete msg.cp_id;
+      delete msg.cp_address;
+      delete msg.cp_type;
+      delete msg.cp_price;
+      delete msg.cp_monthly_pay;
+      delete msg.cp_estate_type;
+      delete msg.cp_first_image;
+
+      if (msg.file_url) {
+        msg.signed_file_url = signedDeliveryUrlFromSecure(msg.file_url, ttl, msg.file_name);
+      }
+      return msg;
     });
 
     pool.query(markAsRead, [me, user_id, property_id || null, property_id || null], () => {
@@ -137,6 +177,7 @@ router.put('/api/chat/mute', authenticateToken, (req, res) => {
 // GET /api/chat/my-chats
 router.get('/api/chat/my-chats', authenticateToken, (req, res) => {
   const userId = req.user.id;
+  console.log('[my-chats] req userId:', userId);
 
   const sql = `
     SELECT
@@ -201,6 +242,7 @@ router.get('/api/chat/my-chats', authenticateToken, (req, res) => {
   ];
 
   pool.query(sql, params, (err, rows) => {
+    if (!err) console.log('[my-chats] rows returned:', rows.length);
     if (err) {
       console.error('[my-chats] SQL ERROR', {
         code: err.code,

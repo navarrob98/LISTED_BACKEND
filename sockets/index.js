@@ -1,15 +1,23 @@
 module.exports = function initSockets(io, pool, helpers) {
   const { sendPushToUser, buildDeliveryUrlFromSecure, isMutedForReceiver } = helpers;
 
+  console.log('[sockets] initSockets called');
   io.on('connection', (socket) => {
-    // El cliente llama: socket.emit('join', { userId })
+    console.log('[socket] client connected:', socket.id);
+    socket.on('disconnect', (reason) => {
+      console.log('[socket] client disconnected:', socket.id, reason);
+    });
     socket.on('join', ({ userId }) => {
-      if (userId) socket.join('user_' + userId);
+      if (userId) {
+        socket.join('user_' + userId);
+        console.log('[socket] join room user_' + userId);
+      }
     });
 
-    // Enviar mensaje (texto y/o archivo)
+    // Enviar mensaje (texto, archivo o property_card)
     socket.on('send_message', (data) => {
-      const { sender_id, receiver_id, property_id, message, file_url, file_name } = data || {};
+      const { sender_id, receiver_id, property_id, message, file_url, file_name, message_type, shared_property_id } = data || {};
+      const msgType = message_type === 'property_card' ? 'property_card' : 'text';
       console.log('[send_message] incoming', {
         socketId: socket.id,
         sender_id,
@@ -17,16 +25,21 @@ module.exports = function initSockets(io, pool, helpers) {
         property_id,
         hasMessage: !!message,
         hasFile: !!file_url,
+        message_type: msgType,
+        shared_property_id: shared_property_id || null,
       });
-      if (!sender_id || !receiver_id || (!message && !file_url)) return;
+
+      if (!sender_id || !receiver_id) return;
+      if (msgType === 'property_card' && !shared_property_id) return;
+      if (msgType === 'text' && !message && !file_url) return;
 
       const messageSafe = typeof message === 'string' ? message.trim() : '';
       const fileUrlSafe = file_url || null;
       const fileNameSafe = file_name || null;
 
       const sql = `
-        INSERT INTO chat_messages (property_id, sender_id, receiver_id, message, file_url, file_name)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO chat_messages (property_id, sender_id, receiver_id, message, file_url, file_name, message_type, shared_property_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `;
       const vals = [
         property_id || null,
@@ -35,13 +48,16 @@ module.exports = function initSockets(io, pool, helpers) {
         messageSafe,
         fileUrlSafe,
         fileNameSafe,
+        msgType,
+        msgType === 'property_card' ? shared_property_id : null,
       ];
 
       pool.query(sql, vals, async (err, result) => {
         if (err) {
-          console.error('[send_message] insert error', err);
+          console.error('[send_message] INSERT ERROR', { code: err.code, sqlMessage: err.sqlMessage });
           return;
         }
+        console.log('[send_message] inserted id:', result.insertId);
 
         const msgObj = {
           id: result.insertId,
@@ -51,8 +67,34 @@ module.exports = function initSockets(io, pool, helpers) {
           message: messageSafe,
           file_url: fileUrlSafe,
           file_name: fileNameSafe,
+          message_type: msgType,
+          shared_property_id: msgType === 'property_card' ? shared_property_id : null,
           created_at: new Date().toISOString(),
         };
+
+        // Si es property_card, obtener datos de la propiedad compartida
+        if (msgType === 'property_card') {
+          try {
+            const [propRows] = await pool.promise().query(
+              `SELECT id, address, type, price, monthly_pay, estate_type,
+                (SELECT image_url FROM property_images WHERE property_id = ? ORDER BY id ASC LIMIT 1) as first_image
+              FROM properties WHERE id = ? AND is_published = 1`,
+              [shared_property_id, shared_property_id]
+            );
+            msgObj.card_property = propRows.length ? {
+              id: propRows[0].id,
+              address: propRows[0].address,
+              type: propRows[0].type,
+              price: propRows[0].price,
+              monthly_pay: propRows[0].monthly_pay,
+              estate_type: propRows[0].estate_type,
+              first_image: propRows[0].first_image,
+            } : null;
+          } catch (propErr) {
+            console.error('[send_message] property query error', propErr);
+            msgObj.card_property = null;
+          }
+        }
 
         // Limpia hidden_chats del receptor para este hilo
         pool.query(
