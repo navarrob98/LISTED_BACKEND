@@ -67,7 +67,7 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
   pool.query(query, params, (err, results) => {
     if (err) {
       console.error('[chat/messages] DB ERROR', { code: err.code, sqlMessage: err.sqlMessage });
-      return res.status(500).json({ error: 'No se pudo obtener los mensajes', detail: err.sqlMessage });
+      return res.status(500).json({ error: 'No se pudo obtener los mensajes' });
     }
     console.log('[chat/messages] rows returned:', results.length);
 
@@ -249,7 +249,7 @@ router.get('/api/chat/my-chats', authenticateToken, (req, res) => {
         sqlMessage: err.sqlMessage,
         sql: err.sql,
       });
-      return res.status(500).json({ error: 'Error fetching chats', details: err.sqlMessage || String(err) });
+      return res.status(500).json({ error: 'No se pudieron obtener los chats' });
     }
     res.json(rows);
   });

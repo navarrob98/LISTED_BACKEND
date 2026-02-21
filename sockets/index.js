@@ -9,6 +9,7 @@ module.exports = function initSockets(io, pool, helpers) {
     });
     socket.on('join', ({ userId }) => {
       if (userId) {
+        socket.data.userId = String(userId);
         socket.join('user_' + userId);
         console.log('[socket] join room user_' + userId);
       }
@@ -30,6 +31,15 @@ module.exports = function initSockets(io, pool, helpers) {
       });
 
       if (!sender_id || !receiver_id) return;
+
+      // Validate sender_id matches the authenticated socket session
+      if (socket.data.userId && String(sender_id) !== socket.data.userId) {
+        console.warn('[send_message] sender_id mismatch — possible spoofing', {
+          claimed: sender_id,
+          actual: socket.data.userId,
+        });
+        return;
+      }
       if (msgType === 'property_card' && !shared_property_id) return;
       if (msgType === 'text' && !message && !file_url) return;
 

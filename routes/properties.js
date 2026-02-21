@@ -223,10 +223,7 @@ router.post('/properties/add', authenticateToken, async (req, res) => {
     });
   } catch (err) {
     console.error("Error saving property:", err);
-    return res.status(500).json({
-      error: "Failed to save property",
-      details: err?.sqlMessage || String(err),
-    });
+    return res.status(500).json({ error: 'No se pudo guardar la propiedad' });
   }
 });
 
@@ -394,8 +391,8 @@ router.put('/properties/:id', authenticateToken, (req, res) => {
 
         pool.query(sql, params, (err, result) => {
           if (err) {
-            console.error('[PUT /properties/:id] SQL ERROR', { sql, params, code: err.code, sqlMessage: err.sqlMessage });
-            return res.status(500).json({ error: 'No se pudo actualizar', details: err.sqlMessage || String(err) });
+            console.error('[PUT /properties/:id] SQL ERROR', { code: err.code, sqlMessage: err.sqlMessage });
+            return res.status(500).json({ error: 'No se pudo actualizar' });
           }
           if (result.affectedRows === 0) {
             return res.status(404).json({ error: 'Propiedad no encontrada o no autorizada' });
@@ -450,9 +447,8 @@ router.get('/properties', (req, res) => {
     (err, results) => {
       if (err) {
         console.error('Error fetching properties:', err);
-        return res.status(500).json({ error: 'Failed to fetch properties' });
+        return res.status(500).json({ error: 'No se pudieron obtener las propiedades' });
       }
-      console.log(results);
       res.json(results);
     }
   );
@@ -574,16 +570,19 @@ router.get('/my-properties/:id', authenticateToken, (req, res) => {
 // DELETE /properties/:id
 router.delete('/properties/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
-  const query = 'DELETE FROM properties WHERE id = ?';
+  const userId = req.user.id;
 
-  pool.query(query, [id], (err, result) => {
+  const query = 'DELETE FROM properties WHERE id = ? AND created_by = ?';
+
+  pool.query(query, [id, userId], (err, result) => {
     if (err) {
       console.error('Error deleting property:', err);
-      res.status(500).json({ error: 'Failed to delete property' });
-      return;
+      return res.status(500).json({ error: 'No se pudo eliminar la propiedad' });
     }
-    console.log('Property deleted successfully')
-    res.json({ message: 'Property deleted successfully' });
+    if (result.affectedRows === 0) {
+      return res.status(403).json({ error: 'No autorizado o propiedad no encontrada' });
+    }
+    res.json({ message: 'Propiedad eliminada correctamente' });
   });
 });
 

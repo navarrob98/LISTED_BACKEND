@@ -325,12 +325,13 @@ router.post('/users/:id/delete-account', authenticateToken, async (req, res) => 
   try {
     cxn = await new Promise((resolve, reject) => pool.getConnection((e, c) => e ? reject(e) : resolve(c)));
   } catch (e) {
-    return res.status(500).json({ error: 'No se pudo abrir transacción', step: 'transaction', details: String(e) });
+    console.error('[delete-account] getConnection error', e);
+    return res.status(500).json({ error: 'No se pudo procesar la solicitud' });
   }
   const began = await new Promise(ok => cxn.beginTransaction(err => ok(!err)));
   if (!began) {
     cxn.release();
-    return res.status(500).json({ error: 'No se pudo iniciar transacción', step: 'transaction_begin' });
+    return res.status(500).json({ error: 'No se pudo procesar la solicitud' });
   }
 
   try {
@@ -397,26 +398,20 @@ router.post('/users/:id/delete-account', authenticateToken, async (req, res) => 
     try {
       await deleteUserChatUploadsByFolder(uid);
     } catch (e) {
+      console.error('[delete-account] cloudinary chats error', e);
       await new Promise(ok => cxn.rollback(() => ok(null)));
       cxn.release();
-      return res.status(500).json({
-        error: 'Falló borrar carpetas de chats en Cloudinary',
-        step: 'cloudinary_chats_folders',
-        details: String(e),
-      });
+      return res.status(500).json({ error: 'No se pudo completar la eliminación de la cuenta' });
     }
 
     // 8B) Cloudinary – borra TODO lo del usuario en PROPIEDADES por carpeta listed/<env>/image/u_<uid>
     try {
       await deleteUserPropertyUploadsByFolder(uid);
     } catch (e) {
+      console.error('[delete-account] cloudinary properties error', e);
       await new Promise(ok => cxn.rollback(() => ok(null)));
       cxn.release();
-      return res.status(500).json({
-        error: 'Falló borrar imágenes de propiedades en Cloudinary',
-        step: 'cloud_properties_folders',
-        details: String(e),
-      });
+      return res.status(500).json({ error: 'No se pudo completar la eliminación de la cuenta' });
     }
 
     // 9) users
@@ -432,22 +427,16 @@ router.post('/users/:id/delete-account', authenticateToken, async (req, res) => 
     if (!committed) {
       await new Promise(ok => cxn.rollback(() => ok(null)));
       cxn.release();
-      return res.status(500).json({ error: 'No se pudo confirmar transacción', step: 'commit' });
+      return res.status(500).json({ error: 'No se pudo completar la eliminación de la cuenta' });
     }
 
     cxn.release();
     res.json({ ok: true });
   } catch (e) {
-    // Rollback + devuelve paso y SQL exacto que falló
+    console.error('[delete-account] error', { step: e?._step, code: e?.code, sqlMessage: e?.sqlMessage, message: e?.message });
     await new Promise(ok => cxn.rollback(() => ok(null)));
     cxn.release();
-    return res.status(500).json({
-      error: 'Error durante eliminación',
-      step: e?._step || 'sql',
-      sql: e?._sql,
-      details: e?.sqlMessage || e?.message || String(e),
-      code: e?.code,
-    });
+    return res.status(500).json({ error: 'No se pudo completar la eliminación de la cuenta' });
   }
 });
 
