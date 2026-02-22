@@ -56,7 +56,9 @@ router.post('/stripe/webhook', express.raw({ type: 'application/json' }), async 
 });
 
 // POST /payments/promote/create-intent
-router.post('/payments/promote/create-intent', authenticateToken, async (req, res) => {
+// NOTE: express.json() is needed here because this entire router is mounted
+// BEFORE the global express.json() middleware (to preserve raw body for the Stripe webhook above).
+router.post('/payments/promote/create-intent', express.json(), authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
     const { propertyId } = req.body || {};
@@ -117,6 +119,58 @@ router.post('/payments/promote/create-intent', authenticateToken, async (req, re
       return res.status(400).json({ error: 'Stripe request error', detail: e.message });
     }
     return res.status(500).json({ error: 'No se pudo crear el intento de pago' });
+  }
+});
+
+// POST /payments/promote/confirm
+// Called by the frontend after presentPaymentSheet() succeeds.
+// Verifies with Stripe that the payment actually succeeded, then updates the DB.
+router.post('/payments/promote/confirm', express.json(), authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { paymentIntentId } = req.body || {};
+    if (!paymentIntentId) {
+      return res.status(400).json({ error: 'Falta paymentIntentId' });
+    }
+
+    // 1) Verify with Stripe that the PaymentIntent actually succeeded
+    const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+    if (pi.status !== 'succeeded') {
+      return res.status(400).json({ error: 'payment_not_succeeded', status: pi.status });
+    }
+
+    // 2) Find the promotion linked to this PaymentIntent
+    const [rows] = await pool.promise().query(
+      'SELECT id, property_id, user_id, status FROM promotions WHERE stripe_payment_intent=? LIMIT 1',
+      [paymentIntentId]
+    );
+    const promo = Array.isArray(rows) && rows[0];
+    if (!promo) {
+      return res.status(404).json({ error: 'Promoción no encontrada' });
+    }
+    if (String(promo.user_id) !== String(userId)) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
+
+    // 3) Already paid (idempotent) — the webhook may have beaten us
+    if (promo.status === 'paid') {
+      return res.json({ ok: true, already: true });
+    }
+
+    // 4) Mark as paid
+    await pool.promise().query(
+      'UPDATE promotions SET status="paid", expires_at=DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id=?',
+      [promo.id]
+    );
+    await pool.promise().query(
+      'UPDATE properties SET promoted_until=DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id=?',
+      [promo.property_id]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[promote/confirm] error', e);
+    return res.status(500).json({ error: 'No se pudo confirmar el pago' });
   }
 });
 
