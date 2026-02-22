@@ -60,7 +60,7 @@ router.post('/payments/promote/create-intent', authenticateToken, async (req, re
   try {
     const userId = req.user.id;
     const { propertyId } = req.body || {};
-    if (!propertyId) return res.status(400).json({ error: 'Falta propertyId' });
+    if (!propertyId) return res.status(400).json({ error: 'Falta propertyId', code: 'missing_property_id' });
 
     // 1) Valida que la propiedad sea del usuario
     const [rows] = await pool.promise().query(
@@ -113,6 +113,9 @@ router.post('/payments/promote/create-intent', authenticateToken, async (req, re
     return res.json({ clientSecret: intent.client_secret });
   } catch (e) {
     console.error('[create-intent] error', e);
+    if (e.type === 'StripeInvalidRequestError') {
+      return res.status(400).json({ error: 'Stripe request error', detail: e.message });
+    }
     return res.status(500).json({ error: 'No se pudo crear el intento de pago' });
   }
 });

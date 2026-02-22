@@ -260,13 +260,24 @@ router.post('/auth/google', async (req, res) => {
     const { id_token } = req.body || {};
     if (!id_token) return res.status(400).json({ error: 'Falta id_token' });
 
+    if (!GOOGLE_CLIENT_IDS.length) {
+      console.error('[auth/google] No Google client IDs configured. Set GMAIL_CLIENT_ID and/or GOOGLE_IOS_CLIENT_ID env vars.');
+      return res.status(500).json({ error: 'Google Sign-In no está configurado en el servidor' });
+    }
+
     // Verificar token
-    const ticket = await googleClient.verifyIdToken({
-      idToken: id_token,
-      audience: GOOGLE_CLIENT_IDS,
-    });
+    let ticket;
+    try {
+      ticket = await googleClient.verifyIdToken({
+        idToken: id_token,
+        audience: GOOGLE_CLIENT_IDS,
+      });
+    } catch (verifyErr) {
+      console.error('[auth/google] verifyIdToken failed:', verifyErr.message);
+      return res.status(401).json({ error: 'Token de Google inválido', detail: verifyErr.message });
+    }
     const payload = ticket.getPayload();
-    if (!payload) return res.status(401).json({ error: 'Token inválido' });
+    if (!payload) return res.status(401).json({ error: 'Token inválido: payload vacío' });
 
     const {
       sub: googleId,

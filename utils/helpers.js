@@ -9,8 +9,9 @@ const expo = new Expo();
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const GOOGLE_CLIENT_IDS = [
-  process.env.GMAIL_CLIENT_ID, // WEB_CLIENT_ID
-];
+  process.env.GMAIL_CLIENT_ID,
+  process.env.GOOGLE_IOS_CLIENT_ID,
+].filter(Boolean);
 
 function extFromFilename(name) {
   const m = /(?:\.)([a-z0-9]+)$/i.exec(name || '');
