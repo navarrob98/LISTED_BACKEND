@@ -3,21 +3,20 @@ module.exports = function initSockets(io, pool, helpers) {
 
   console.log('[sockets] initSockets called');
   io.on('connection', (socket) => {
-    console.log('[socket] client connected:', socket.id);
+    // userId is set by JWT middleware in backend.js
+    const uid = socket.data.userId;
+    console.log('[socket] client connected:', socket.id, 'userId:', uid);
+    socket.join('user_' + uid);
+
     socket.on('disconnect', (reason) => {
       console.log('[socket] client disconnected:', socket.id, reason);
-    });
-    socket.on('join', ({ userId }) => {
-      if (userId) {
-        socket.data.userId = String(userId);
-        socket.join('user_' + userId);
-        console.log('[socket] join room user_' + userId);
-      }
     });
 
     // Enviar mensaje (texto, archivo o property_card)
     socket.on('send_message', (data) => {
-      const { sender_id, receiver_id, property_id, message, file_url, file_name, message_type, shared_property_id } = data || {};
+      // Always use authenticated userId from JWT — ignore client-sent sender_id
+      const sender_id = socket.data.userId;
+      const { receiver_id, property_id, message, file_url, file_name, message_type, shared_property_id } = data || {};
       const msgType = message_type === 'property_card' ? 'property_card' : 'text';
       console.log('[send_message] incoming', {
         socketId: socket.id,
@@ -31,15 +30,6 @@ module.exports = function initSockets(io, pool, helpers) {
       });
 
       if (!sender_id || !receiver_id) return;
-
-      // Validate sender_id matches the authenticated socket session
-      if (socket.data.userId && String(sender_id) !== socket.data.userId) {
-        console.warn('[send_message] sender_id mismatch — possible spoofing', {
-          claimed: sender_id,
-          actual: socket.data.userId,
-        });
-        return;
-      }
       if (msgType === 'property_card' && !shared_property_id) return;
       if (msgType === 'text' && !message && !file_url) return;
 
@@ -159,8 +149,9 @@ module.exports = function initSockets(io, pool, helpers) {
     });
   });
 
-    // Eliminar mensaje
-    socket.on('delete_message', ({ message_id, user_id }) => {
+    // Eliminar mensaje — use authenticated userId from JWT
+    socket.on('delete_message', ({ message_id }) => {
+      const user_id = socket.data.userId;
       if (!message_id || !user_id) return;
 
       const q = `

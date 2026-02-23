@@ -19,10 +19,52 @@ const {
   GOOGLE_CLIENT_IDS,
 } = helpers;
 
+const rateLimit = require('express-rate-limit');
+
+const loginIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos. Intente más tarde.' }),
+});
+
+const verifyEmailIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
+});
+
+const registerIpLimiter = rateLimit({
+  windowMs: 30 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ error: 'Demasiados registros. Intente más tarde.' }),
+});
+
+const googleAuthIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
+});
+
+const resetPasswordIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
+});
+
 const googleClient = new OAuth2Client();
 
 // POST /users/register
-router.post('/users/register', async (req, res) => {
+router.post('/users/register', registerIpLimiter, async (req, res) => {
   const { name, last_name, email, password } = req.body;
   if (!name || !last_name || !email || !password) {
     return res.status(400).json({ error: 'Faltan datos obligatorios.' });
@@ -86,7 +128,7 @@ router.post('/users/register', async (req, res) => {
 });
 
 // POST /users/verify-email
-router.post('/users/verify-email', (req, res) => {
+router.post('/users/verify-email', verifyEmailIpLimiter, (req, res) => {
   const { email, code } = req.body;
   if (!email || !code) return res.status(400).json({ error: 'Faltan email o código.' });
 
@@ -194,7 +236,7 @@ router.post('/users/resend-code', resendCodeIpLimiter, resendCodeEmailCooldown, 
 });
 
 // POST /users/login
-router.post('/users/login', (req, res) => {
+router.post('/users/login', loginIpLimiter, (req, res) => {
   const { email, password } = req.body;
   const sql = `
     SELECT id, name, last_name, email, password, phone,
@@ -255,7 +297,7 @@ router.post('/users/login', (req, res) => {
 });
 
 // POST /auth/google
-router.post('/auth/google', async (req, res) => {
+router.post('/auth/google', googleAuthIpLimiter, async (req, res) => {
   try {
     const { id_token } = req.body || {};
     if (!id_token) return res.status(400).json({ error: 'Falta id_token' });
@@ -451,7 +493,7 @@ router.post(
 );
 
 // POST /auth/reset-password
-router.post('/auth/reset-password', async (req, res) => {
+router.post('/auth/reset-password', resetPasswordIpLimiter, async (req, res) => {
   try {
     const token = String(req.body?.token || '').trim();
     const newPassword = String(req.body?.password || '');

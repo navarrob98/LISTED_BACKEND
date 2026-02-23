@@ -14,7 +14,7 @@ const { q } = require('../utils/helpers');
 router.get('/users/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
   pool.query(
-    'SELECT id, name, email FROM users WHERE id = ? LIMIT 1',
+    'SELECT id, name, last_name, email, profile_photo FROM users WHERE id = ? LIMIT 1',
     [id],
     (err, results) => {
       if (err) return res.status(500).json({ error: 'Error buscando usuario' });

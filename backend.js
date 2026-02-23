@@ -4,6 +4,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
 
 const pool = require('./db/pool');
 const helpers = require('./utils/helpers');
@@ -52,6 +53,18 @@ pool.getConnection((err, connection) => {
 // ── HTTP + Socket.io ──────────────────────────────────
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
+
+// ── Socket.io JWT authentication middleware ──
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error('auth_required'));
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) return next(new Error('invalid_token'));
+    socket.data.userId = String(decoded.id);
+    socket.data.user = decoded;
+    next();
+  });
+});
 
 initSockets(io, pool, helpers);
 

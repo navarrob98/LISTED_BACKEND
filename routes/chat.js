@@ -280,9 +280,10 @@ router.post('/api/chat/hide-chat', authenticateToken, (req, res) => {
 
 // PUT /api/chat/mark-read
 router.put('/api/chat/mark-read', authenticateToken, (req, res) => {
-  const { user_id, chat_with_user_id, property_id } = req.body;
+  const user_id = req.user.id;  // use authenticated user, not body
+  const { chat_with_user_id, property_id } = req.body;
 
-  if (user_id == null || chat_with_user_id == null) {
+  if (chat_with_user_id == null) {
     return res.status(400).json({ error: 'Faltan campos' });
   }
 

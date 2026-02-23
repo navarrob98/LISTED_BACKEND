@@ -21,6 +21,9 @@ router.post('/api/buying-power', authenticateToken, (req, res) => {
   if (!user_id) {
     return res.status(400).json({ error: 'user_id es requerido' });
   }
+  if (Number(user_id) !== req.user.id) {
+    return res.status(403).json({ error: 'No autorizado' });
+  }
   if (suggested_price === undefined || suggested_price === null) {
     return res.status(400).json({ error: 'suggested_price es requerido' });
   }
@@ -63,6 +66,9 @@ router.post('/api/buying-power', authenticateToken, (req, res) => {
 // GET /api/buying-power/:user_id
 router.get('/api/buying-power/:user_id', authenticateToken, (req, res) => {
   const { user_id } = req.params;
+  if (Number(user_id) !== req.user.id) {
+    return res.status(403).json({ error: 'No autorizado' });
+  }
 
   const sql = `
     SELECT *
@@ -190,6 +196,9 @@ router.post('/api/tenant-profile', authenticateToken, (req, res) => {
 // GET /api/tenant-profile/:user_id
 router.get('/api/tenant-profile/:user_id', authenticateToken, (req, res) => {
   const { user_id } = req.params;
+  if (Number(user_id) !== req.user.id) {
+    return res.status(403).json({ error: 'No autorizado' });
+  }
   pool.query(
     'SELECT * FROM tenant_profiles WHERE user_id = ? LIMIT 1',
     [user_id],
