@@ -13,6 +13,10 @@ const {
   sendResetPasswordEmail,
   buildResetWebUrl,
   issueToken,
+  generateRefreshToken,
+  consumeRefreshToken,
+  revokeRefreshToken,
+  ACCESS_TOKEN_TTL,
   forgotPasswordIpLimiter,
   forgotPasswordEmailCooldown,
   createEmailCooldown,
@@ -166,20 +170,28 @@ router.post('/users/verify-email', verifyEmailIpLimiter, (req, res) => {
     pool.query(
       'UPDATE users SET email_verified = 1, email_verif_code = NULL, email_verif_expires = NULL WHERE id = ?',
       [u.id],
-      (uErr) => {
+      async (uErr) => {
         if (uErr) return res.status(500).json({ error: 'No se pudo verificar.' });
 
         // Listo: da token y user (login inmediato)
         const token = jwt.sign(
           { id: u.id, email: u.email, agent_type: u.agent_type },
           process.env.JWT_SECRET,
-          { expiresIn: '3h' }
+          { expiresIn: ACCESS_TOKEN_TTL }
         );
+
+        const { rawToken: refreshToken } = await generateRefreshToken({
+          userId: u.id,
+          email: u.email,
+          agentType: u.agent_type,
+        });
+
         let citiesArr = null;
         try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {}
 
         return res.json({
           token,
+          refreshToken,
           user: {
             id: u.id,
             name: u.name,
@@ -276,14 +288,21 @@ router.post('/users/login', loginIpLimiter, (req, res) => {
     const token = jwt.sign(
       { id: u.id, email: u.email, agent_type: u.agent_type },
       process.env.JWT_SECRET,
-      { expiresIn: '3h' }
+      { expiresIn: ACCESS_TOKEN_TTL }
     );
+
+    const { rawToken: refreshToken } = await generateRefreshToken({
+      userId: u.id,
+      email: u.email,
+      agentType: u.agent_type,
+    });
 
     let citiesArr = null;
     try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {}
 
     return res.json({
       token,
+      refreshToken,
       user: {
         id: u.id,
         name: u.name,
@@ -370,7 +389,7 @@ router.post('/auth/google', googleAuthIpLimiter, async (req, res) => {
         VALUES (?, ?, ?, ?, ?, 1, ?, ?)
         `;
         const vals = [given_name || name || '', family_name || '', email, hashed, 'regular', null, null];
-        pool.query(insSql, vals, (insErr, result) => {
+        pool.query(insSql, vals, async (insErr, result) => {
           if (insErr) {
             console.error('[auth/google] insert error', insErr);
             return res.status(500).json({ error: 'No se pudo crear el usuario' });
@@ -389,13 +408,13 @@ router.post('/auth/google', googleAuthIpLimiter, async (req, res) => {
             cities: null,
           };
           // devolver token
-          issueToken(res, userRow);
+          await issueToken(res, userRow);
         });
         return; // importante cortar aquí: devolvemos en el callback
       }
 
       // Usuario ya existía → devolver token
-      issueToken(res, userRow);
+      await issueToken(res, userRow);
     });
   } catch (e) {
     console.error('[auth/google] error', e);
@@ -568,6 +587,64 @@ router.post('/auth/reset-password', resetPasswordIpLimiter, async (req, res) => 
   } catch (e) {
     console.error('[auth/reset-password] error', e);
     return res.status(500).json({ error: 'Error de servidor.' });
+  }
+});
+
+// --------------- Refresh token endpoints ---------------
+
+const refreshIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:refresh:' }),
+  handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
+});
+
+// POST /auth/refresh
+router.post('/auth/refresh', refreshIpLimiter, async (req, res) => {
+  try {
+    const { refreshToken } = req.body || {};
+    if (!refreshToken) return res.status(400).json({ error: 'Falta refreshToken' });
+
+    const result = await consumeRefreshToken(refreshToken);
+    if (result.error) {
+      return res.status(401).json({ error: 'Refresh token inválido', code: 'REFRESH_INVALID' });
+    }
+
+    const { userId, email, agentType, family } = result.data;
+
+    const token = jwt.sign(
+      { id: userId, email, agent_type: agentType },
+      process.env.JWT_SECRET,
+      { expiresIn: ACCESS_TOKEN_TTL }
+    );
+
+    const { rawToken: newRefreshToken } = await generateRefreshToken({
+      userId,
+      email,
+      agentType,
+      family, // misma familia → rotación
+    });
+
+    return res.json({ token, refreshToken: newRefreshToken });
+  } catch (e) {
+    console.error('[auth/refresh] error', e);
+    return res.status(500).json({ error: 'Error de servidor' });
+  }
+});
+
+// POST /auth/logout
+router.post('/auth/logout', async (req, res) => {
+  try {
+    const { refreshToken } = req.body || {};
+    if (refreshToken) {
+      await revokeRefreshToken(refreshToken);
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[auth/logout] error', e);
+    return res.json({ ok: true }); // siempre ok
   }
 });
 

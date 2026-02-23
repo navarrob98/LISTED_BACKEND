@@ -4,8 +4,13 @@ const cloudinary = require('../cldnry');
 const { Resend } = require('resend');
 const { Expo } = require('expo-server-sdk');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const RedisStore = require('rate-limit-redis').default;
+
+const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || '15m';
+const REFRESH_TOKEN_TTL_DAYS = Number(process.env.REFRESH_TOKEN_TTL_DAYS || 180);
+const REFRESH_TOKEN_TTL_SECS = REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60;
 
 const expo = new Expo();
 const resend = new Resend(process.env.RESEND_API_KEY);
@@ -320,19 +325,79 @@ function getActivePushTokens(userId) {
   });
 }
 
+// --------------- Refresh-token helpers ---------------
+
+async function generateRefreshToken({ userId, email, agentType, family }) {
+  const familyId = family || crypto.randomUUID();
+  const raw = crypto.randomBytes(32).toString('hex');          // 64-char hex
+  const hash = crypto.createHash('sha256').update(raw).digest('hex');
+
+  const payload = JSON.stringify({
+    userId,
+    email,
+    agentType,
+    family: familyId,
+    createdAt: Date.now(),
+  });
+
+  await redis.set(`rt:${hash}`, payload, 'EX', REFRESH_TOKEN_TTL_SECS);
+  return { rawToken: raw, family: familyId };
+}
+
+async function consumeRefreshToken(rawToken) {
+  const hash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+  const stored = await redis.get(`rt:${hash}`);
+  if (!stored) {
+    // Token desconocido — puede ser replay: intentamos detectar la familia
+    // (no podemos saber la familia sin el payload, así que simplemente rechazamos)
+    return { error: 'invalid' };
+  }
+
+  const data = JSON.parse(stored);
+
+  // ¿Familia revocada?
+  const revoked = await redis.exists(`rt:family:${data.family}`);
+  if (revoked) {
+    return { error: 'family_revoked' };
+  }
+
+  // Eliminar token actual (rotación: single-use)
+  const deleted = await redis.del(`rt:${hash}`);
+  if (deleted === 0) {
+    // Race-condition: ya fue consumido por otro request → posible replay
+    await redis.set(`rt:family:${data.family}`, 'revoked', 'EX', REFRESH_TOKEN_TTL_SECS);
+    return { error: 'replay_detected' };
+  }
+
+  return { data };
+}
+
+async function revokeRefreshToken(rawToken) {
+  const hash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  await redis.del(`rt:${hash}`);
+}
+
 // Helper para emitir token con forma homogénea a tu /users/login
-function issueToken(res, u) {
+async function issueToken(res, u) {
   const token = jwt.sign(
     { id: u.id, email: u.email, agent_type: u.agent_type },
     process.env.JWT_SECRET,
-    { expiresIn: '3h' }
+    { expiresIn: ACCESS_TOKEN_TTL }
   );
+
+  const { rawToken: refreshToken } = await generateRefreshToken({
+    userId: u.id,
+    email: u.email,
+    agentType: u.agent_type,
+  });
 
   let citiesArr = null;
   try { citiesArr = u.cities ? JSON.parse(u.cities) : null; } catch {}
 
   return res.json({
     token,
+    refreshToken,
     user: {
       id: u.id,
       name: u.name,
@@ -396,6 +461,10 @@ module.exports = {
   isMutedForReceiver,
   getActivePushTokens,
   issueToken,
+  generateRefreshToken,
+  consumeRefreshToken,
+  revokeRefreshToken,
+  ACCESS_TOKEN_TTL,
   forgotPasswordIpLimiter,
   createEmailCooldown,
   forgotPasswordEmailCooldown,

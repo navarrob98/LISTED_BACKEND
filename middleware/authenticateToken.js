@@ -8,10 +8,14 @@ function authenticateToken(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Acceso denegado. Token no proporcionado.' });
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Token inválido o expirado.' });
-    // Puedes agregar la info del usuario decodificado a la request para usarla después
+    if (err) {
+      if (err.name === 'TokenExpiredError') {
+        return res.status(401).json({ error: 'Token expirado.', code: 'TOKEN_EXPIRED' });
+      }
+      return res.status(401).json({ error: 'Token inválido.', code: 'TOKEN_INVALID' });
+    }
     req.user = user;
-    next(); // continúa con la siguiente función en la ruta
+    next();
   });
 }
 
