@@ -7,9 +7,11 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 
 const pool = require('./db/pool');
+const redis = require('./db/redis');
 const helpers = require('./utils/helpers');
 const registerRoutes = require('./routes');
 const initSockets = require('./sockets');
+const { createAdapter } = require('@socket.io/redis-adapter');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -54,6 +56,11 @@ pool.getConnection((err, connection) => {
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
+// ── Socket.io Redis adapter (multi-worker pub/sub) ──
+const pubClient = redis.duplicate();
+const subClient = redis.duplicate();
+io.adapter(createAdapter(pubClient, subClient));
+
 // ── Socket.io JWT authentication middleware ──
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
@@ -74,6 +81,20 @@ app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   res.status(500).json({ error: 'Error interno del servidor' });
 });
+
+// ── Graceful shutdown ────────────────────────────────────
+function gracefulShutdown() {
+  server.close(() => {
+    io.close(() => {
+      redis.quit().then(() => {
+        pool.end(() => process.exit(0));
+      });
+    });
+  });
+  setTimeout(() => process.exit(1), 10000);
+}
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
 
 // ── Start ─────────────────────────────────────────────
 server.listen(port, '0.0.0.0', () => {

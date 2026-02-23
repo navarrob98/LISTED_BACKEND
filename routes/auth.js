@@ -20,12 +20,15 @@ const {
 } = helpers;
 
 const rateLimit = require('express-rate-limit');
+const RedisStore = require('rate-limit-redis').default;
+const redis = require('../db/redis');
 
 const loginIpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:login:' }),
   handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos. Intente más tarde.' }),
 });
 
@@ -34,6 +37,7 @@ const verifyEmailIpLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:verify:' }),
   handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
 });
 
@@ -42,6 +46,7 @@ const registerIpLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:register:' }),
   handler: (req, res) => res.status(429).json({ error: 'Demasiados registros. Intente más tarde.' }),
 });
 
@@ -50,6 +55,7 @@ const googleAuthIpLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:gauth:' }),
   handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
 });
 
@@ -58,6 +64,7 @@ const resetPasswordIpLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:resetpw:' }),
   handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
 });
 
@@ -200,6 +207,7 @@ const resendCodeIpLimiter = require('express-rate-limit')({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:resend:' }),
   handler: (req, res) => res.status(429).json({ ok: true }),
 });
 

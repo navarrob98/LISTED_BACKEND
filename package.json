@@ -11,6 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
     "bcrypt": "^6.0.0",
     "body-parser": "^2.2.0",
     "cloudinary": "^2.7.0",
@@ -20,9 +21,11 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
     "google-auth-library": "^10.2.1",
+    "ioredis": "^5.9.3",
     "jsonwebtoken": "^9.0.2",
     "mysql2": "^3.14.1",
     "nodemailer": "^7.0.5",
+    "rate-limit-redis": "^4.3.1",
     "resend": "^6.7.0",
     "socket.io": "^4.8.1",
     "stripe": "^18.5.0"

@@ -4,6 +4,11 @@ const pool = require('../db/pool');
 const authenticateToken = require('../middleware/authenticateToken');
 const cloudinary = require('../cldnry');
 const { sendPushToUser } = require('../utils/helpers');
+const {
+  getCached, setCache, waitForNominatimSlot,
+  TTL_24H, TTL_7D,
+  autocompleteKey, geocodeKey, reverseGeocodeKey, detailsKey,
+} = require('../utils/geoCache');
 
 // POST /api/buying-power
 router.post('/api/buying-power', authenticateToken, (req, res) => {
@@ -291,102 +296,165 @@ router.put('/api/tenant-profile/:id', authenticateToken, (req, res) => {
   });
 });
 
-// GET /api/places/autocomplete
+const NOMINATIM_UA = 'listed-app/1.0 (support@listed.com.mx)';
+
+// GET /api/places/autocomplete → Photon API
 router.get('/api/places/autocomplete', async (req, res) => {
   try {
-    const input = req.query.input?.toString() || '';
+    const input = req.query.input?.toString().trim() || '';
     if (!input) return res.status(400).json({ error: 'input requerido' });
 
-    const url = new URL('https://maps.googleapis.com/maps/api/place/autocomplete/json');
-    url.searchParams.set('input', input);
-    url.searchParams.set('types', 'address');
-    url.searchParams.set('components', 'country:mx');
-    url.searchParams.set('language', 'es');
-    url.searchParams.set('key', process.env.MAPS_KEY);
+    const cacheKey = autocompleteKey('mx', input);
+    const cached = await getCached(cacheKey);
+    if (cached) return res.json(cached);
+
+    const url = new URL('https://photon.komoot.io/api');
+    url.searchParams.set('q', input);
+    url.searchParams.set('limit', '10');
+    url.searchParams.set('lang', 'default');
+    url.searchParams.set('lat', '23.63');
+    url.searchParams.set('lon', '-102.55');
 
     const r = await fetch(url);
     const data = await r.json();
-    return res.json(data);
+
+    const predictions = (data.features || [])
+      .filter((f) => {
+        const c = (f.properties?.country || '').toLowerCase();
+        return c.includes('mexico') || c.includes('méxico');
+      })
+      .slice(0, 5)
+      .map((f) => {
+        const p = f.properties;
+        const typeChar = (p.osm_type || 'N')[0].toUpperCase();
+        const placeId = `osm:${typeChar}${p.osm_id}`;
+        const parts = [p.name, p.street, p.city, p.state].filter(Boolean);
+        return { place_id: placeId, description: parts.join(', ') };
+      });
+
+    const result = { predictions };
+    await setCache(cacheKey, result, TTL_24H);
+    return res.json(result);
   } catch (e) {
     console.error('[places/autocomplete] error', e);
     res.status(500).json({ error: 'fail' });
   }
 });
 
-// GET /api/places/details
+// GET /api/places/details → Nominatim /lookup
 router.get('/api/places/details', async (req, res) => {
   try {
     const place_id = req.query.place_id?.toString();
     if (!place_id) return res.status(400).json({ error: 'place_id requerido' });
 
-    const url = new URL('https://maps.googleapis.com/maps/api/place/details/json');
-    url.searchParams.set('place_id', place_id);
-    url.searchParams.set('fields', 'geometry,formatted_address');
-    url.searchParams.set('key', process.env.MAPS_KEY);
+    const cacheKey = detailsKey(place_id);
+    const cached = await getCached(cacheKey);
+    if (cached) return res.json(cached);
 
-    const r = await fetch(url);
+    // Parse osm:N12345 → N12345
+    const m = place_id.match(/^osm:([NWR])(\d+)$/i);
+    if (!m) return res.status(400).json({ error: 'place_id inválido' });
+    const osmIds = `${m[1].toUpperCase()}${m[2]}`;
+
+    await waitForNominatimSlot();
+    const url = new URL('https://nominatim.openstreetmap.org/lookup');
+    url.searchParams.set('osm_ids', osmIds);
+    url.searchParams.set('format', 'json');
+    url.searchParams.set('accept-language', 'es');
+
+    const r = await fetch(url, { headers: { 'User-Agent': NOMINATIM_UA } });
     const data = await r.json();
-    res.json(data); // result.geometry.location { lat, lng }
+
+    if (!data.length) return res.json({ result: null });
+
+    const item = data[0];
+    const result = {
+      result: {
+        geometry: { location: { lat: parseFloat(item.lat), lng: parseFloat(item.lon) } },
+        formatted_address: item.display_name,
+      },
+    };
+
+    await setCache(cacheKey, result, TTL_7D);
+    res.json(result);
   } catch (e) {
     console.error('[places/details]', e);
     res.status(500).json({ error: 'fail' });
   }
 });
 
-// GET /api/places/geocode
+// GET /api/places/geocode → Nominatim /search
 router.get('/api/places/geocode', async (req, res) => {
   try {
-    const address = req.query.address?.toString() || '';
-    const country = (req.query.country || 'MX').toString();
+    const address = req.query.address?.toString().trim() || '';
+    const country = (req.query.country || 'MX').toString().toLowerCase();
     if (!address) return res.status(400).json({ error: 'address requerido' });
 
-    const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
-    url.searchParams.set('address', address);
-    url.searchParams.set('types', 'address');
-    url.searchParams.set('components', `country:${country}`);
-    url.searchParams.set('key', process.env.MAPS_KEY);
+    const cacheKey = geocodeKey(country, address);
+    const cached = await getCached(cacheKey);
+    if (cached) return res.json(cached);
 
-    const r = await fetch(url);
+    await waitForNominatimSlot();
+    const url = new URL('https://nominatim.openstreetmap.org/search');
+    url.searchParams.set('q', address);
+    url.searchParams.set('format', 'json');
+    url.searchParams.set('limit', '1');
+    url.searchParams.set('countrycodes', country);
+
+    const r = await fetch(url, { headers: { 'User-Agent': NOMINATIM_UA } });
     const data = await r.json();
 
-    // respuesta compacta (pero mantén status para el front)
-    if (data.status === 'OK' && data.results?.length) {
-      const r0 = data.results[0];
-      return res.json({
-        status: 'OK',
-        result: {
-          formatted_address: r0.formatted_address,
-          geometry: { location: r0.geometry.location }
-        }
-      });
+    if (!data.length) {
+      const noResult = { status: 'ZERO_RESULTS', results: [] };
+      await setCache(cacheKey, noResult, TTL_24H);
+      return res.json(noResult);
     }
-    res.json({ status: data.status, results: [] });
+
+    const item = data[0];
+    const result = {
+      status: 'OK',
+      result: {
+        formatted_address: item.display_name,
+        geometry: { location: { lat: parseFloat(item.lat), lng: parseFloat(item.lon) } },
+      },
+    };
+
+    await setCache(cacheKey, result, TTL_7D);
+    res.json(result);
   } catch (e) {
     console.error('[places/geocode]', e);
     res.status(500).json({ error: 'fail' });
   }
 });
 
-// GET /api/places/reverse-geocode
+// GET /api/places/reverse-geocode → Nominatim /reverse
 router.get('/api/places/reverse-geocode', async (req, res) => {
   try {
     const lat = req.query.lat?.toString();
     const lng = req.query.lng?.toString();
-    const lang = (req.query.lang || 'es').toString();
     if (!lat || !lng) return res.status(400).json({ error: 'lat y lng requeridos' });
 
-    const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
-    url.searchParams.set('latlng', `${lat},${lng}`);
-    url.searchParams.set('language', lang);
-    url.searchParams.set('key', process.env.GOOGLE_PLACES_SERVER_KEY);
+    const cacheKey = reverseGeocodeKey(lat, lng);
+    const cached = await getCached(cacheKey);
+    if (cached) return res.json(cached);
 
-    const r = await fetch(url);
+    await waitForNominatimSlot();
+    const url = new URL('https://nominatim.openstreetmap.org/reverse');
+    url.searchParams.set('lat', lat);
+    url.searchParams.set('lon', lng);
+    url.searchParams.set('format', 'json');
+    url.searchParams.set('accept-language', 'es');
+
+    const r = await fetch(url, { headers: { 'User-Agent': NOMINATIM_UA } });
     const data = await r.json();
-    if (data.status === 'OK' && data.results?.length) {
-      const r0 = data.results[0];
-      return res.json({ status: 'OK', result: { formatted_address: r0.formatted_address } });
+
+    if (data.error) {
+      return res.json({ status: 'ZERO_RESULTS', results: [] });
     }
-    res.json({ status: data.status, results: [] });
+
+    const result = { status: 'OK', result: { formatted_address: data.display_name } };
+    await setCache(cacheKey, result, TTL_7D);
+    res.json(result);
   } catch (e) {
     console.error('[places/reverse-geocode]', e);
     res.status(500).json({ error: 'fail' });

@@ -1,9 +1,11 @@
 const pool = require('../db/pool');
+const redis = require('../db/redis');
 const cloudinary = require('../cldnry');
 const { Resend } = require('resend');
 const { Expo } = require('expo-server-sdk');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
+const RedisStore = require('rate-limit-redis').default;
 
 const expo = new Expo();
 const resend = new Resend(process.env.RESEND_API_KEY);
@@ -354,42 +356,24 @@ const forgotPasswordIpLimiter = rateLimit({
   max: 5,                   // 5 requests por IP en la ventana
   standardHeaders: true,
   legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:forgotpw:' }),
   handler: (req, res) => res.status(429).json({ ok: true }),
 });
 
-// 2) Cooldown por email (30s) in-memory
-function createEmailCooldown({ windowMs = 30_000, maxEntries = 50_000 } = {}) {
-  const map = new Map(); // email -> lastTimestampMs
-  let lastSweep = Date.now();
-
-  function sweep() {
-    const now = Date.now();
-    // barrido cada 5 min
-    if (now - lastSweep < 5 * 60_000) return;
-    lastSweep = now;
-
-    for (const [k, ts] of map.entries()) {
-      if (now - ts > windowMs) map.delete(k);
-    }
-
-    // hard cap para evitar crecimiento de memoria por ataque
-    if (map.size > maxEntries) map.clear();
-  }
-
-  return function emailCooldown(req, res, next) {
-    sweep();
-
+// 2) Cooldown por email (30s) backed by Redis
+function createEmailCooldown({ windowMs = 30_000 } = {}) {
+  return async function emailCooldown(req, res, next) {
     const email = String(req.body?.email || '').trim().toLowerCase();
     if (!email || !email.includes('@')) return next();
 
-    const now = Date.now();
-    const last = map.get(email);
-
-    if (last && now - last < windowMs) {
-      return res.status(429).json({ ok: true });
+    const key = `rl:emailcd:${email}`;
+    try {
+      const exists = await redis.exists(key);
+      if (exists) return res.status(429).json({ ok: true });
+      await redis.set(key, '1', 'PX', windowMs);
+    } catch (err) {
+      console.error('[emailCooldown] redis error, allowing request', err.message);
     }
-
-    map.set(email, now);
     return next();
   };
 }
