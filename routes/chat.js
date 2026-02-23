@@ -32,29 +32,52 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
   console.log('[chat/messages] req', { me, user_id, property_id });
   if (!user_id) return res.status(400).json({ error: 'Faltan campos' });
 
-  let query = `
-  SELECT
-    cm.*,
-    CASE WHEN cm.message_type = 'property_card' THEN p.id END as cp_id,
-    CASE WHEN cm.message_type = 'property_card' THEN p.address END as cp_address,
-    CASE WHEN cm.message_type = 'property_card' THEN p.type END as cp_type,
-    CASE WHEN cm.message_type = 'property_card' THEN p.price END as cp_price,
-    CASE WHEN cm.message_type = 'property_card' THEN p.monthly_pay END as cp_monthly_pay,
-    CASE WHEN cm.message_type = 'property_card' THEN p.estate_type END as cp_estate_type,
-    CASE WHEN cm.message_type = 'property_card'
-      THEN (SELECT image_url FROM property_images WHERE property_id = p.id ORDER BY id ASC LIMIT 1)
-    END as cp_first_image
-  FROM chat_messages cm
-  LEFT JOIN properties p ON cm.shared_property_id = p.id AND cm.message_type = 'property_card'
-  WHERE cm.is_deleted = 0
-    AND ((cm.sender_id = ? AND cm.receiver_id = ?) OR (cm.sender_id = ? AND cm.receiver_id = ?))
-  `;
-  const params = [me, user_id, user_id, me];
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 30;
+  const offset = (page - 1) * limit;
+
+  // Build WHERE params for both count and main queries
+  const whereParams = [me, user_id, user_id, me];
+  let propertyFilter = '';
   if (property_id) {
-    query += ' AND cm.property_id = ?';
-    params.push(property_id);
+    propertyFilter = ' AND cm.property_id = ?';
+    whereParams.push(property_id);
   }
-  query += ' ORDER BY cm.created_at ASC';
+
+  // COUNT query
+  const countQuery = `
+    SELECT COUNT(*) AS total FROM chat_messages cm
+    WHERE cm.is_deleted = 0
+      AND ((cm.sender_id = ? AND cm.receiver_id = ?) OR (cm.sender_id = ? AND cm.receiver_id = ?))
+      ${propertyFilter}
+  `;
+
+  // Main query with inverse pagination (get most recent page, then reorder ASC)
+  const query = `
+    SELECT * FROM (
+      SELECT
+        cm.*,
+        CASE WHEN cm.message_type = 'property_card' THEN p.id END as cp_id,
+        CASE WHEN cm.message_type = 'property_card' THEN p.address END as cp_address,
+        CASE WHEN cm.message_type = 'property_card' THEN p.type END as cp_type,
+        CASE WHEN cm.message_type = 'property_card' THEN p.price END as cp_price,
+        CASE WHEN cm.message_type = 'property_card' THEN p.monthly_pay END as cp_monthly_pay,
+        CASE WHEN cm.message_type = 'property_card' THEN p.estate_type END as cp_estate_type,
+        CASE WHEN cm.message_type = 'property_card'
+          THEN (SELECT image_url FROM property_images WHERE property_id = p.id ORDER BY id ASC LIMIT 1)
+        END as cp_first_image
+      FROM chat_messages cm
+      LEFT JOIN properties p ON cm.shared_property_id = p.id AND cm.message_type = 'property_card'
+      WHERE cm.is_deleted = 0
+        AND ((cm.sender_id = ? AND cm.receiver_id = ?) OR (cm.sender_id = ? AND cm.receiver_id = ?))
+        ${propertyFilter}
+      ORDER BY cm.created_at DESC
+      LIMIT ? OFFSET ?
+    ) sub
+    ORDER BY sub.created_at ASC
+  `;
+
+  const mainParams = [...whereParams, limit, offset];
 
   // Marca los mensajes recibidos como leídos
   const markAsRead = `
@@ -63,48 +86,64 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
     WHERE receiver_id = ? AND sender_id = ? AND (property_id = ? OR ? IS NULL)
   `;
 
-  console.log('[chat/messages] params', params);
-  pool.query(query, params, (err, results) => {
-    if (err) {
-      console.error('[chat/messages] DB ERROR', { code: err.code, sqlMessage: err.sqlMessage });
+  console.log('[chat/messages] whereParams', whereParams);
+  pool.query(countQuery, whereParams, (countErr, countRows) => {
+    if (countErr) {
+      console.error('[chat/messages] COUNT ERROR', { code: countErr.code, sqlMessage: countErr.sqlMessage });
       return res.status(500).json({ error: 'No se pudo obtener los mensajes' });
     }
-    console.log('[chat/messages] rows returned:', results.length);
 
-    const ttl = Number(process.env.CLD_DEFAULT_URL_TTL_SECONDS || 300);
-    const mapped = results.map(row => {
-      const msg = { ...row };
+    const total = countRows[0].total;
+    const totalPages = Math.ceil(total / limit);
 
-      if (row.message_type === 'property_card' && row.cp_id) {
-        msg.card_property = {
-          id: row.cp_id,
-          address: row.cp_address,
-          type: row.cp_type,
-          price: row.cp_price,
-          monthly_pay: row.cp_monthly_pay,
-          estate_type: row.cp_estate_type,
-          first_image: row.cp_first_image,
-        };
-      } else if (row.message_type === 'property_card') {
-        msg.card_property = null;
+    pool.query(query, mainParams, (err, results) => {
+      if (err) {
+        console.error('[chat/messages] DB ERROR', { code: err.code, sqlMessage: err.sqlMessage });
+        return res.status(500).json({ error: 'No se pudo obtener los mensajes' });
       }
+      console.log('[chat/messages] rows returned:', results.length);
 
-      delete msg.cp_id;
-      delete msg.cp_address;
-      delete msg.cp_type;
-      delete msg.cp_price;
-      delete msg.cp_monthly_pay;
-      delete msg.cp_estate_type;
-      delete msg.cp_first_image;
+      const ttl = Number(process.env.CLD_DEFAULT_URL_TTL_SECONDS || 300);
+      const mapped = results.map(row => {
+        const msg = { ...row };
 
-      if (msg.file_url) {
-        msg.signed_file_url = signedDeliveryUrlFromSecure(msg.file_url, ttl, msg.file_name);
-      }
-      return msg;
-    });
+        if (row.message_type === 'property_card' && row.cp_id) {
+          msg.card_property = {
+            id: row.cp_id,
+            address: row.cp_address,
+            type: row.cp_type,
+            price: row.cp_price,
+            monthly_pay: row.cp_monthly_pay,
+            estate_type: row.cp_estate_type,
+            first_image: row.cp_first_image,
+          };
+        } else if (row.message_type === 'property_card') {
+          msg.card_property = null;
+        }
 
-    pool.query(markAsRead, [me, user_id, property_id || null, property_id || null], () => {
-      res.json(mapped);
+        delete msg.cp_id;
+        delete msg.cp_address;
+        delete msg.cp_type;
+        delete msg.cp_price;
+        delete msg.cp_monthly_pay;
+        delete msg.cp_estate_type;
+        delete msg.cp_first_image;
+
+        if (msg.file_url) {
+          msg.signed_file_url = signedDeliveryUrlFromSecure(msg.file_url, ttl, msg.file_name);
+        }
+        return msg;
+      });
+
+      pool.query(markAsRead, [me, user_id, property_id || null, property_id || null], () => {
+        res.json({
+          data: mapped,
+          page,
+          totalPages,
+          total,
+          hasMore: page < totalPages,
+        });
+      });
     });
   });
 });
@@ -179,6 +218,10 @@ router.get('/api/chat/my-chats', authenticateToken, (req, res) => {
   const userId = req.user.id;
   console.log('[my-chats] req userId:', userId);
 
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 20;
+  const offset = (page - 1) * limit;
+
   const sql = `
     SELECT
       t.chat_with_user_id,
@@ -232,9 +275,40 @@ router.get('/api/chat/my-chats', authenticateToken, (req, res) => {
      AND (h.property_id <=> t.property_id)
     WHERE h.user_id IS NULL
     ORDER BY cm.created_at DESC
+    LIMIT ? OFFSET ?
   `;
 
-  // 6 placeholders -> 6 params (en el orden exacto del SQL)
+  const countSql = `
+    SELECT COUNT(*) AS total FROM (
+      SELECT
+        t.chat_with_user_id,
+        t.property_id
+      FROM (
+        SELECT
+          IF(sender_id = ?, receiver_id, sender_id) AS chat_with_user_id,
+          property_id,
+          MAX(id) AS last_msg_id
+        FROM chat_messages
+        WHERE (sender_id = ? OR receiver_id = ?)
+          AND is_deleted = 0
+        GROUP BY chat_with_user_id, property_id
+      ) t
+      JOIN chat_messages cm ON cm.id = t.last_msg_id
+      JOIN users u          ON u.id = t.chat_with_user_id
+      LEFT JOIN properties p ON p.id = t.property_id
+      LEFT JOIN chat_mutes cmute
+        ON cmute.user_id = ?
+       AND cmute.other_user_id = t.chat_with_user_id
+       AND (cmute.property_id <=> t.property_id)
+      LEFT JOIN hidden_chats h
+        ON h.user_id = ?
+       AND h.chat_with_user_id = t.chat_with_user_id
+       AND (h.property_id <=> t.property_id)
+      WHERE h.user_id IS NULL
+    ) sub
+  `;
+
+  // 6 placeholders for main query + 2 for LIMIT/OFFSET
   const params = [
     userId, // unread_count: m.receiver_id = ?
     userId, // IF(sender_id = ?, ...)
@@ -242,19 +316,50 @@ router.get('/api/chat/my-chats', authenticateToken, (req, res) => {
     userId, // WHERE receiver_id = ?
     userId, // cmute.user_id = ?
     userId, // h.user_id = ?
+    limit,
+    offset,
   ];
 
-  pool.query(sql, params, (err, rows) => {
-    if (!err) console.log('[my-chats] rows returned:', rows.length);
-    if (err) {
-      console.error('[my-chats] SQL ERROR', {
-        code: err.code,
-        sqlMessage: err.sqlMessage,
-        sql: err.sql,
+  // 5 placeholders for count query (same as main minus unread_count)
+  const countParams = [
+    userId, // IF(sender_id = ?, ...)
+    userId, // WHERE sender_id = ?
+    userId, // WHERE receiver_id = ?
+    userId, // cmute.user_id = ?
+    userId, // h.user_id = ?
+  ];
+
+  pool.query(countSql, countParams, (countErr, countRows) => {
+    if (countErr) {
+      console.error('[my-chats] COUNT ERROR', {
+        code: countErr.code,
+        sqlMessage: countErr.sqlMessage,
+        sql: countErr.sql,
       });
       return res.status(500).json({ error: 'No se pudieron obtener los chats' });
     }
-    res.json(rows);
+
+    const total = countRows[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    pool.query(sql, params, (err, rows) => {
+      if (!err) console.log('[my-chats] rows returned:', rows.length);
+      if (err) {
+        console.error('[my-chats] SQL ERROR', {
+          code: err.code,
+          sqlMessage: err.sqlMessage,
+          sql: err.sql,
+        });
+        return res.status(500).json({ error: 'No se pudieron obtener los chats' });
+      }
+      res.json({
+        data: rows,
+        page,
+        totalPages,
+        total,
+        hasMore: page < totalPages,
+      });
+    });
   });
 });
 

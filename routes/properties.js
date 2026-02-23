@@ -420,6 +420,20 @@ router.get('/properties', (req, res) => {
     return res.status(400).json({ error: 'Faltan parámetros de región' });
   }
 
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 30;
+  const offset = (page - 1) * limit;
+
+  const whereParams = [Number(minLat), Number(maxLat), Number(minLng), Number(maxLng)];
+
+  const countQuery = `
+    SELECT COUNT(*) AS total
+    FROM properties p
+    WHERE p.lat BETWEEN ? AND ?
+      AND p.lng BETWEEN ? AND ?
+      AND p.is_published = 1
+  `;
+
   const query = `
     SELECT
       p.*,
@@ -439,19 +453,36 @@ router.get('/properties', (req, res) => {
     ORDER BY
       (p.promoted_until IS NOT NULL AND p.promoted_until > NOW()) DESC,
       p.id DESC
+    LIMIT ? OFFSET ?
   `;
 
-  pool.query(
-    query,
-    [Number(minLat), Number(maxLat), Number(minLng), Number(maxLng)],
-    (err, results) => {
-      if (err) {
-        console.error('Error fetching properties:', err);
-        return res.status(500).json({ error: 'No se pudieron obtener las propiedades' });
-      }
-      res.json(results);
+  pool.query(countQuery, whereParams, (countErr, countRows) => {
+    if (countErr) {
+      console.error('Error counting properties:', countErr);
+      return res.status(500).json({ error: 'No se pudieron obtener las propiedades' });
     }
-  );
+
+    const total = countRows[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    pool.query(
+      query,
+      [...whereParams, limit, offset],
+      (err, results) => {
+        if (err) {
+          console.error('Error fetching properties:', err);
+          return res.status(500).json({ error: 'No se pudieron obtener las propiedades' });
+        }
+        res.json({
+          data: results,
+          page,
+          totalPages,
+          total,
+          hasMore: page < totalPages,
+        });
+      }
+    );
+  });
 });
 
 // GET /properties/:id
