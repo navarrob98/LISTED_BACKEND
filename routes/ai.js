@@ -131,16 +131,54 @@ router.post('/api/ai/property-description', authenticateToken, descriptionLimite
       amenityList.length ? `Amenidades: ${amenityList.join(', ')}` : null,
     ].filter(Boolean).join('\n');
 
-    const systemPrompt = `Eres un copywriter inmobiliario mexicano profesional. Genera una descripción atractiva para un listado de propiedad en un marketplace. La descripción debe:
-- Estar en español mexicano natural
-- Tener máximo 450 caracteres
-- No usar emojis
-- Ser persuasiva pero honesta
-- Destacar las mejores características
-- Usar un tono profesional y cálido
-Responde ÚNICAMENTE con la descripción, sin comillas ni explicaciones adicionales.`;
+    // Detect tier for tone adaptation
+    const numPrice = Number(price) || 0;
+    const numRent = Number(monthly_pay) || 0;
+    const tier = (type === 'venta' && numPrice >= 5000000) || (type === 'renta' && numRent >= 25000)
+      ? 'luxury'
+      : (type === 'venta' && numPrice > 0 && numPrice < 1500000) || (type === 'renta' && numRent > 0 && numRent < 8000)
+        ? 'affordable'
+        : 'standard';
 
-    const userPrompt = `Genera una descripción para esta propiedad:\n${details}`;
+    const toneHint = tier === 'luxury'
+      ? 'Tono aspiracional y exclusivo: transmite prestigio, estilo de vida premium'
+      : tier === 'affordable'
+        ? 'Tono práctico y accesible: enfatiza valor, oportunidad, buena inversión'
+        : 'Tono profesional y cálido: equilibra confianza con calidez';
+
+    // Detect security features to highlight
+    const securityFeatures = ['surveillance_24_7', 'controlled_access', 'cctv', 'alarm', 'gated_community']
+      .filter(k => amenities && amenities[k]);
+    const securityHint = securityFeatures.length > 0
+      ? '\n- Esta propiedad tiene seguridad — DESTÁCALO, es factor decisivo en México'
+      : '';
+
+    // Completeness check
+    const totalFields = ['type', 'estate_type', 'price', 'monthly_pay', 'bedrooms', 'bathrooms', 'half_bathrooms', 'land', 'construction', 'parking_spaces', 'stories', 'address'].length;
+    const filledFields = [type, estate_type, price, monthly_pay, bedrooms, bathrooms, half_bathrooms, land, construction, parking_spaces, stories, address].filter(Boolean).length;
+    const completeness = filledFields / totalFields;
+    const completenessNote = completeness < 0.6
+      ? '\n\n(Tip: completa más detalles de la propiedad para obtener una descripción más precisa y persuasiva)'
+      : '';
+
+    const systemPrompt = `Eres el vendedor inmobiliario #1 de México. Tu trabajo NO es listar datos — es VENDER un estilo de vida.
+
+REGLAS ABSOLUTAS:
+- Entre 350 y 500 caracteres. Ni menos, ni más.
+- Español mexicano natural, sin emojis, sin hashtags.
+- PROHIBIDO repetir los datos como lista ("3 recámaras, 2 baños, 150m²"). Eso ya lo ve el comprador en la ficha técnica.
+- En vez de listar, TRANSFORMA los datos en beneficios y sensaciones:
+  * NO: "Casa de 3 recámaras con alberca" → SÍ: "Imagina llegar cada tarde a refrescarte en tu propia alberca mientras los niños juegan en su propio espacio"
+  * NO: "200m² de construcción" → SÍ: "Espacios amplios donde cada rincón respira comodidad"
+  * NO: "Fraccionamiento con vigilancia 24/7" → SÍ: "Tu familia duerme tranquila con seguridad las 24 horas"
+- Abre con un gancho emocional irresistible — la primera frase decide si siguen leyendo o no
+- Si hay ubicación, véndela como zona de vida, no como dato ("en el corazón de...", "a minutos de todo lo que necesitas")${securityHint}
+- Cierra con urgencia sutil que empuje a actuar ("Agenda tu visita antes de que alguien más la aparte", "Esta oportunidad no espera")
+- ${toneHint}
+- Nunca inventes información que no fue proporcionada — si faltan datos, enfócate en lo que SÍ tienes y hazlo brillar
+- Responde ÚNICAMENTE con la descripción, sin comillas, sin títulos, sin explicaciones.`;
+
+    const userPrompt = `Genera una descripción para esta propiedad:\n${details}${completenessNote}`;
 
     const description = await aiGenerate(systemPrompt, userPrompt, {
       cacheTTL: 3600,
