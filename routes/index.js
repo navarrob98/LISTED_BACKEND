@@ -17,4 +17,5 @@ module.exports = function registerRoutes(app) {
   app.use('/', require('./appointments'));
   app.use('/', require('./misc'));
   app.use('/', require('./favorites'));
+  app.use('/', require('./ai'));
 };
