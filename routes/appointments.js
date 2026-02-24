@@ -94,6 +94,220 @@ router.post('/api/appointments', authenticateToken, async (req, res) => {
   }
 });
 
+// POST /api/appointments/quick-invite  (agent creates appointment on behalf of client)
+router.post('/api/appointments/quick-invite', authenticateToken, async (req, res) => {
+  try {
+    const agentId = req.user.id;
+    const { property_id, client_id, appointment_date, appointment_time, notes } = req.body;
+
+    if (!property_id || !client_id || !appointment_date || !appointment_time) {
+      return res.status(400).json({ error: 'Faltan campos obligatorios' });
+    }
+
+    // Verify user is an agent
+    const [agentRows] = await pool.promise().query(
+      'SELECT id, agent_type, name, last_name FROM users WHERE id = ? LIMIT 1',
+      [agentId]
+    );
+    if (!agentRows.length || !agentRows[0].agent_type || agentRows[0].agent_type === 'regular') {
+      return res.status(403).json({ error: 'Solo agentes pueden usar esta función' });
+    }
+
+    // Validate property exists and belongs to the agent
+    const [propRows] = await pool.promise().query(
+      'SELECT id, created_by, address FROM properties WHERE id = ? AND is_published = 1',
+      [property_id]
+    );
+    if (!propRows.length) {
+      return res.status(404).json({ error: 'Propiedad no encontrada' });
+    }
+    if (String(propRows[0].created_by) !== String(agentId)) {
+      return res.status(403).json({ error: 'La propiedad no te pertenece' });
+    }
+
+    // Validate date/time is not in the past
+    const appointmentDateTime = new Date(`${appointment_date} ${appointment_time}`);
+    if (appointmentDateTime < new Date()) {
+      return res.status(400).json({ error: 'No puedes agendar citas en el pasado' });
+    }
+
+    // Block if there is already a confirmed appointment for this user+property
+    const [confirmedExist] = await pool.promise().query(
+      `SELECT id FROM appointments
+       WHERE property_id = ? AND requester_id = ? AND agent_id = ?
+         AND status = 'confirmed'
+       LIMIT 1`,
+      [property_id, client_id, agentId]
+    );
+    if (confirmedExist.length) {
+      return res.status(409).json({ error: 'Ya existe una cita confirmada para esta propiedad. No se puede crear otra.' });
+    }
+
+    // Cancel all previous pending appointments for same agent+client+property (before slot check so they don't block)
+    const [oldPending] = await pool.promise().query(
+      `SELECT id FROM appointments
+       WHERE property_id = ? AND requester_id = ? AND agent_id = ?
+       AND status = 'pending'`,
+      [property_id, client_id, agentId]
+    );
+    const cancelledIds = oldPending.map(r => r.id);
+    if (cancelledIds.length) {
+      await pool.promise().query(
+        `UPDATE appointments SET status = 'cancelled', cancellation_reason = 'Reemplazada por nueva propuesta', updated_at = NOW()
+         WHERE id IN (?)`,
+        [cancelledIds]
+      );
+    }
+
+    // Check slot availability — suggest alternative if occupied or out of hours
+    const [agentSchedule] = await pool.promise().query(
+      'SELECT work_start, work_end FROM users WHERE id = ? LIMIT 1',
+      [agentId]
+    );
+    if (agentSchedule.length && agentSchedule[0].work_start && agentSchedule[0].work_end) {
+      const { work_start, work_end } = agentSchedule[0];
+      const [wsH, wsM] = work_start.split(':').map(Number);
+      const [weH, weM] = work_end.split(':').map(Number);
+      const [reqH] = appointment_time.split(':').map(Number);
+      const workStartMin = wsH * 60 + (wsM || 0);
+      const workEndMin = weH * 60 + (weM || 0);
+      const reqMin = reqH * 60;
+
+      if (reqMin < workStartMin || reqMin >= workEndMin) {
+        // Requested time is outside work hours — find nearest available slot
+        const [booked] = await pool.promise().query(
+          `SELECT appointment_time FROM appointments WHERE agent_id = ? AND appointment_date = ? AND status IN ('pending','confirmed')`,
+          [agentId, appointment_date]
+        );
+        const bookedSet = new Set(booked.map(r => r.appointment_time));
+        let suggested = null;
+        for (let h = wsH; h * 60 < workEndMin; h++) {
+          const t = `${String(h).padStart(2, '0')}:00:00`;
+          if (!bookedSet.has(t)) { suggested = { date: appointment_date, time: t }; break; }
+        }
+        return res.status(409).json({ error: 'Horario fuera de horas laborales', code: 'OUT_OF_HOURS', suggested, cancelledIds });
+      }
+
+      // Check if the specific slot is already taken (by another client)
+      const [slotTaken] = await pool.promise().query(
+        `SELECT id FROM appointments WHERE agent_id = ? AND appointment_date = ? AND appointment_time = ? AND status IN ('pending','confirmed') LIMIT 1`,
+        [agentId, appointment_date, appointment_time]
+      );
+      if (slotTaken.length) {
+        const [booked] = await pool.promise().query(
+          `SELECT appointment_time FROM appointments WHERE agent_id = ? AND appointment_date = ? AND status IN ('pending','confirmed')`,
+          [agentId, appointment_date]
+        );
+        const bookedSet = new Set(booked.map(r => r.appointment_time));
+        let suggested = null;
+        for (let offset = 1; offset <= 12; offset++) {
+          for (const dir of [1, -1]) {
+            const h = reqH + offset * dir;
+            if (h * 60 < workStartMin || h * 60 >= workEndMin) continue;
+            const t = `${String(h).padStart(2, '0')}:00:00`;
+            if (!bookedSet.has(t)) { suggested = { date: appointment_date, time: t }; break; }
+          }
+          if (suggested) break;
+        }
+        return res.status(409).json({ error: 'Ese horario ya está ocupado', code: 'SLOT_TAKEN', suggested, cancelledIds });
+      }
+    }
+
+    // Create the appointment (requester = client, agent = authenticated agent)
+    const [result] = await pool.promise().query(
+      `INSERT INTO appointments (property_id, requester_id, agent_id, appointment_date, appointment_time, notes, status)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+      [property_id, client_id, agentId, appointment_date, appointment_time, notes || null]
+    );
+
+    // Send push notification to the client
+    try {
+      const agentName = `${agentRows[0].name} ${agentRows[0].last_name}`.trim();
+      const dateObj = new Date(`${appointment_date}T12:00:00`);
+      const formattedDate = dateObj.toLocaleDateString('es-MX', { weekday: 'long', day: 'numeric', month: 'long' });
+      const formattedTime = appointment_time.slice(0, 5);
+
+      await sendPushToUser({
+        userId: client_id,
+        title: 'Propuesta de cita',
+        body: `El agente ${agentName} te propone una cita el ${formattedDate} a las ${formattedTime}`,
+        data: {
+          type: 'appointment',
+          appointmentId: String(result.insertId),
+          propertyId: String(property_id),
+        },
+      });
+    } catch (pushErr) {
+      console.error('[appointments/quick-invite] push error', pushErr);
+    }
+
+    res.status(201).json({ ok: true, appointmentId: result.insertId, cancelledIds });
+  } catch (e) {
+    console.error('[POST /api/appointments/quick-invite] error', e);
+    res.status(500).json({ error: 'Error al crear la cita' });
+  }
+});
+
+// PUT /api/appointments/:id/client-accept  (client accepts a pending appointment)
+router.put('/api/appointments/:id/client-accept', authenticateToken, async (req, res) => {
+  try {
+    const appointmentId = req.params.id;
+    const userId = req.user.id;
+
+    const [rows] = await pool.promise().query(
+      'SELECT id, agent_id, requester_id, status, property_id, appointment_date, appointment_time FROM appointments WHERE id = ? LIMIT 1',
+      [appointmentId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Cita no encontrada' });
+    }
+
+    const appointment = rows[0];
+
+    // Only the requester (client) can accept
+    if (String(appointment.requester_id) !== String(userId)) {
+      return res.status(403).json({ error: 'Solo el cliente puede aceptar la cita' });
+    }
+
+    if (appointment.status !== 'pending') {
+      return res.status(400).json({ error: 'Solo se pueden aceptar citas pendientes' });
+    }
+
+    await pool.promise().query(
+      'UPDATE appointments SET status = "confirmed", updated_at = NOW() WHERE id = ?',
+      [appointmentId]
+    );
+
+    // Notify the agent
+    try {
+      const [clientRows] = await pool.promise().query(
+        'SELECT name, last_name FROM users WHERE id = ? LIMIT 1',
+        [userId]
+      );
+      const clientName = clientRows[0] ? `${clientRows[0].name} ${clientRows[0].last_name}`.trim() : 'El cliente';
+
+      await sendPushToUser({
+        userId: appointment.agent_id,
+        title: 'Cita confirmada!',
+        body: `${clientName} confirmo la cita`,
+        data: {
+          type: 'appointment',
+          appointmentId: String(appointmentId),
+          propertyId: String(appointment.property_id),
+        },
+      });
+    } catch (pushErr) {
+      console.error('[appointments/client-accept] push error', pushErr);
+    }
+
+    res.json({ ok: true, message: 'Cita confirmada' });
+  } catch (e) {
+    console.error('[PUT /api/appointments/:id/client-accept] error', e);
+    res.status(500).json({ error: 'Error al aceptar la cita' });
+  }
+});
+
 // GET /api/appointments
 router.get('/api/appointments', authenticateToken, async (req, res) => {
   try {
@@ -335,6 +549,61 @@ router.put('/api/appointments/:id/complete', authenticateToken, async (req, res)
   } catch (e) {
     console.error('[PUT /api/appointments/:id/complete] error', e);
     res.status(500).json({ error: 'Error al completar la cita' });
+  }
+});
+
+// GET /api/appointments/next-available/:agentId — find the nearest open slot from now
+router.get('/api/appointments/next-available/:agentId', authenticateToken, async (req, res) => {
+  try {
+    const { agentId } = req.params;
+
+    const [agentRows] = await pool.promise().query(
+      'SELECT work_start, work_end FROM users WHERE id = ? LIMIT 1',
+      [agentId]
+    );
+    if (!agentRows.length || !agentRows[0].work_start || !agentRows[0].work_end) {
+      return res.json({ found: false });
+    }
+
+    const { work_start, work_end } = agentRows[0];
+    const [wsH] = work_start.split(':').map(Number);
+    const [weH, weM] = work_end.split(':').map(Number);
+    const workEndMin = weH * 60 + (weM || 0);
+
+    const now = new Date();
+
+    // Search today + next 7 days
+    for (let dayOffset = 0; dayOffset <= 7; dayOffset++) {
+      const d = new Date(now);
+      d.setDate(d.getDate() + dayOffset);
+      const dateStr = d.toISOString().split('T')[0];
+
+      const [booked] = await pool.promise().query(
+        `SELECT appointment_time FROM appointments WHERE agent_id = ? AND appointment_date = ? AND status IN ('pending','confirmed')`,
+        [agentId, dateStr]
+      );
+      const bookedSet = new Set(booked.map(r => r.appointment_time));
+
+      // Determine starting hour: if today, skip past hours
+      let startH = wsH;
+      if (dayOffset === 0) {
+        const currentHour = now.getHours();
+        // Start from the next full hour if current hour is within work hours
+        startH = Math.max(wsH, currentHour + 1);
+      }
+
+      for (let h = startH; h * 60 < workEndMin; h++) {
+        const t = `${String(h).padStart(2, '0')}:00:00`;
+        if (!bookedSet.has(t)) {
+          return res.json({ found: true, date: dateStr, time: t });
+        }
+      }
+    }
+
+    return res.json({ found: false });
+  } catch (e) {
+    console.error('[GET /api/appointments/next-available] error', e);
+    res.status(500).json({ error: 'Error al buscar horario disponible' });
   }
 });
 

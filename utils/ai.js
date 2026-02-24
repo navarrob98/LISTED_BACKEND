@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const redis  = require('../db/redis');
 
 // ── Config ──────────────────────────────────────────────────────────────────────
-const GEMINI_URL   = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+const GEMINI_URL   = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
 const GROQ_URL     = 'https://api.groq.com/openai/v1/chat/completions';
 const GEMINI_KEY   = () => process.env.GEMINI_API_KEY;
 const GROQ_KEY     = () => process.env.GROQ_API_KEY;
@@ -18,7 +18,7 @@ const MAX_RETRIES  = 2;
 
 // ── Rate-limit constants (Gemini free tier) ─────────────────────────────────────
 const GEMINI_RPM        = 14;   // leave 1 headroom from 15
-const GEMINI_RPD        = 1400; // leave 100 headroom from 1500
+const GEMINI_RPD        = 950;  // leave headroom from 1000
 const RL_MINUTE_KEY     = 'ai:rl:gemini:min';
 const RL_DAY_KEY        = 'ai:rl:gemini:day';
 
@@ -115,6 +115,10 @@ async function callGemini(systemPrompt, userPrompt) {
   });
 
   if (!res.ok) {
+    let errBody = '';
+    try { errBody = await res.text(); } catch {}
+    if (res.status !== 429) console.error('[Gemini error]', res.status, errBody.slice(0, 300));
+    else console.log('[Gemini] 429 rate limited → fallback to Groq');
     const status = res.status;
     if (status === 429) throw new Error('GEMINI_RATE_LIMITED');
     throw new Error(`Gemini HTTP ${status}`);
@@ -200,10 +204,26 @@ async function callGeminiMessages(systemPrompt, messages) {
   const withinLimit = await checkGeminiRateLimit();
   if (!withinLimit) throw new Error('GEMINI_RATE_LIMITED');
 
-  const contents = messages.map(m => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: m.content }],
-  }));
+  // Gemini requires strictly alternating user/model turns.
+  // Merge consecutive same-role messages and ensure it starts with 'user'.
+  const contents = [];
+  for (const m of messages) {
+    const role = m.role === 'assistant' ? 'model' : 'user';
+    const last = contents[contents.length - 1];
+    if (last && last.role === role) {
+      // Merge into previous turn
+      last.parts[0].text += '\n' + m.content;
+    } else {
+      contents.push({ role, parts: [{ text: m.content }] });
+    }
+  }
+  // Gemini requires the first message to be 'user'
+  if (contents.length > 0 && contents[0].role !== 'user') {
+    contents.shift();
+  }
+  if (contents.length === 0) {
+    throw new Error('No valid messages for Gemini');
+  }
 
   const body = {
     system_instruction: { parts: [{ text: systemPrompt }] },
@@ -218,6 +238,10 @@ async function callGeminiMessages(systemPrompt, messages) {
   });
 
   if (!res.ok) {
+    let errBody = '';
+    try { errBody = await res.text(); } catch {}
+    if (res.status !== 429) console.error('[Gemini error]', res.status, errBody.slice(0, 300));
+    else console.log('[Gemini] 429 rate limited → fallback to Groq');
     if (res.status === 429) throw new Error('GEMINI_RATE_LIMITED');
     throw new Error(`Gemini HTTP ${res.status}`);
   }

@@ -65,9 +65,18 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
         CASE WHEN cm.message_type = 'property_card' THEN p.estate_type END as cp_estate_type,
         CASE WHEN cm.message_type = 'property_card'
           THEN (SELECT image_url FROM property_images WHERE property_id = p.id ORDER BY id ASC LIMIT 1)
-        END as cp_first_image
+        END as cp_first_image,
+        CASE WHEN cm.message_type = 'appointment_card' THEN appt.id END as ca_id,
+        CASE WHEN cm.message_type = 'appointment_card' THEN appt.appointment_date END as ca_date,
+        CASE WHEN cm.message_type = 'appointment_card' THEN appt.appointment_time END as ca_time,
+        CASE WHEN cm.message_type = 'appointment_card' THEN appt.status END as ca_status,
+        CASE WHEN cm.message_type = 'appointment_card' THEN appt.requester_id END as ca_requester_id,
+        CASE WHEN cm.message_type = 'appointment_card' THEN appt.agent_id END as ca_agent_id,
+        CASE WHEN cm.message_type = 'appointment_card' THEN ap.address END as ca_property_address
       FROM chat_messages cm
       LEFT JOIN properties p ON cm.shared_property_id = p.id AND cm.message_type = 'property_card'
+      LEFT JOIN appointments appt ON cm.shared_property_id = appt.id AND cm.message_type = 'appointment_card'
+      LEFT JOIN properties ap ON appt.property_id = ap.id AND cm.message_type = 'appointment_card'
       WHERE cm.is_deleted = 0
         AND ((cm.sender_id = ? AND cm.receiver_id = ?) OR (cm.sender_id = ? AND cm.receiver_id = ?))
         ${propertyFilter}
@@ -121,6 +130,20 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
           msg.card_property = null;
         }
 
+        if (row.message_type === 'appointment_card' && row.ca_id) {
+          msg.card_appointment = {
+            id: row.ca_id,
+            appointment_date: row.ca_date,
+            appointment_time: row.ca_time,
+            status: row.ca_status,
+            property_address: row.ca_property_address,
+            requester_id: row.ca_requester_id,
+            agent_id: row.ca_agent_id,
+          };
+        } else if (row.message_type === 'appointment_card') {
+          msg.card_appointment = null;
+        }
+
         delete msg.cp_id;
         delete msg.cp_address;
         delete msg.cp_type;
@@ -128,6 +151,13 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
         delete msg.cp_monthly_pay;
         delete msg.cp_estate_type;
         delete msg.cp_first_image;
+        delete msg.ca_id;
+        delete msg.ca_date;
+        delete msg.ca_time;
+        delete msg.ca_status;
+        delete msg.ca_requester_id;
+        delete msg.ca_agent_id;
+        delete msg.ca_property_address;
 
         if (msg.file_url) {
           msg.signed_file_url = signedDeliveryUrlFromSecure(msg.file_url, ttl, msg.file_name);
