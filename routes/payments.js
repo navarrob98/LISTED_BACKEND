@@ -34,7 +34,11 @@ router.post('/stripe/webhook', express.raw({ type: 'application/json' }), async 
           [promo.id]
         );
         await pool.promise().query(
-          'UPDATE properties SET promoted_until=DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id=?',
+          `UPDATE properties
+             SET promoted_until = DATE_ADD(NOW(), INTERVAL 7 DAY),
+                 is_published = 1,
+                 review_status = 'approved'
+           WHERE id = ?`,
           [promo.property_id]
         );
       }
@@ -163,7 +167,11 @@ router.post('/payments/promote/confirm', express.json(), authenticateToken, asyn
       [promo.id]
     );
     await pool.promise().query(
-      'UPDATE properties SET promoted_until=DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id=?',
+      `UPDATE properties
+         SET promoted_until = DATE_ADD(NOW(), INTERVAL 7 DAY),
+             is_published = 1,
+             review_status = 'approved'
+       WHERE id = ?`,
       [promo.property_id]
     );
 
