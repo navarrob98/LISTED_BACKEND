@@ -70,6 +70,32 @@ function q(sql, params) {
   });
 }
 
+// ── Cached user context (Redis, 5-min TTL) ─────────────────────────────────────
+async function getUserContextCached(userId, ttlSeconds = 300) {
+  const cacheKey = `user:context:${userId}`;
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached) return JSON.parse(cached);
+  } catch { /* cache miss is fine */ }
+
+  const [buyingPower, infonavit, tenantProfile, qualifying] = await Promise.all([
+    q('SELECT * FROM buying_power WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [userId]).catch(() => []),
+    q('SELECT * FROM infonavit_calculations WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [userId]).catch(() => []),
+    q('SELECT * FROM tenant_profiles WHERE user_id = ? LIMIT 1', [userId]).catch(() => []),
+    q('SELECT * FROM user_qualifying_profile WHERE user_id = ? LIMIT 1', [userId]).catch(() => []),
+  ]);
+
+  const result = {
+    buying_power: buyingPower[0] || null,
+    infonavit: infonavit[0] || null,
+    tenant_profile: tenantProfile[0] || null,
+    qualifying: qualifying[0] || null,
+  };
+
+  try { await redis.set(cacheKey, JSON.stringify(result), 'EX', ttlSeconds); } catch { /* non-critical */ }
+  return result;
+}
+
 // ── Estate type labels ──────────────────────────────────────────────────────────
 const ESTATE_LABELS = {
   casa: 'Casa', departamento: 'Departamento', terreno: 'Terreno',
@@ -289,6 +315,31 @@ router.post('/api/ai/smart-replies', authenticateToken, smartRepliesLimiter, asy
       ? `\nEs la primera vez que el agente responde. Incluye un saludo educado como "Buenas tardes${clientNameStr ? ' ' + clientNameStr : ''}, soy ${agentNameStr || 'su agente'}, con mucho gusto le atiendo" o similar. Profesional pero calido.`
       : '';
 
+    // ── Fetch client financial context for informed suggestions (cached) ──
+    let clientContextNote = '';
+    if (clientId) {
+      try {
+    
+        const ctx = await getUserContextCached(clientId, 600); // 10-min TTL for enrichment
+        const { buying_power: bp, infonavit: info, tenant_profile: tp, qualifying: qp } = ctx;
+        const parts = [];
+        if (qp) {
+          if (qp.intent) parts.push(`Intención: ${qp.intent === 'buy' ? 'comprar' : qp.intent === 'rent' ? 'rentar' : 'invertir'}`);
+          if (qp.purchase_timeline) parts.push(`Timeline: ${qp.purchase_timeline} meses`);
+          if (qp.has_pre_approval) parts.push(`Pre-aprobación: ${qp.pre_approval_bank || 'Sí'}${qp.pre_approval_amount ? ' $' + Number(qp.pre_approval_amount).toLocaleString('es-MX') : ''}`);
+          if (qp.credit_score_range && qp.credit_score_range !== 'unknown') parts.push(`Score crediticio: ${qp.credit_score_range}`);
+          if (qp.bureau_status && qp.bureau_status !== 'unknown') parts.push(`Buró: ${qp.bureau_status === 'clean' ? 'limpio' : qp.bureau_status === 'minor_issues' ? 'algunos detalles' : 'temas importantes'}`);
+        }
+        if (bp?.suggested) parts.push(`Capacidad de compra: $${Number(bp.suggested).toLocaleString('es-MX')}`);
+        if (bp?.monthly_income) parts.push(`Ingreso mensual: $${Number(bp.monthly_income).toLocaleString('es-MX')}`);
+        if (info?.credit_amount) parts.push(`Crédito Infonavit: $${Number(info.credit_amount).toLocaleString('es-MX')}`);
+        if (tp?.estimated_monthly_income) parts.push(`Ingreso (perfil renta): $${Number(tp.estimated_monthly_income).toLocaleString('es-MX')}`);
+        if (parts.length > 0) {
+          clientContextNote = `\n\nDATOS FINANCIEROS DEL PROSPECTO (úsalos para dar respuestas informadas, pero NO los compartas directamente con el cliente):\n${parts.join('\n')}`;
+        }
+      } catch { /* non-critical */ }
+    }
+
     // Check if there is already a confirmed appointment for this chat
     let confirmedAppointmentNote = '';
     if (propertyId && clientId) {
@@ -349,7 +400,7 @@ Tags disponibles:
    Si quiere cambiar pero no dice fecha/hora exacta: [MODIFICAR_CITA]
 4. NO puedes confirmar ni cancelar citas, solo crear propuestas y modificaciones.
 5. Solo puede haber UNA cita pendiente por propiedad.
-6. En caso de duda, NO agregues ningun tag. Es mejor no proponer cita que proponerla cuando no se pidio.${confirmedAppointmentNote}
+6. En caso de duda, NO agregues ningun tag. Es mejor no proponer cita que proponerla cuando no se pidio.${confirmedAppointmentNote}${clientContextNote}
 
 Responde SOLO con las 3 opciones separadas por ||| sin números ni explicaciones.`;
 
@@ -438,16 +489,6 @@ router.post('/api/ai/assistant', optionalAuth, assistantLimiter, async (req, res
     // ── Conversation history (only for logged-in users) ──
     let history = [];
     if (userId) {
-      try {
-        await q(`CREATE TABLE IF NOT EXISTS ai_conversations (
-          id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-          user_id INT UNSIGNED NOT NULL,
-          role ENUM('user', 'assistant') NOT NULL,
-          message TEXT NOT NULL,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          INDEX idx_user_created (user_id, created_at)
-        )`, []);
-      } catch { /* table likely exists */ }
 
       await q('INSERT INTO ai_conversations (user_id, role, message) VALUES (?, ?, ?)',
         [userId, 'user', message.trim()]);
@@ -512,9 +553,10 @@ No hagas excepciones. No respondas preguntas de cultura general, matemáticas, a
 
 Reglas de formato:
 - Responde en español mexicano natural y profesional
-- Máximo 300 palabras por respuesta
+- Máximo 150 palabras por respuesta. Sé BREVE y directo — ve al grano sin rodeos ni introducciones largas
+- No repitas la pregunta del usuario ni uses frases de relleno como "Claro, con gusto te explico", "Es una excelente pregunta", etc. Ve directo a la respuesta
+- Usa bullets o listas cortas cuando aplique, en vez de párrafos largos
 - No uses emojis
-- Sé útil, claro y conciso
 - No inventes datos específicos de precios de zonas; si no estás seguro, indica que los precios varían
 - Cuando sea relevante, sugiere usar herramientas de la app como la calculadora Infonavit o el perfil de capacidad de compra${propertyContext}${buyingPowerContext}`;
 
@@ -559,6 +601,79 @@ Reglas de formato:
       return res.status(503).json({ ok: false, error: 'ai_disabled', message: 'El asistente no está disponible temporalmente.' });
     }
     return res.status(500).json({ ok: false, error: 'ai_error', message: 'Error al procesar tu mensaje.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Feature 4: User qualifying profile + context for agents
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/ai/user-context/:userId — fetch financial context for a prospect
+router.get('/api/ai/user-context/:userId', authenticateToken, async (req, res) => {
+  try {
+    const targetUserId = Number(req.params.userId);
+    if (!targetUserId || isNaN(targetUserId)) {
+      return res.status(400).json({ ok: false, error: 'userId inválido' });
+    }
+
+
+
+    const context = await getUserContextCached(targetUserId);
+    return res.json({ ok: true, ...context });
+  } catch (err) {
+    console.error('[ai:user-context]', err.message);
+    return res.status(500).json({ ok: false, error: 'Error al obtener contexto del usuario' });
+  }
+});
+
+// POST /api/ai/qualifying-profile — user saves their qualifying answers
+router.post('/api/ai/qualifying-profile', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ ok: false, error: 'No autenticado' });
+
+
+
+    const {
+      intent,
+      purchase_timeline,
+      has_pre_approval,
+      pre_approval_bank,
+      pre_approval_amount,
+      credit_score_range,
+      bureau_status,
+    } = req.body;
+
+    await q(`INSERT INTO user_qualifying_profile
+      (user_id, intent, purchase_timeline, has_pre_approval, pre_approval_bank, pre_approval_amount, credit_score_range, bureau_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        intent = VALUES(intent),
+        purchase_timeline = VALUES(purchase_timeline),
+        has_pre_approval = VALUES(has_pre_approval),
+        pre_approval_bank = VALUES(pre_approval_bank),
+        pre_approval_amount = VALUES(pre_approval_amount),
+        credit_score_range = VALUES(credit_score_range),
+        bureau_status = VALUES(bureau_status)`,
+      [
+        userId,
+        intent || null,
+        purchase_timeline || null,
+        has_pre_approval ? 1 : 0,
+        pre_approval_bank || null,
+        pre_approval_amount || null,
+        credit_score_range || null,
+        bureau_status || null,
+      ]
+    );
+
+    // Invalidate cached context so next GET returns fresh data
+    try { await redis.del(`user:context:${userId}`); } catch { /* non-critical */ }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[ai:qualifying-profile]', err.message);
+    return res.status(500).json({ ok: false, error: 'Error al guardar perfil' });
   }
 });
 
