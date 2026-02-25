@@ -267,6 +267,8 @@ router.get('/api/chat/my-chats', authenticateToken, (req, res) => {
        ORDER BY pi.id ASC LIMIT 1) AS property_cover_photo,
       cm.created_at  AS last_message_at,
       cm.message     AS last_message,
+      cm.message_type AS last_message_type,
+      cm.file_name   AS last_file_name,
       (
         SELECT COUNT(*)
         FROM chat_messages m

@@ -161,6 +161,10 @@ router.post('/admin/properties/:id/approve', authenticateToken, requireAdmin, (r
       if (err) return res.status(500).json({ error: 'Error aprobando propiedad' });
       if (!r.affectedRows) return res.status(404).json({ error: 'Propiedad no encontrada o no está pending' });
       res.json({ ok: true });
+
+      // Fire-and-forget: notify users with matching saved searches
+      const { matchAndNotify } = require('../services/smartAlerts');
+      matchAndNotify(propertyId).catch(err => console.error('[smart-alerts]', err));
     }
   );
 });

@@ -206,6 +206,16 @@ router.post('/properties/add', authenticateToken, async (req, res) => {
     const [result] = await pool.promise().query(query, values);
     const propertyId = result.insertId;
 
+    // Fire-and-forget: extract city from coords
+    if (lat && lng) {
+      const { extractCityFromCoords } = require('../utils/extractCity');
+      extractCityFromCoords(lat, lng)
+        .then(city => {
+          if (city) pool.promise().query('UPDATE properties SET city = ? WHERE id = ?', [city, propertyId]);
+        })
+        .catch(err => console.error('[extractCity] Error:', err));
+    }
+
     // Inserta imágenes si vienen
     const imgs = Array.isArray(images) ? images.map((x) => String(x || "").trim()).filter(Boolean) : [];
     if (imgs.length) {

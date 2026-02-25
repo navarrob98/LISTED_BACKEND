@@ -242,11 +242,43 @@ router.post('/api/ai/smart-replies', authenticateToken, smartRepliesLimiter, asy
       return res.status(400).json({ ok: false, error: 'Se requieren mensajes del chat.' });
     }
 
-    // Take last 6 messages
-    const recentMessages = messages.slice(-6);
-    const chatContext = recentMessages.map(m =>
-      `${m.isOwn ? (agentName || 'Agente') : (clientName || 'Cliente')}: ${m.text}`
-    ).join('\n');
+    // Take last 20 messages for full conversation context
+    const recentMessages = messages.slice(-20);
+    const chatContext = recentMessages.map(m => {
+      const speaker = m.isOwn ? (agentName || 'Agente') : (clientName || 'Cliente');
+      if (m.type === 'appointment_card' && m.appointment) {
+        const apptStatus = m.appointment.status === 'confirmed' ? 'CONFIRMADA' : m.appointment.status === 'cancelled' ? 'CANCELADA' : 'PENDIENTE';
+        return `${speaker}: [Propuesta de visita - ${apptStatus}${m.appointment.date ? ` ${m.appointment.date}` : ''}${m.appointment.time ? ` ${String(m.appointment.time).slice(0,5)}` : ''}]${m.text ? ' ' + m.text : ''}`;
+      }
+      if (m.type === 'property_card') {
+        return `${speaker}: [Compartió una propiedad]${m.text ? ' ' + m.text : ''}`;
+      }
+      if (m.hasFile) {
+        return `${speaker}: [Envió archivo${m.fileName ? ': ' + m.fileName : ''}]${m.text ? ' ' + m.text : ''}`;
+      }
+      return `${speaker}: ${m.text}`;
+    }).join('\n');
+
+    // Determine conversation stage
+    const totalMessages = recentMessages.length;
+    const agentMessages = recentMessages.filter(m => m.isOwn).length;
+    const clientMessages = totalMessages - agentMessages;
+    const hasAppointment = recentMessages.some(m => m.type === 'appointment_card');
+    const hasConfirmedAppt = recentMessages.some(m => m.type === 'appointment_card' && m.appointment?.status === 'confirmed');
+    const hasPendingAppt = recentMessages.some(m => m.type === 'appointment_card' && m.appointment?.status === 'pending');
+
+    // Conversation stage is determined AFTER appointment query (below) using real DB data
+    let conversationStage = 'inicio';
+    if (agentMessages >= 1) conversationStage = 'seguimiento';
+    if (agentMessages >= 3 && clientMessages >= 3) conversationStage = 'negociacion';
+
+    const stageHints = {
+      inicio: 'La conversacion apenas comienza. Saluda profesionalmente y ofrece informacion sobre la propiedad.',
+      seguimiento: 'Ya hubo intercambio inicial. NO vuelvas a saludar ni a presentarte. Continua la conversacion de forma natural, responde lo que el cliente pregunta o necesita.',
+      negociacion: 'La conversacion esta avanzada. NO saludes ni te presentes. Enfocate en resolver dudas especificas, destacar beneficios relevantes y avanzar hacia el cierre (visita o decision).',
+      cita_pendiente: 'Ya hay una propuesta de visita PENDIENTE. NO propongas otra cita. Enfocate en confirmar detalles, resolver dudas restantes o preparar al cliente para la visita.',
+      cita_confirmada: 'Ya hay una cita CONFIRMADA. NO propongas mas citas. Enfocate en preparar al cliente para la visita, dar indicaciones de ubicacion, o resolver dudas finales antes de la visita.',
+    };
 
     let propertyContext = '';
     if (property) {
@@ -340,18 +372,30 @@ router.post('/api/ai/smart-replies', authenticateToken, smartRepliesLimiter, asy
       } catch { /* non-critical */ }
     }
 
-    // Check if there is already a confirmed appointment for this chat
-    let confirmedAppointmentNote = '';
+    // Check real appointment state for this property+client
+    let appointmentNote = '';
     if (propertyId && clientId) {
-      const [confirmed] = await q(
-        `SELECT id, appointment_date, appointment_time FROM appointments
-         WHERE property_id = ? AND requester_id = ? AND agent_id = ? AND status = 'confirmed'
-         ORDER BY id DESC LIMIT 1`,
+      const appointments = await q(
+        `SELECT id, appointment_date, appointment_time, status FROM appointments
+         WHERE property_id = ? AND requester_id = ? AND agent_id = ?
+           AND status IN ('pending', 'confirmed')
+         ORDER BY id DESC LIMIT 3`,
         [propertyId, clientId, userId]
       );
-      if (confirmed) {
-        confirmedAppointmentNote = `\nIMPORTANTE: Ya existe una cita CONFIRMADA para esta propiedad (${confirmed.appointment_date} a las ${String(confirmed.appointment_time).slice(0,5)}). NO uses [CITA], [MODIFICAR_CITA] ni propongas cambios de horario. La cita confirmada no se puede modificar ni cancelar por IA.`;
+      if (appointments.length > 0) {
+        const confirmed = appointments.find(a => a.status === 'confirmed');
+        const pending = appointments.find(a => a.status === 'pending');
+        if (confirmed) {
+          appointmentNote = `\nESTADO DE CITAS PARA ESTA PROPIEDAD: Ya existe una cita CONFIRMADA (${confirmed.appointment_date} a las ${String(confirmed.appointment_time).slice(0,5)}). NO uses [CITA], [MODIFICAR_CITA] ni propongas cambios de horario. Enfocate en preparar la visita.`;
+        } else if (pending) {
+          appointmentNote = `\nESTADO DE CITAS PARA ESTA PROPIEDAD: Hay una propuesta de visita PENDIENTE de confirmar (${pending.appointment_date} a las ${String(pending.appointment_time).slice(0,5)}). NO propongas nueva cita. Puedes mencionar que la propuesta ya fue enviada y esta pendiente de confirmacion.`;
+        }
+      } else {
+        appointmentNote = '\nESTADO DE CITAS PARA ESTA PROPIEDAD: NO hay ninguna cita agendada ni propuesta. Si el cliente quiere vernos o visitar la propiedad, usa [CITA] para proponer una.';
       }
+      // Override conversation stage with real DB appointment state
+      if (appointments.find(a => a.status === 'confirmed')) conversationStage = 'cita_confirmada';
+      else if (appointments.find(a => a.status === 'pending')) conversationStage = 'cita_pendiente';
     }
 
     // Build today's date for the AI to resolve relative dates ("jueves", "mañana", etc.)
@@ -362,7 +406,12 @@ router.post('/api/ai/smart-replies', authenticateToken, smartRepliesLimiter, asy
     const systemPrompt = `Eres un agente inmobiliario mexicano profesional y astuto escribiendo por WhatsApp.${agentNameStr ? ' Te llamas ' + agentNameStr + '.' : ''}${clientNameStr ? ' Le escribes a ' + clientNameStr + '.' : ''}
 Hoy es ${todayDayName} ${todayISO}.
 
+ETAPA DE LA CONVERSACION: ${conversationStage.toUpperCase()}
+${stageHints[conversationStage]}
+
 TU ROL: Eres un VENDEDOR. Tu objetivo es cerrar la venta o renta. Usa la información de la propiedad a tu favor para responder con datos concretos que generen interés y confianza. Si el cliente pregunta sobre características, responde con lo que tiene la propiedad y destaca lo positivo. Si no tiene algo que preguntan, se honesto pero redirige a lo que SI tiene.
+
+CONTEXTO CRITICO: Lee TODA la conversacion antes de responder. Tus sugerencias deben ser la CONTINUACION LOGICA de lo que se esta hablando. Si el cliente hizo una pregunta, RESPONDELA. Si ya se hablo de algo, no lo repitas. Si ya se saludo, NO vuelvas a saludar.
 
 Genera 3 opciones de mensaje que el agente podría enviar. Reglas:
 - Tono profesional pero cercano. Habla de USTED al cliente, nunca de tu. Ejemplo: "con gusto le comparto", "si gusta podemos agendar"
@@ -373,11 +422,13 @@ Genera 3 opciones de mensaje que el agente podría enviar. Reglas:
 - Se astuto como vendedor: destaca ventajas, amenidades, ubicación, seguridad o lo que sea relevante para lo que pregunta el cliente
 - Si el cliente pregunta algo que no esta en los datos, responde con honestidad y sugiere algo que SI tiene la propiedad como valor agregado
 - Cada opción con un enfoque distinto: una informativa con datos, una que destaque un beneficio y proponga accion, una corta y directa
+- NUNCA repitas saludos o presentaciones si ya se hicieron en la conversacion
+- Las respuestas deben responder DIRECTAMENTE al ultimo mensaje del cliente en el contexto de toda la conversacion
 - NO uses emojis
 - Entre 20 y 200 caracteres cada una
 - Español mexicano natural, profesional${firstReplyHint}
 
-DETECCION DE CITAS — SE MUY CONSERVADOR. Solo activa tags de cita cuando la intencion es CLARA E INEQUIVOCA.
+DETECCION DE CITAS — Lee el contexto completo de la conversacion para determinar si el cliente quiere agendar.
 
 NUNCA uses tags de cita si el cliente:
 - Solo saluda ("hola", "buenas tardes", "como esta")
@@ -386,10 +437,16 @@ NUNCA uses tags de cita si el cliente:
 - Dice algo ambiguo o conversacional
 - Apenas inicia la conversacion (primer o segundo mensaje)
 
-SOLO usa tags de cita cuando el cliente EXPLICITAMENTE dice que quiere VISITAR, IR, CONOCER EN PERSONA o VER FISICAMENTE la propiedad. Debe ser una intencion clara de agendar una visita presencial, no solo interes general.
+USA [CITA] cuando:
+1. El cliente EXPLICITAMENTE dice que quiere VISITAR, IR, CONOCER EN PERSONA o VER FISICAMENTE la propiedad
+2. El AGENTE previamente ofrecio o pregunto si quiere agendar/visitar Y el cliente CONFIRMO positivamente (ej: "si", "claro", "si me gustaria", "dale", "va", "por supuesto", "si, cuando?")
+
+IMPORTANTE: Si el agente pregunto "le gustaria agendar una visita?" y el cliente contesto "si" o cualquier afirmacion, eso ES una confirmacion de cita. NO vuelvas a preguntar, USA [CITA] directamente.
 
 Ejemplos que NO son cita: "me interesa", "quiero info", "se ve bien", "me gusta", "esta disponible?"
-Ejemplos que SI son cita: "quiero ir a verla", "puedo visitarla?", "cuando puedo pasar a conocerla?", "me gustaria agendar una visita"
+Ejemplos que SI son cita:
+- Directos: "quiero ir a verla", "puedo visitarla?", "cuando puedo pasar a conocerla?", "me gustaria agendar una visita"
+- Confirmaciones a oferta del agente: "si claro", "si cuando podemos vernos?", "cuando nos vemos?", "si me gustaria", "dale", "claro que si", "por supuesto", "va", "si, cuando seria?"
 
 Tags disponibles:
 1. Si el cliente quiere visitar Y menciona fecha y hora concretas: [CITA:YYYY-MM-DD:HH:MM]
@@ -400,7 +457,9 @@ Tags disponibles:
    Si quiere cambiar pero no dice fecha/hora exacta: [MODIFICAR_CITA]
 4. NO puedes confirmar ni cancelar citas, solo crear propuestas y modificaciones.
 5. Solo puede haber UNA cita pendiente por propiedad.
-6. En caso de duda, NO agregues ningun tag. Es mejor no proponer cita que proponerla cuando no se pidio.${confirmedAppointmentNote}${clientContextNote}
+6. En caso de duda, NO agregues ningun tag. Es mejor no proponer cita que proponerla cuando no se pidio.
+7. NUNCA inventes citas que no existen. Si no hay cita agendada, NO digas que ya hay una. Usa SOLO la informacion del ESTADO DE CITAS que se te proporciona.
+8. Si en el historial del chat ves propuestas de visita CANCELADAS, IGNORALAS completamente. Una cita cancelada ya no existe. Solo considera las citas que aparecen en el ESTADO DE CITAS.${appointmentNote}${clientContextNote}
 
 Responde SOLO con las 3 opciones separadas por ||| sin números ni explicaciones.`;
 

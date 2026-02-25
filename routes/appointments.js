@@ -83,6 +83,17 @@ router.post('/api/appointments', authenticateToken, async (req, res) => {
       console.error('[appointments] push error', pushErr);
     }
 
+    // Insertar appointment_card en el chat para que aparezca en la conversación
+    try {
+      await pool.promise().query(
+        `INSERT INTO chat_messages (sender_id, receiver_id, property_id, message, message_type, shared_property_id)
+         VALUES (?, ?, ?, '', 'appointment_card', ?)`,
+        [requesterId, agentId, property_id, result.insertId]
+      );
+    } catch (chatErr) {
+      console.error('[appointments] chat message insert error', chatErr);
+    }
+
     res.status(201).json({
       ok: true,
       appointmentId: result.insertId,
@@ -239,6 +250,19 @@ router.post('/api/appointments/quick-invite', authenticateToken, async (req, res
       });
     } catch (pushErr) {
       console.error('[appointments/quick-invite] push error', pushErr);
+    }
+
+    // Insertar appointment_card en el chat (skip si el caller ya lo maneja via socket, ej. flujo IA)
+    if (!req.body.skip_chat_message) {
+      try {
+        await pool.promise().query(
+          `INSERT INTO chat_messages (sender_id, receiver_id, property_id, message, message_type, shared_property_id)
+           VALUES (?, ?, ?, '', 'appointment_card', ?)`,
+          [agentId, client_id, property_id, result.insertId]
+        );
+      } catch (chatErr) {
+        console.error('[appointments/quick-invite] chat message insert error', chatErr);
+      }
     }
 
     res.status(201).json({ ok: true, appointmentId: result.insertId, cancelledIds });
@@ -572,8 +596,8 @@ router.get('/api/appointments/next-available/:agentId', authenticateToken, async
 
     const now = new Date();
 
-    // Search today + next 7 days
-    for (let dayOffset = 0; dayOffset <= 7; dayOffset++) {
+    // Search from tomorrow + next 7 days (avoid proposing same-day appointments)
+    for (let dayOffset = 1; dayOffset <= 7; dayOffset++) {
       const d = new Date(now);
       d.setDate(d.getDate() + dayOffset);
       const dateStr = d.toISOString().split('T')[0];
@@ -584,15 +608,7 @@ router.get('/api/appointments/next-available/:agentId', authenticateToken, async
       );
       const bookedSet = new Set(booked.map(r => r.appointment_time));
 
-      // Determine starting hour: if today, skip past hours
-      let startH = wsH;
-      if (dayOffset === 0) {
-        const currentHour = now.getHours();
-        // Start from the next full hour if current hour is within work hours
-        startH = Math.max(wsH, currentHour + 1);
-      }
-
-      for (let h = startH; h * 60 < workEndMin; h++) {
+      for (let h = wsH; h * 60 < workEndMin; h++) {
         const t = `${String(h).padStart(2, '0')}:00:00`;
         if (!bookedSet.has(t)) {
           return res.json({ found: true, date: dateStr, time: t });
@@ -623,8 +639,13 @@ router.get('/api/appointments/available-slots/:agentId', authenticateToken, asyn
       [agentId]
     );
 
-    if (!agentRows.length || !agentRows[0].work_start || !agentRows[0].work_end) {
-      return res.json({ available_slots: [] });
+    if (!agentRows.length) {
+      return res.json({ available_slots: [], error: 'Agente no encontrado' });
+    }
+
+    if (!agentRows[0].work_start || !agentRows[0].work_end) {
+      console.warn(`[available-slots] agentId=${agentId} sin horario laboral configurado. work_start=${agentRows[0].work_start}, work_end=${agentRows[0].work_end}`);
+      return res.json({ available_slots: [], error: 'El agente no tiene horario laboral configurado' });
     }
 
     const { work_start, work_end } = agentRows[0];
