@@ -437,7 +437,8 @@ router.get('/auth/validate', authenticateToken, (req, res) => {
       work_end,
       agent_verification_status,
       agent_rejection_reason,
-      profile_photo
+      profile_photo,
+      calendar_sync_enabled
     FROM users
     WHERE id = ?
     LIMIT 1
@@ -462,6 +463,7 @@ router.get('/auth/validate', authenticateToken, (req, res) => {
       agent_verification_status: user.agent_verification_status ?? null,
       agent_rejection_reason: user.agent_rejection_reason ?? null,
       profile_photo: user.profile_photo ?? null,
+      calendar_sync_enabled: user.calendar_sync_enabled ?? 1,
     });
   });
 });

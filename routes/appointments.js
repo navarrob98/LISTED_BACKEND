@@ -4,6 +4,105 @@ const pool = require('../db/pool');
 const authenticateToken = require('../middleware/authenticateToken');
 const { sendPushToUser } = require('../utils/helpers');
 
+// Helper: convert "HH:MM:SS" → minutes since midnight
+function timeToMin(t) {
+  const [h, m] = String(t).split(':').map(Number);
+  return h * 60 + (m || 0);
+}
+
+// Helper: check if a slot overlaps with any calendar block
+function slotOverlapsCalBlocks(slotStartMin, slotEndMin, calBlocks) {
+  return calBlocks.some(b => {
+    if (b.is_all_day) return true;
+    const bStart = timeToMin(b.block_start);
+    const bEnd = timeToMin(b.block_end);
+    return bStart < slotEndMin && bEnd > slotStartMin;
+  });
+}
+
+// Helper: check if a specific time conflicts with calendar blocks
+async function hasCalendarConflict(agentId, date, time) {
+  const [blocks] = await pool.promise().query(
+    'SELECT block_start, block_end, is_all_day FROM agent_calendar_blocks WHERE agent_id = ? AND block_date = ?',
+    [agentId, date]
+  );
+  if (!blocks.length) return false;
+  const slotStart = timeToMin(time);
+  const slotEnd = slotStart + 60;
+  return slotOverlapsCalBlocks(slotStart, slotEnd, blocks);
+}
+
+// POST /api/calendar-sync — batch sync device calendar blocks (30 days)
+router.post('/api/calendar-sync', authenticateToken, async (req, res) => {
+  try {
+    const agentId = req.user.id;
+
+    // Verify user is an agent
+    const [userRows] = await pool.promise().query(
+      'SELECT agent_type FROM users WHERE id = ? LIMIT 1',
+      [agentId]
+    );
+    if (!userRows.length || !userRows[0].agent_type || userRows[0].agent_type === 'regular') {
+      return res.status(403).json({ error: 'Solo agentes pueden sincronizar calendario' });
+    }
+
+    const { blocks_by_date } = req.body;
+    if (!blocks_by_date || typeof blocks_by_date !== 'object') {
+      return res.status(400).json({ error: 'blocks_by_date es requerido' });
+    }
+
+    // Delete ALL blocks for this agent in the next 30 days (clean stale data)
+    await pool.promise().query(
+      'DELETE FROM agent_calendar_blocks WHERE agent_id = ? AND block_date >= CURDATE() AND block_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)',
+      [agentId]
+    );
+
+    // Insert new blocks
+    for (const [date, blocks] of Object.entries(blocks_by_date)) {
+      if (Array.isArray(blocks) && blocks.length) {
+        const values = blocks.map(b => [
+          agentId, date, b.start, b.end, b.is_all_day ? 1 : 0, b.device_event_id || null
+        ]);
+        await pool.promise().query(
+          'INSERT INTO agent_calendar_blocks (agent_id, block_date, block_start, block_end, is_all_day, device_event_id) VALUES ?',
+          [values]
+        );
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[POST /api/calendar-sync] error', e);
+    res.status(500).json({ error: 'Error al sincronizar calendario' });
+  }
+});
+
+// PUT /api/calendar-sync/toggle — enable/disable calendar sync
+router.put('/api/calendar-sync/toggle', authenticateToken, async (req, res) => {
+  try {
+    const agentId = req.user.id;
+    const { enabled } = req.body;
+
+    await pool.promise().query(
+      'UPDATE users SET calendar_sync_enabled = ? WHERE id = ?',
+      [enabled ? 1 : 0, agentId]
+    );
+
+    // If disabling, clear all calendar blocks
+    if (!enabled) {
+      await pool.promise().query(
+        'DELETE FROM agent_calendar_blocks WHERE agent_id = ?',
+        [agentId]
+      );
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[PUT /api/calendar-sync/toggle] error', e);
+    res.status(500).json({ error: 'Error al cambiar estado de sincronización' });
+  }
+});
+
 // POST /api/appointments
 router.post('/api/appointments', authenticateToken, async (req, res) => {
   try {
@@ -52,6 +151,11 @@ router.post('/api/appointments', authenticateToken, async (req, res) => {
 
     if (existing.length) {
       return res.status(409).json({ error: 'Ya tienes una cita agendada para este horario' });
+    }
+
+    // Verificar conflicto con calendario del agente
+    if (await hasCalendarConflict(agentId, appointment_date, appointment_time)) {
+      return res.status(409).json({ error: 'El agente tiene un compromiso en su calendario personal en ese horario' });
     }
 
     // Crear la cita
@@ -221,6 +325,11 @@ router.post('/api/appointments/quick-invite', authenticateToken, async (req, res
           if (suggested) break;
         }
         return res.status(409).json({ error: 'Ese horario ya está ocupado', code: 'SLOT_TAKEN', suggested, cancelledIds });
+      }
+
+      // Verificar conflicto con calendario del agente
+      if (await hasCalendarConflict(agentId, appointment_date, appointment_time)) {
+        return res.status(409).json({ error: 'Tienes un compromiso en tu calendario personal en ese horario', code: 'CALENDAR_BLOCKED', cancelledIds });
       }
     }
 
@@ -576,41 +685,70 @@ router.put('/api/appointments/:id/complete', authenticateToken, async (req, res)
   }
 });
 
-// GET /api/appointments/next-available/:agentId — find the nearest open slot from now
-router.get('/api/appointments/next-available/:agentId', authenticateToken, async (req, res) => {
+// GET /api/appointments/next-available/:agentId — find the nearest open slot
+// Query: ?client_id=N (optional) — also excludes client's booked appointments
+// El backend determina quién es agente a partir de agent_type + work_start/work_end.
+router.get('/api/appointments/next-available/:id1', authenticateToken, async (req, res) => {
   try {
-    const { agentId } = req.params;
+    const id1 = req.params.id1;
+    const id2 = req.query.client_id;
 
-    const [agentRows] = await pool.promise().query(
-      'SELECT work_start, work_end FROM users WHERE id = ? LIMIT 1',
-      [agentId]
+    // Obtener datos de ambos usuarios
+    const userIds = id2 ? [id1, id2] : [id1];
+    const [userRows] = await pool.promise().query(
+      'SELECT id, work_start, work_end, agent_type FROM users WHERE id IN (?)',
+      [userIds]
     );
-    if (!agentRows.length || !agentRows[0].work_start || !agentRows[0].work_end) {
-      return res.json({ found: false });
-    }
 
-    const { work_start, work_end } = agentRows[0];
+    if (!userRows.length) return res.json({ found: false });
+
+    // Determinar quién es el agente (tiene horario)
+    const agentRow = userRows.find(u => u.agent_type && u.agent_type !== 'regular' && u.work_start && u.work_end);
+    const clientRow = userRows.find(u => !u.agent_type || u.agent_type === 'regular' || !u.work_start);
+
+    if (!agentRow) return res.json({ found: false });
+
+    const agentId = agentRow.id;
+    const clientId = clientRow ? clientRow.id : null;
+    const { work_start, work_end } = agentRow;
     const [wsH] = work_start.split(':').map(Number);
     const [weH, weM] = work_end.split(':').map(Number);
     const workEndMin = weH * 60 + (weM || 0);
 
     const now = new Date();
 
-    // Search from tomorrow + next 7 days (avoid proposing same-day appointments)
     for (let dayOffset = 1; dayOffset <= 7; dayOffset++) {
       const d = new Date(now);
       d.setDate(d.getDate() + dayOffset);
       const dateStr = d.toISOString().split('T')[0];
 
+      // Citas del agente
       const [booked] = await pool.promise().query(
         `SELECT appointment_time FROM appointments WHERE agent_id = ? AND appointment_date = ? AND status IN ('pending','confirmed')`,
         [agentId, dateStr]
       );
-      const bookedSet = new Set(booked.map(r => r.appointment_time));
+      const agentBookedSet = new Set(booked.map(r => r.appointment_time));
+
+      // Citas del cliente (regular — solo citas existentes, sin horario)
+      const clientBookedSet = new Set();
+      if (clientId) {
+        const [clientBooked] = await pool.promise().query(
+          `SELECT appointment_time FROM appointments WHERE (requester_id = ? OR agent_id = ?) AND appointment_date = ? AND status IN ('pending','confirmed')`,
+          [clientId, clientId, dateStr]
+        );
+        clientBooked.forEach(r => clientBookedSet.add(r.appointment_time));
+      }
+
+      // Bloqueos de calendario del agente
+      const [calBlocks] = await pool.promise().query(
+        'SELECT block_start, block_end, is_all_day FROM agent_calendar_blocks WHERE agent_id = ? AND block_date = ?',
+        [agentId, dateStr]
+      );
 
       for (let h = wsH; h * 60 < workEndMin; h++) {
         const t = `${String(h).padStart(2, '0')}:00:00`;
-        if (!bookedSet.has(t)) {
+        const isCalBlocked = slotOverlapsCalBlocks(h * 60, (h + 1) * 60, calBlocks);
+        if (!agentBookedSet.has(t) && !clientBookedSet.has(t) && !isCalBlocked) {
           return res.json({ found: true, date: dateStr, time: t });
         }
       }
@@ -623,63 +761,105 @@ router.get('/api/appointments/next-available/:agentId', authenticateToken, async
   }
 });
 
-// GET /api/appointments/available-slots/:agentId
-router.get('/api/appointments/available-slots/:agentId', authenticateToken, async (req, res) => {
+// GET /api/appointments/available-slots
+// Query: ?date=YYYY-MM-DD&user1=ID&user2=ID
+//
+// El backend determina quién es agente y quién es regular a partir de agent_type.
+//   - Agente (individual/brokerage/seller): tiene work_start/work_end → genera rango de slots.
+//     Se excluyen sus citas y bloqueos de calendario.
+//   - Regular: NO tiene horario. Solo se consultan sus citas existentes
+//     para no proponer un horario donde ya tenga cita con otro agente/propiedad.
+//   - Un slot es "available" solo si NINGUNO de los dos tiene cita a esa hora.
+//
+// Fallback: también acepta /:agentId legacy (param) + client_id query.
+// Lógica compartida para available-slots
+async function handleAvailableSlots(req, res) {
   try {
-    const { agentId } = req.params;
     const { date } = req.query;
-
     if (!date) {
       return res.status(400).json({ error: 'Falta el parámetro date (YYYY-MM-DD)' });
     }
 
-    // Obtener horario laboral del agente
-    const [agentRows] = await pool.promise().query(
-      'SELECT work_start, work_end FROM users WHERE id = ? LIMIT 1',
-      [agentId]
+    // Resolver ambos user IDs (nuevo: user1/user2 — legacy: :agentId + client_id)
+    let id1 = req.query.user1 || req.params.agentId;
+    let id2 = req.query.user2 || req.query.client_id;
+
+    console.log('[available-slots] id1=%s id2=%s params=%j query=%j', id1, id2, req.params, { user1: req.query.user1, user2: req.query.user2, client_id: req.query.client_id, date: req.query.date });
+
+    if (!id1) {
+      return res.status(400).json({ error: 'Falta al menos un usuario' });
+    }
+
+    // ── 1. Obtener datos de ambos usuarios ──
+    const userIds = id2 ? [id1, id2] : [id1];
+    const [userRows] = await pool.promise().query(
+      'SELECT id, work_start, work_end, agent_type FROM users WHERE id IN (?)',
+      [userIds]
     );
 
-    if (!agentRows.length) {
-      return res.json({ available_slots: [], error: 'Agente no encontrado' });
+    console.log('[available-slots] userRows=%j', userRows.map(u => ({ id: u.id, agent_type: u.agent_type, work_start: u.work_start, work_end: u.work_end })));
+
+    if (!userRows.length) {
+      return res.json({ available_slots: [], error: 'Usuario no encontrado' });
     }
 
-    if (!agentRows[0].work_start || !agentRows[0].work_end) {
-      console.warn(`[available-slots] agentId=${agentId} sin horario laboral configurado. work_start=${agentRows[0].work_start}, work_end=${agentRows[0].work_end}`);
-      return res.json({ available_slots: [], error: 'El agente no tiene horario laboral configurado' });
+    // Determinar quién es el agente (tiene horario) y quién es el cliente (regular)
+    const agentRow = userRows.find(u => u.agent_type && u.agent_type !== 'regular' && u.work_start && u.work_end);
+    const clientRow = userRows.find(u => !u.agent_type || u.agent_type === 'regular' || !u.work_start);
+
+    console.log('[available-slots] agentRow=%s clientRow=%s', agentRow?.id ?? 'NONE', clientRow?.id ?? 'NONE');
+
+    if (!agentRow) {
+      return res.json({ available_slots: [], error: 'Ninguno de los usuarios tiene horario laboral configurado' });
     }
 
-    const { work_start, work_end } = agentRows[0];
+    const agentId = agentRow.id;
+    const clientId = clientRow ? clientRow.id : null;
+    const { work_start, work_end } = agentRow;
 
-    // Obtener citas ya agendadas para ese día
-    const [bookedSlots] = await pool.promise().query(
-      `SELECT appointment_time
-       FROM appointments
-       WHERE agent_id = ?
-         AND appointment_date = ?
-         AND status IN ('pending', 'confirmed')`,
+    // ── 2. Citas del agente para ese día ──
+    const [agentBooked] = await pool.promise().query(
+      `SELECT appointment_time FROM appointments
+       WHERE agent_id = ? AND appointment_date = ? AND status IN ('pending', 'confirmed')`,
+      [agentId, date]
+    );
+    const agentBookedTimes = new Set(agentBooked.map(r => r.appointment_time));
+
+    // ── 3. Citas del cliente para ese día (sin horario, solo citas existentes) ──
+    const clientBookedTimes = new Set();
+    if (clientId) {
+      const [clientBooked] = await pool.promise().query(
+        `SELECT appointment_time FROM appointments
+         WHERE (requester_id = ? OR agent_id = ?)
+           AND appointment_date = ? AND status IN ('pending', 'confirmed')`,
+        [clientId, clientId, date]
+      );
+      clientBooked.forEach(r => clientBookedTimes.add(r.appointment_time));
+    }
+
+    // ── 4. Bloqueos de calendario del agente ──
+    const [calBlocks] = await pool.promise().query(
+      'SELECT block_start, block_end, is_all_day FROM agent_calendar_blocks WHERE agent_id = ? AND block_date = ?',
       [agentId, date]
     );
 
-    const bookedTimes = bookedSlots.map(row => row.appointment_time);
-
-    // Generar slots de 1 hora
+    // ── 5. Generar slots de 1 hora dentro del horario del agente ──
     const slots = [];
-    const [startHour, startMin] = work_start.split(':').map(Number);
+    const [startHour] = work_start.split(':').map(Number);
     const [endHour, endMin] = work_end.split(':').map(Number);
+    const endTime = endHour * 60 + (endMin || 0);
 
-    let currentHour = startHour;
-    const endTime = endHour * 60 + endMin;
-
-    while ((currentHour * 60) < endTime) {
-      const timeStr = `${String(currentHour).padStart(2, '0')}:00:00`;
-      const isBooked = bookedTimes.some(t => t.startsWith(`${String(currentHour).padStart(2, '0')}:`));
+    for (let h = startHour; h * 60 < endTime; h++) {
+      const timeStr = `${String(h).padStart(2, '0')}:00:00`;
+      const hourPrefix = `${String(h).padStart(2, '0')}:`;
+      const isAgentBusy = [...agentBookedTimes].some(t => t.startsWith(hourPrefix));
+      const isClientBusy = [...clientBookedTimes].some(t => t.startsWith(hourPrefix));
+      const isCalBlocked = slotOverlapsCalBlocks(h * 60, (h + 1) * 60, calBlocks);
 
       slots.push({
         time: timeStr,
-        available: !isBooked
+        available: !isAgentBusy && !isClientBusy && !isCalBlocked,
       });
-
-      currentHour++;
     }
 
     res.json({ available_slots: slots, work_start, work_end });
@@ -687,7 +867,11 @@ router.get('/api/appointments/available-slots/:agentId', authenticateToken, asyn
     console.error('[GET /api/appointments/available-slots] error', e);
     res.status(500).json({ error: 'Error al obtener horarios disponibles' });
   }
-});
+}
+
+// Dos rutas: con y sin :agentId (legacy + nuevo)
+router.get('/api/appointments/available-slots/:agentId', authenticateToken, handleAvailableSlots);
+router.get('/api/appointments/available-slots', authenticateToken, handleAvailableSlots);
 
 // PUT /api/appointments/:id/reschedule
 router.put('/api/appointments/:id/reschedule', authenticateToken, async (req, res) => {
@@ -741,6 +925,11 @@ router.put('/api/appointments/:id/reschedule', authenticateToken, async (req, re
 
     if (existing.length) {
       return res.status(409).json({ error: 'Ese horario ya está ocupado' });
+    }
+
+    // Verificar conflicto con calendario del agente
+    if (await hasCalendarConflict(appointment.agent_id, appointment_date, appointment_time)) {
+      return res.status(409).json({ error: 'El agente tiene un compromiso en su calendario personal en ese horario' });
     }
 
     // Actualizar la cita y resetear a pending si estaba confirmada
