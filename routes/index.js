@@ -20,4 +20,5 @@ module.exports = function registerRoutes(app) {
   app.use('/', require('./ai'));
   app.use('/', require('./leads'));
   app.use('/', require('./savedSearches'));
+  app.use('/', require('./findAgent'));
 };

@@ -335,8 +335,8 @@ router.put('/properties/:id', authenticateToken, (req, res) => {
   }
 
   // Verifica dueño
-  const checkOwnerSql = `SELECT id FROM properties WHERE id = ? AND created_by = ?`;
-  pool.query(checkOwnerSql, [id, req.user.id], (chkErr, chkRows) => {
+  const checkOwnerSql = `SELECT id FROM properties WHERE id = ? AND (created_by = ? OR managed_by = ?)`;
+  pool.query(checkOwnerSql, [id, req.user.id, req.user.id], (chkErr, chkRows) => {
     if (chkErr)   return res.status(500).json({ error: 'Error de permisos' });
     if (!chkRows || chkRows.length === 0) return res.status(403).json({ error: 'No autorizado' });
 
@@ -386,17 +386,17 @@ router.put('/properties/:id', authenticateToken, (req, res) => {
           sql = `
             UPDATE properties
             SET ${setFragments.join(', ')}${setFragments.length ? ',' : ''} ${priceBlock}
-            WHERE id = ? AND created_by = ?
+            WHERE id = ? AND (created_by = ? OR managed_by = ?)
           `;
-          params = [...values, newPrice, id, req.user.id];
+          params = [...values, newPrice, id, req.user.id, req.user.id];
         } else {
           // Update normal sin precio
           sql = `
             UPDATE properties
             SET ${setFragments.join(', ')}
-            WHERE id = ? AND created_by = ?
+            WHERE id = ? AND (created_by = ? OR managed_by = ?)
           `;
-          params = [...values, id, req.user.id];
+          params = [...values, id, req.user.id, req.user.id];
         }
 
         pool.query(sql, params, (err, result) => {
@@ -495,6 +495,43 @@ router.get('/properties', (req, res) => {
   });
 });
 
+// GET /properties/:id/chat — property info for chat context (includes unpublished/prospect)
+router.get('/properties/:id/chat', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+
+  const sql = `
+    SELECT
+      p.*,
+      u.name AS owner_name,
+      u.last_name AS owner_last_name
+    FROM properties p
+    JOIN users u ON p.created_by = u.id
+    WHERE p.id = ?
+      AND (
+        p.created_by = ?
+        OR p.managed_by = ?
+        OR EXISTS (SELECT 1 FROM chat_messages cm WHERE cm.property_id = p.id AND (cm.sender_id = ? OR cm.receiver_id = ?))
+      )
+    LIMIT 1
+  `;
+
+  pool.query(sql, [id, userId, userId, userId, userId], (err, rows) => {
+    if (err) return res.status(500).json({ error: 'Error al buscar la propiedad' });
+    if (!rows.length) return res.status(404).json({ error: 'No encontrada' });
+
+    const property = rows[0];
+    pool.query(
+      `SELECT image_url FROM property_images WHERE property_id = ? ORDER BY id ASC`,
+      [id],
+      (imgErr, imgRows = []) => {
+        if (imgErr) return res.json({ ...property, images: [] });
+        res.json({ ...property, images: imgRows.map(r => r.image_url) });
+      }
+    );
+  });
+});
+
 // GET /properties/:id
 router.get('/properties/:id', (req, res) => {
   const { id } = req.params;
@@ -551,13 +588,13 @@ router.get('/my-properties', authenticateToken, (req, res) => {
         ELSE ROUND(((p.price_original - p.price) / p.price_original) * 100, 1)
       END AS discount_percent
     FROM properties p
-    WHERE p.created_by = ?
+    WHERE (p.created_by = ? OR p.managed_by = ?)
     ORDER BY
       (p.promoted_until IS NOT NULL AND p.promoted_until > NOW()) DESC,
       p.id DESC
   `;
 
-  pool.query(query, [userId], (err, results) => {
+  pool.query(query, [userId, userId], (err, results) => {
     if (err) {
       console.error('Error getting user properties:', err);
       return res.status(500).json({ error: 'Error al obtener tus propiedades.' });
@@ -575,6 +612,7 @@ router.get('/my-properties/:id', authenticateToken, (req, res) => {
     SELECT
       p.*,
       COALESCE(img.images, JSON_ARRAY()) AS images,
+      u.name AS owner_name, u.last_name AS owner_last_name,
       CASE
         WHEN p.price_original IS NULL OR p.price_original <= 0 OR p.price >= p.price_original THEN 0
         ELSE ROUND(((p.price_original - p.price) / p.price_original) * 100, 1)
@@ -593,12 +631,18 @@ router.get('/my-properties/:id', authenticateToken, (req, res) => {
       FROM property_images
       GROUP BY property_id
     ) img ON img.property_id = p.id
+    JOIN users u ON u.id = p.created_by
     WHERE p.id = ?
-      AND p.created_by = ?
+      AND (
+        p.created_by = ?
+        OR (p.review_status = 'prospect' AND EXISTS (
+          SELECT 1 FROM owner_agent_contacts c WHERE c.user_id = p.created_by AND c.agent_id = ?
+        ))
+      )
     LIMIT 1
   `;
 
-  pool.query(sql, [propertyId, userId], (err, rows) => {
+  pool.query(sql, [propertyId, userId, userId], (err, rows) => {
     if (err) {
       console.error('[GET /my-properties/:id] error', err);
       return res.status(500).json({ error: 'Error consultando propiedad' });

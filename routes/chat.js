@@ -262,6 +262,8 @@ router.get('/api/chat/my-chats', authenticateToken, (req, res) => {
       p.price        AS property_price,
       p.monthly_pay  AS property_monthly_pay,
       p.type         AS property_type,
+      p.review_status AS property_review_status,
+      p.created_by   AS property_created_by,
       (SELECT pi.image_url FROM property_images pi
        WHERE pi.property_id = t.property_id
        ORDER BY pi.id ASC LIMIT 1) AS property_cover_photo,

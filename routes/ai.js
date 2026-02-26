@@ -639,18 +639,6 @@ Reglas de formato:
       await q('INSERT INTO ai_conversations (user_id, role, message) VALUES (?, ?, ?)',
         [userId, 'assistant', reply]);
 
-      // Auto-clean: keep only last 50 messages per user
-      try {
-        const countResult = await q('SELECT COUNT(*) as cnt FROM ai_conversations WHERE user_id = ?', [userId]);
-        if (countResult[0]?.cnt > 50) {
-          await q(
-            `DELETE FROM ai_conversations WHERE user_id = ? AND id NOT IN (
-              SELECT id FROM (SELECT id FROM ai_conversations WHERE user_id = ? ORDER BY created_at DESC LIMIT 50) AS recent
-            )`,
-            [userId, userId]
-          );
-        }
-      } catch { /* non-critical cleanup */ }
     }
 
     return res.json({ ok: true, reply });
@@ -743,13 +731,33 @@ router.get('/api/ai/assistant/history', optionalAuth, async (req, res) => {
     if (!userId) return res.json({ ok: true, messages: [] });
 
     const rows = await q(
-      'SELECT role, message, created_at FROM ai_conversations WHERE user_id = ? ORDER BY created_at ASC LIMIT 50',
+      'SELECT role, message, created_at FROM ai_conversations WHERE user_id = ? ORDER BY created_at ASC LIMIT 15',
       [userId]
     );
     return res.json({ ok: true, messages: rows });
   } catch (err) {
     console.error('[ai:history]', err.message);
     return res.json({ ok: true, messages: [] });
+  }
+});
+
+// ── Cleanup: keep last 15 messages (called when user leaves chat) ────────────
+router.post('/api/ai/assistant/cleanup', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const countResult = await q('SELECT COUNT(*) as cnt FROM ai_conversations WHERE user_id = ?', [userId]);
+    if (countResult[0]?.cnt > 15) {
+      await q(
+        `DELETE FROM ai_conversations WHERE user_id = ? AND id NOT IN (
+          SELECT id FROM (SELECT id FROM ai_conversations WHERE user_id = ? ORDER BY created_at DESC LIMIT 15) AS recent
+        )`,
+        [userId, userId]
+      );
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[ai:cleanup]', err.message);
+    return res.json({ ok: true });
   }
 });
 
