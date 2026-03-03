@@ -72,6 +72,15 @@ const resetPasswordIpLimiter = rateLimit({
   handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
 });
 
+const validateResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:valreset:' }),
+  handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
+});
+
 const googleClient = new OAuth2Client();
 
 // POST /users/register
@@ -81,7 +90,7 @@ router.post('/users/register', registerIpLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Faltan datos obligatorios.' });
   }
   try {
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const hashedPassword = await bcrypt.hash(password, 12);
 
     // IMPORTANTE: incluye columnas que tu tabla exige o que son NOT NULL
     const sql = `
@@ -343,7 +352,7 @@ router.post('/auth/google', googleAuthIpLimiter, async (req, res) => {
       });
     } catch (verifyErr) {
       console.error('[auth/google] verifyIdToken failed:', verifyErr.message);
-      return res.status(401).json({ error: 'Token de Google inválido', detail: verifyErr.message });
+      return res.status(401).json({ error: 'Token de Google inválido' });
     }
     const payload = ticket.getPayload();
     if (!payload) return res.status(401).json({ error: 'Token inválido: payload vacío' });
@@ -382,7 +391,7 @@ router.post('/auth/google', googleAuthIpLimiter, async (req, res) => {
       } else {
         // Crear usuario nuevo (password aleatoria encriptada)
         const randomPass = crypto.randomBytes(18).toString('hex');
-        const hashed = await bcrypt.hash(randomPass, 10);
+        const hashed = await bcrypt.hash(randomPass, 12);
 
         const insSql = `
         INSERT INTO users (name, last_name, email, password, agent_type, email_verified, work_start, work_end)
@@ -553,7 +562,7 @@ router.post('/auth/reset-password', resetPasswordIpLimiter, async (req, res) => 
     }
 
     // Hash password
-    const hashed = await bcrypt.hash(newPassword, 10);
+    const hashed = await bcrypt.hash(newPassword, 12);
 
     // Transacción: marcar usado + cambiar password
     const cxn = await pool.promise().getConnection();
@@ -651,7 +660,7 @@ router.post('/auth/logout', async (req, res) => {
 });
 
 // POST /auth/reset-password/validate
-router.post('/auth/reset-password/validate', async (req, res) => {
+router.post('/auth/reset-password/validate', validateResetLimiter, async (req, res) => {
   try {
     const token = String(req.body?.token || '').trim();
     if (!token) return res.status(400).json({ valid: false });

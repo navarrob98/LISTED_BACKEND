@@ -23,7 +23,7 @@ function slotOverlapsCalBlocks(slotStartMin, slotEndMin, calBlocks) {
 // Helper: check if a specific time conflicts with calendar blocks
 async function hasCalendarConflict(agentId, date, time) {
   const [blocks] = await pool.promise().query(
-    'SELECT block_start, block_end, is_all_day FROM agent_calendar_blocks WHERE agent_id = ? AND block_date = ?',
+    'SELECT block_start, block_end, is_all_day FROM agent_calendar_blocks WHERE agent_id = ? AND block_date = ? AND is_available = 0',
     [agentId, date]
   );
   if (!blocks.length) return false;
@@ -51,22 +51,45 @@ router.post('/api/calendar-sync', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'blocks_by_date es requerido' });
     }
 
-    // Delete ALL blocks for this agent in the next 30 days (clean stale data)
-    await pool.promise().query(
-      'DELETE FROM agent_calendar_blocks WHERE agent_id = ? AND block_date >= CURDATE() AND block_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)',
+    // 1. Get existing device_event_ids for this agent (cast to string for safe comparison)
+    const [existing] = await pool.promise().query(
+      'SELECT DISTINCT device_event_id FROM agent_calendar_blocks WHERE agent_id = ?',
       [agentId]
     );
+    const existingIds = new Set(existing.map(r => String(r.device_event_id)).filter(id => id && id !== 'null'));
 
-    // Insert new blocks
+    // 2. Collect all incoming device_event_ids (as strings)
+    const incomingIds = new Set();
+    for (const blocks of Object.values(blocks_by_date)) {
+      if (Array.isArray(blocks)) {
+        for (const b of blocks) {
+          if (b.device_event_id) incomingIds.add(String(b.device_event_id));
+        }
+      }
+    }
+
+    // 3. Delete blocks for events removed from device calendar
+    const toDelete = [...existingIds].filter(id => !incomingIds.has(id));
+    if (toDelete.length) {
+      await pool.promise().query(
+        'DELETE FROM agent_calendar_blocks WHERE agent_id = ? AND device_event_id IN (?)',
+        [agentId, toDelete]
+      );
+    }
+
+    // 4. Insert only blocks for NEW events (skip existing device_event_ids)
     for (const [date, blocks] of Object.entries(blocks_by_date)) {
       if (Array.isArray(blocks) && blocks.length) {
-        const values = blocks.map(b => [
-          agentId, date, b.start, b.end, b.is_all_day ? 1 : 0, b.device_event_id || null
-        ]);
-        await pool.promise().query(
-          'INSERT INTO agent_calendar_blocks (agent_id, block_date, block_start, block_end, is_all_day, device_event_id) VALUES ?',
-          [values]
-        );
+        const newBlocks = blocks.filter(b => !existingIds.has(String(b.device_event_id)));
+        if (newBlocks.length) {
+          const values = newBlocks.map(b => [
+            agentId, date, b.start, b.end, b.is_all_day ? 1 : 0, b.device_event_id || null
+          ]);
+          await pool.promise().query(
+            'INSERT INTO agent_calendar_blocks (agent_id, block_date, block_start, block_end, is_all_day, device_event_id) VALUES ?',
+            [values]
+          );
+        }
       }
     }
 
@@ -100,6 +123,52 @@ router.put('/api/calendar-sync/toggle', authenticateToken, async (req, res) => {
   } catch (e) {
     console.error('[PUT /api/calendar-sync/toggle] error', e);
     res.status(500).json({ error: 'Error al cambiar estado de sincronización' });
+  }
+});
+
+// GET /api/calendar-blocks — return synced calendar blocks for a date range
+router.get('/api/calendar-blocks', authenticateToken, async (req, res) => {
+  try {
+    const agentId = req.user.id;
+    const { from, to } = req.query;
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Parámetros from y to son requeridos (YYYY-MM-DD)' });
+    }
+    const [blocks] = await pool.promise().query(
+      'SELECT id, block_date, block_start, block_end, is_all_day, is_available FROM agent_calendar_blocks WHERE agent_id = ? AND block_date BETWEEN ? AND ?',
+      [agentId, from, to]
+    );
+    res.json({ blocks });
+  } catch (e) {
+    console.error('[GET /api/calendar-blocks] error', e);
+    res.status(500).json({ error: 'Error al obtener bloques de calendario' });
+  }
+});
+
+// PUT /api/calendar-blocks/:id/toggle-available — toggle block availability
+router.put('/api/calendar-blocks/:id/toggle-available', authenticateToken, async (req, res) => {
+  try {
+    const blockId = req.params.id;
+    const agentId = req.user.id;
+
+    const [result] = await pool.promise().query(
+      'UPDATE agent_calendar_blocks SET is_available = NOT is_available WHERE id = ? AND agent_id = ?',
+      [blockId, agentId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Bloque no encontrado o no te pertenece' });
+    }
+
+    const [rows] = await pool.promise().query(
+      'SELECT is_available FROM agent_calendar_blocks WHERE id = ?',
+      [blockId]
+    );
+
+    res.json({ ok: true, is_available: rows[0].is_available });
+  } catch (e) {
+    console.error('[PUT /api/calendar-blocks/:id/toggle-available] error', e);
+    res.status(500).json({ error: 'Error al cambiar disponibilidad del bloque' });
   }
 });
 
@@ -739,9 +808,9 @@ router.get('/api/appointments/next-available/:id1', authenticateToken, async (re
         clientBooked.forEach(r => clientBookedSet.add(r.appointment_time));
       }
 
-      // Bloqueos de calendario del agente
+      // Bloqueos de calendario del agente (solo los que bloquean)
       const [calBlocks] = await pool.promise().query(
-        'SELECT block_start, block_end, is_all_day FROM agent_calendar_blocks WHERE agent_id = ? AND block_date = ?',
+        'SELECT block_start, block_end, is_all_day FROM agent_calendar_blocks WHERE agent_id = ? AND block_date = ? AND is_available = 0',
         [agentId, dateStr]
       );
 
@@ -837,9 +906,9 @@ async function handleAvailableSlots(req, res) {
       clientBooked.forEach(r => clientBookedTimes.add(r.appointment_time));
     }
 
-    // ── 4. Bloqueos de calendario del agente ──
+    // ── 4. Bloqueos de calendario del agente (solo los que bloquean) ──
     const [calBlocks] = await pool.promise().query(
-      'SELECT block_start, block_end, is_all_day FROM agent_calendar_blocks WHERE agent_id = ? AND block_date = ?',
+      'SELECT block_start, block_end, is_all_day FROM agent_calendar_blocks WHERE agent_id = ? AND block_date = ? AND is_available = 0',
       [agentId, date]
     );
 

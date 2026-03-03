@@ -108,9 +108,9 @@ async function callGemini(systemPrompt, userPrompt) {
     generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
   };
 
-  const res = await fetchWithTimeout(`${GEMINI_URL}?key=${key}`, {
+  const res = await fetchWithTimeout(GEMINI_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
     body: JSON.stringify(body),
   });
 
@@ -231,9 +231,9 @@ async function callGeminiMessages(systemPrompt, messages) {
     generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
   };
 
-  const res = await fetchWithTimeout(`${GEMINI_URL}?key=${key}`, {
+  const res = await fetchWithTimeout(GEMINI_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
     body: JSON.stringify(body),
   });
 

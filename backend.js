@@ -4,6 +4,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 
 const pool = require('./db/pool');
@@ -17,13 +18,21 @@ const app = express();
 app.set('trust proxy', 1);
 const port = process.env.PORT || 3001;
 
+// ── Security headers ─────────────────────────────────
+app.use(helmet());
+
 // ── CORS ──────────────────────────────────────────────
-const allowedOrigins = [
-  'https://listed.com.mx',
-  'https://www.listed.com.mx',
-  'http://localhost:19006',
-  'http://localhost:3000',
-];
+const allowedOrigins = process.env.NODE_ENV === 'production'
+  ? [
+      'https://listed.com.mx',
+      'https://www.listed.com.mx',
+    ]
+  : [
+      'https://listed.com.mx',
+      'https://www.listed.com.mx',
+      'http://localhost:19006',
+      'http://localhost:3000',
+    ];
 
 app.use(cors({
   origin: function(origin, cb) {
@@ -54,7 +63,7 @@ pool.getConnection((err, connection) => {
 
 // ── HTTP + Socket.io ──────────────────────────────────
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, { cors: { origin: allowedOrigins, methods: ['GET', 'POST'] } });
 
 // ── Socket.io Redis adapter (multi-worker pub/sub) ──
 const pubClient = redis.duplicate();
@@ -65,7 +74,7 @@ io.adapter(createAdapter(pubClient, subClient));
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
   if (!token) return next(new Error('auth_required'));
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+  jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] }, (err, decoded) => {
     if (err) return next(new Error('invalid_token'));
     socket.data.userId = String(decoded.id);
     socket.data.user = decoded;

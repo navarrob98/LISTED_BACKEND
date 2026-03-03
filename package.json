@@ -21,6 +21,7 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
     "google-auth-library": "^10.2.1",
+    "helmet": "^8.1.0",
     "ioredis": "^5.9.3",
     "jsonwebtoken": "^9.0.2",
     "mysql2": "^3.14.1",

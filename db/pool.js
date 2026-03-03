@@ -13,6 +13,7 @@ const pool = mysql.createPool({
   enableKeepAlive: true,
   keepAliveInitialDelay: 30000,
   connectTimeout: 10000,
+  ssl: process.env.MYSQL_SSL === 'false' ? undefined : { rejectUnauthorized: false },
 });
 
 module.exports = pool;

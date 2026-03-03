@@ -12,9 +12,16 @@ const { q } = require('../utils/helpers');
 
 // GET /users/:id
 router.get('/users/:id', authenticateToken, (req, res) => {
-  const { id } = req.params;
+  const id = Number(req.params.id);
+  const isOwner = id === req.user.id;
+
+  // Owner gets full profile, others get limited public info
+  const fields = isOwner
+    ? 'id, name, last_name, email, phone, profile_photo'
+    : 'id, name, last_name, profile_photo';
+
   pool.query(
-    'SELECT id, name, last_name, email, profile_photo FROM users WHERE id = ? LIMIT 1',
+    `SELECT ${fields} FROM users WHERE id = ? LIMIT 1`,
     [id],
     (err, results) => {
       if (err) return res.status(500).json({ error: 'Error buscando usuario' });
@@ -69,8 +76,8 @@ router.put('/users/:id', authenticateToken, async (req, res) => {
   if (phone !== undefined) { updates.push('phone = ?'); values.push(phone || null); }
 
   if (password !== undefined) {
-    if (String(password).length < 6) return res.status(400).json({ error: 'Contraseña muy corta' });
-    const hashedPassword = bcrypt.hashSync(String(password), 10);
+    if (String(password).length < 8) return res.status(400).json({ error: 'Contraseña debe tener al menos 8 caracteres' });
+    const hashedPassword = bcrypt.hashSync(String(password), 12);
     updates.push('password = ?');
     values.push(hashedPassword);
   }
@@ -114,7 +121,7 @@ router.put('/users/:id', authenticateToken, async (req, res) => {
 });
 
 // GET /users/:id/profile-photo
-router.get('/users/:id/profile-photo', async (req, res) => {
+router.get('/users/:id/profile-photo', authenticateToken, async (req, res) => {
   try {
     const userId = req.params.id;
 

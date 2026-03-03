@@ -90,7 +90,7 @@ router.post('/agents/register', async (req, res) => {
   }
 
   try {
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const hashedPassword = await bcrypt.hash(password, 12);
     const minutes = Number(process.env.VERIFICATION_MINUTES || 15);
     const code = gen6();                                // 6 dígitos
     const expires = new Date(Date.now() + minutes * 60 * 1000);

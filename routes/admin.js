@@ -67,8 +67,6 @@ router.post('/admin/agents/:id/approve', authenticateToken, requireAdmin, (req, 
       if (err) {
         console.error('[admin/agents/approve] SQL error', {
           code: err.code,
-          sqlMessage: err.sqlMessage,
-          sql: err.sql,
         });
         return res.status(500).json({ error: 'Error aprobando agente' });
       }

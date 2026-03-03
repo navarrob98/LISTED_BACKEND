@@ -55,10 +55,9 @@ module.exports = function initSockets(io, pool, helpers) {
 
       pool.query(sql, vals, async (err, result) => {
         if (err) {
-          console.error('[send_message] INSERT ERROR', { code: err.code, sqlMessage: err.sqlMessage });
+          console.error('[send_message] INSERT ERROR', { code: err.code });
           return;
         }
-        console.log('[send_message] inserted id:', result.insertId);
 
         const msgObj = {
           id: result.insertId,

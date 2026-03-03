@@ -89,7 +89,7 @@ function buildDeliveryUrlFromSecure(secureUrl, filename, ttlSeconds = 300) {
 
 function gen6() {
   // Código 6 dígitos
-  return String(Math.floor(100000 + Math.random() * 900000));
+  return String(crypto.randomInt(100000, 1000000));
 }
 
 async function sendVerificationEmail(to, code) {
@@ -202,7 +202,7 @@ async function sendPushToUser({ userId, title, body, data }) {
           return resolve(false);
         }
 
-        console.log('[push] tokens_for_user', userId, rows);
+        console.log('[push] tokens_for_user', userId, rows.length, 'tokens');
 
         const tokenRows = Array.isArray(rows) ? rows : [];
         const tokens = tokenRows
@@ -242,7 +242,7 @@ async function sendPushToUser({ userId, title, body, data }) {
             }
           }
 
-          console.log('[push] tickets', ticketMap.map((x) => x.ticket));
+          console.log('[push] tickets sent:', ticketMap.length);
 
           // Desactivar tokens inválidos (DeviceNotRegistered)
           const invalidTokenIds = ticketMap
@@ -256,7 +256,7 @@ async function sendPushToUser({ userId, title, body, data }) {
             [invalidTokenIds],
             (e2) => {
               if (e2) console.error('[push] deactivate invalid tokens error', e2);
-              else console.log('[push] deactivated token ids', invalidTokenIds);
+              else console.log('[push] deactivated', invalidTokenIds.length, 'invalid tokens');
               return resolve(true);
             }
           );
@@ -437,7 +437,8 @@ function createEmailCooldown({ windowMs = 30_000 } = {}) {
       if (exists) return res.status(429).json({ ok: true });
       await redis.set(key, '1', 'PX', windowMs);
     } catch (err) {
-      console.error('[emailCooldown] redis error, allowing request', err.message);
+      console.error('[emailCooldown] redis error');
+      return res.status(503).json({ error: 'Servicio temporalmente no disponible' });
     }
     return next();
   };
