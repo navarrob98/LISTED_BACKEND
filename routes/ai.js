@@ -398,7 +398,7 @@ router.post('/api/ai/smart-replies', authenticateToken, smartRepliesLimiter, asy
           appointmentNote = `\nESTADO DE CITAS PARA ESTA PROPIEDAD: Hay una propuesta de visita PENDIENTE de confirmar (${pending.appointment_date} a las ${String(pending.appointment_time).slice(0,5)}). NO propongas nueva cita. Puedes mencionar que la propuesta ya fue enviada y esta pendiente de confirmacion.`;
         }
       } else {
-        appointmentNote = '\nESTADO DE CITAS PARA ESTA PROPIEDAD: NO hay ninguna cita agendada ni propuesta. Si el cliente quiere vernos o visitar la propiedad, usa [CITA] para proponer una.';
+        appointmentNote = '\nESTADO DE CITAS PARA ESTA PROPIEDAD: No hay citas agendadas. Si el cliente pide explicitamente visitar o ver la propiedad en persona, puedes usar [CITA].';
       }
       // Override conversation stage with real DB appointment state
       if (appointments.find(a => a.status === 'confirmed')) conversationStage = 'cita_confirmada';
@@ -435,25 +435,28 @@ Genera 3 opciones de mensaje que el agente podría enviar. Reglas:
 - Entre 20 y 200 caracteres cada una
 - Español mexicano natural, profesional${firstReplyHint}
 
-DETECCION DE CITAS — Lee el contexto completo de la conversacion para determinar si el cliente quiere agendar.
+DETECCION DE CITAS — REGLA CRITICA: Por defecto NO uses [CITA]. Solo usalo en casos MUY claros.
 
 NUNCA uses tags de cita si el cliente:
 - Solo saluda ("hola", "buenas tardes", "como esta")
 - Pide informacion general ("me puede dar mas info", "cuanto cuesta", "tiene fotos")
-- Hace preguntas sobre la propiedad ("cuantos cuartos tiene", "incluye estacionamiento")
-- Dice algo ambiguo o conversacional
-- Apenas inicia la conversacion (primer o segundo mensaje)
+- Hace preguntas sobre la propiedad ("cuantos cuartos tiene", "incluye estacionamiento", "tiene alberca", "que amenidades tiene")
+- Dice algo ambiguo o conversacional ("me interesa", "se ve bien", "me gusta", "esta disponible?", "quiero info")
+- Apenas inicia la conversacion (primeros 4 mensajes del cliente)
+- Pregunta sobre ubicacion, precio, metraje, o cualquier caracteristica
+- Dice "quiero saber mas", "cuenteme mas", "que incluye"
+- NUNCA propongas cita por tu cuenta. Solo responde a la SOLICITUD EXPLICITA del cliente.
 
-USA [CITA] cuando:
-1. El cliente EXPLICITAMENTE dice que quiere VISITAR, IR, CONOCER EN PERSONA o VER FISICAMENTE la propiedad
-2. El AGENTE previamente ofrecio o pregunto si quiere agendar/visitar Y el cliente CONFIRMO positivamente (ej: "si", "claro", "si me gustaria", "dale", "va", "por supuesto", "si, cuando?")
+USA [CITA] UNICAMENTE cuando el cliente usa palabras como VISITAR, IR A VER, CONOCER EN PERSONA, AGENDAR VISITA, RECORRER, PASAR A VERLA:
+1. El cliente EXPLICITAMENTE dice que quiere VISITAR, IR, CONOCER EN PERSONA o VER FISICAMENTE la propiedad usando esas palabras exactas
+2. El AGENTE previamente ofrecio o pregunto si quiere agendar/visitar Y el cliente CONFIRMO con "si" o afirmacion clara
 
-IMPORTANTE: Si el agente pregunto "le gustaria agendar una visita?" y el cliente contesto "si" o cualquier afirmacion, eso ES una confirmacion de cita. NO vuelvas a preguntar, USA [CITA] directamente.
+SI TIENES DUDA, NO USES [CITA]. Es mejor NO proponer una cita que proponerla cuando no se pidio.
 
-Ejemplos que NO son cita: "me interesa", "quiero info", "se ve bien", "me gusta", "esta disponible?"
+Ejemplos que NO son cita: "me interesa", "quiero info", "se ve bien", "me gusta", "esta disponible?", "hola", "buenas", "que amenidades tiene", "tiene estacionamiento", "cuanto cuesta", "me puede dar mas info"
 Ejemplos que SI son cita:
 - Directos: "quiero ir a verla", "puedo visitarla?", "cuando puedo pasar a conocerla?", "me gustaria agendar una visita"
-- Confirmaciones a oferta del agente: "si claro", "si cuando podemos vernos?", "cuando nos vemos?", "si me gustaria", "dale", "claro que si", "por supuesto", "va", "si, cuando seria?"
+- Confirmaciones a oferta del agente: "si claro" (SOLO si el agente pregunto sobre visitar), "si cuando podemos vernos?", "cuando nos vemos?", "si me gustaria ir"
 
 Tags disponibles:
 1. Si el cliente quiere visitar Y menciona fecha y hora concretas: [CITA:YYYY-MM-DD:HH:MM]
@@ -464,7 +467,7 @@ Tags disponibles:
    Si quiere cambiar pero no dice fecha/hora exacta: [MODIFICAR_CITA]
 4. NO puedes confirmar ni cancelar citas, solo crear propuestas y modificaciones.
 5. Solo puede haber UNA cita pendiente por propiedad.
-6. En caso de duda, NO agregues ningun tag. Es mejor no proponer cita que proponerla cuando no se pidio.
+6. En caso de duda, NO agregues ningun tag. Es MUCHO mejor no proponer cita que proponerla cuando no se pidio. Un falso positivo es un error grave.
 7. NUNCA inventes citas que no existen. Si no hay cita agendada, NO digas que ya hay una. Usa SOLO la informacion del ESTADO DE CITAS que se te proporciona.
 8. Si en el historial del chat ves propuestas de visita CANCELADAS, IGNORALAS completamente. Una cita cancelada ya no existe. Solo considera las citas que aparecen en el ESTADO DE CITAS.${appointmentNote}${clientContextNote}
 
@@ -483,13 +486,17 @@ Responde SOLO con las 3 opciones separadas por ||| sin números ni explicaciones
     let extractedDate = null;
     let extractedTime = null;
 
+    // Hard guard: block appointment suggestions if conversation is too early
+    const clientMsgCount = recentMessages.filter(m => !m.isOwn).length;
+    const allowAppointmentTags = clientMsgCount >= 3;
+
     // [CITA:YYYY-MM-DD:HH:MM] — full date+time extracted
     const citaFullMatch = result.match(/\[CITA:(\d{4}-\d{2}-\d{2}):(\d{2}:\d{2})\]/);
-    if (citaFullMatch) {
+    if (citaFullMatch && allowAppointmentTags) {
       suggestAppointment = true;
       extractedDate = citaFullMatch[1];
       extractedTime = citaFullMatch[2] + ':00';
-    } else if (result.includes('[CITA]')) {
+    } else if (result.includes('[CITA]') && allowAppointmentTags) {
       suggestAppointment = true;
     }
 
