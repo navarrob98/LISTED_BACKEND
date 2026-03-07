@@ -635,6 +635,7 @@ router.get('/my-properties/:id', authenticateToken, (req, res) => {
     WHERE p.id = ?
       AND (
         p.created_by = ?
+        OR p.managed_by = ?
         OR (p.review_status = 'prospect' AND EXISTS (
           SELECT 1 FROM owner_agent_contacts c WHERE c.user_id = p.created_by AND c.agent_id = ?
         ))
@@ -642,7 +643,7 @@ router.get('/my-properties/:id', authenticateToken, (req, res) => {
     LIMIT 1
   `;
 
-  pool.query(sql, [propertyId, userId, userId], (err, rows) => {
+  pool.query(sql, [propertyId, userId, userId, userId], (err, rows) => {
     if (err) {
       console.error('[GET /my-properties/:id] error', err);
       return res.status(500).json({ error: 'Error consultando propiedad' });
@@ -657,9 +658,9 @@ router.delete('/properties/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
   const userId = req.user.id;
 
-  const query = 'DELETE FROM properties WHERE id = ? AND created_by = ?';
+  const query = 'DELETE FROM properties WHERE id = ? AND (created_by = ? OR managed_by = ?)';
 
-  pool.query(query, [id, userId], (err, result) => {
+  pool.query(query, [id, userId, userId], (err, result) => {
     if (err) {
       console.error('Error deleting property:', err);
       return res.status(500).json({ error: 'No se pudo eliminar la propiedad' });
@@ -679,7 +680,7 @@ router.post('/properties/:id/resubmit', authenticateToken, async (req, res) => {
 
     // Verificar que la propiedad existe y pertenece al usuario
     const [rows] = await pool.promise().query(
-      `SELECT id, created_by, review_status, is_published
+      `SELECT id, created_by, managed_by, review_status, is_published
        FROM properties
        WHERE id = ?
        LIMIT 1`,
@@ -692,8 +693,8 @@ router.post('/properties/:id/resubmit', authenticateToken, async (req, res) => {
 
     const property = rows[0];
 
-    // Verificar que es el dueño
-    if (String(property.created_by) !== String(userId)) {
+    // Verificar que es el dueño o el agente que gestiona
+    if (String(property.created_by) !== String(userId) && String(property.managed_by) !== String(userId)) {
       return res.status(403).json({ error: 'No autorizado' });
     }
 

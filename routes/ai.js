@@ -190,7 +190,7 @@ router.post('/api/ai/property-description', authenticateToken, descriptionLimite
     const systemPrompt = `Eres el vendedor inmobiliario #1 de México. Tu trabajo NO es listar datos — es VENDER un estilo de vida.
 
 REGLAS ABSOLUTAS:
-- Entre 350 y 500 caracteres. Ni menos, ni más.
+- Entre 400 y 650 caracteres. Ni menos, ni más. SIEMPRE termina la última oración completa — NUNCA cortes una frase a la mitad.
 - Español mexicano natural, sin emojis, sin hashtags.
 - PROHIBIDO repetir los datos como lista ("3 recámaras, 2 baños, 150m²"). Eso ya lo ve el comprador en la ficha técnica.
 - En vez de listar, TRANSFORMA los datos en beneficios y sensaciones:
@@ -211,8 +211,15 @@ REGLAS ABSOLUTAS:
       cachePrefix: 'desc',
     });
 
-    // Enforce max length
-    const trimmed = description.length > 500 ? description.substring(0, 497) + '...' : description;
+    // Enforce max length — cortar en la última oración completa antes del límite
+    let trimmed = description;
+    if (trimmed.length > 700) {
+      trimmed = trimmed.substring(0, 700);
+      const lastPeriod = Math.max(trimmed.lastIndexOf('.'), trimmed.lastIndexOf('!'), trimmed.lastIndexOf('?'));
+      if (lastPeriod > 400) {
+        trimmed = trimmed.substring(0, lastPeriod + 1);
+      }
+    }
 
     return res.json({ ok: true, description: trimmed });
   } catch (err) {

@@ -208,6 +208,17 @@ router.post('/api/find-agent/request', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     const b = req.body;
 
+    // Prevenir requests duplicados para la misma dirección
+    const [existing] = await q(
+      `SELECT id FROM owner_agent_requests
+       WHERE user_id = ? AND address = ? AND status = 'submitted'
+       LIMIT 1`,
+      [userId, b.address]
+    );
+    if (existing) {
+      return res.json({ ok: true, requestId: existing.id, existing: true });
+    }
+
     // Calcular doc_percentage (5 obligatorios = 20% cada uno)
     const docs = b.docs || {};
     const mandatory = ['escrituras', 'predial', 'libertad_gravamen', 'ine', 'comprobante_domicilio'];
@@ -313,31 +324,43 @@ router.post('/api/find-agent/contact', authenticateToken, async (req, res) => {
       return res.json({ ok: false, already_contacted: true });
     }
 
-    // Crear propiedad prospecto
-    const propResult = await q(
-      `INSERT INTO properties (
-        estate_type, address, city, lat, lng, land, construction,
-        bedrooms, bathrooms, parking_spaces, price, type,
-        created_by, review_status, is_published
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prospect', 0)`,
-      [
-        request.estate_type, request.address, request.city,
-        request.lat, request.lng,
-        request.land_area, request.construction_area,
-        request.bedrooms, request.bathrooms, request.parking_spaces,
-        request.desired_price, request.operation_type,
-        userId,
-      ]
+    // Buscar si ya existe una propiedad prospecto para este request
+    const [existingProp] = await q(
+      `SELECT id FROM properties WHERE created_by = ? AND review_status = 'prospect'
+       AND address = ? AND estate_type = ? AND city = ? LIMIT 1`,
+      [userId, request.address, request.estate_type, request.city]
     );
-    const propertyId = propResult.insertId;
 
-    // Insertar imágenes si vienen
-    if (images && images.length > 0) {
-      const imgValues = images.map((url) => [propertyId, url]);
-      await q(
-        'INSERT INTO property_images (property_id, image_url) VALUES ?',
-        [imgValues]
+    let propertyId;
+    if (existingProp) {
+      propertyId = existingProp.id;
+    } else {
+      // Crear propiedad prospecto solo la primera vez
+      const propResult = await q(
+        `INSERT INTO properties (
+          estate_type, address, city, lat, lng, land, construction,
+          bedrooms, bathrooms, parking_spaces, price, type,
+          created_by, review_status, is_published
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prospect', 0)`,
+        [
+          request.estate_type, request.address, request.city,
+          request.lat, request.lng,
+          request.land_area, request.construction_area,
+          request.bedrooms, request.bathrooms, request.parking_spaces,
+          request.desired_price, request.operation_type,
+          userId,
+        ]
       );
+      propertyId = propResult.insertId;
+
+      // Insertar imágenes solo al crear la propiedad
+      if (images && images.length > 0) {
+        const imgValues = images.map((url) => [propertyId, url]);
+        await q(
+          'INSERT INTO property_images (property_id, image_url) VALUES ?',
+          [imgValues]
+        );
+      }
     }
 
     // Construir mensaje automático
@@ -406,66 +429,80 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
         [userId, userId, userId]
       );
     } else {
-      // Propietario: propiedades prospecto agrupadas por request_id
-      const propRows = await q(
-        `SELECT p.id, p.address, p.city, p.estate_type, p.price, p.construction,
-                p.bedrooms, p.bathrooms, p.type, p.created_at,
-                (SELECT image_url FROM property_images WHERE property_id = p.id ORDER BY id ASC LIMIT 1) AS cover,
-                (SELECT cm.receiver_id FROM chat_messages cm
-                 WHERE cm.property_id = p.id AND cm.sender_id = ? LIMIT 1) AS _agent_id
-         FROM properties p
-         WHERE p.review_status = 'prospect' AND p.created_by = ?
-         ORDER BY p.created_at DESC`,
-        [userId, userId]
-      );
-
-      // Datos de contactos por request con info del agente
+      // Propietario: obtener contactos con info de agente y request
       const contacts = await q(
-        `SELECT oac.request_id, oac.agent_id, u.name, u.last_name, u.profile_photo,
-          (SELECT COUNT(*) FROM owner_agent_contacts WHERE request_id = oac.request_id) AS contacts_count,
-          (SELECT GROUP_CONCAT(oc.agent_id) FROM owner_agent_contacts oc WHERE oc.request_id = oac.request_id) AS contacted_agent_ids
-        FROM owner_agent_contacts oac
-        JOIN users u ON u.id = oac.agent_id
-        WHERE oac.user_id = ?`,
+        `SELECT oac.request_id, oac.agent_id, oac.status AS contact_status,
+                u.name, u.last_name, u.profile_photo, u.phone,
+                r.address, r.city, r.estate_type, r.desired_price AS price,
+                r.construction_area AS construction, r.bedrooms, r.bathrooms,
+                r.operation_type AS type, r.created_at
+         FROM owner_agent_contacts oac
+         JOIN users u ON u.id = oac.agent_id
+         JOIN owner_agent_requests r ON r.id = oac.request_id
+         WHERE oac.user_id = ?
+         ORDER BY r.created_at DESC`,
         [userId]
       );
 
-      // Agrupar propRows por request_id usando Map
+      // Buscar propiedades prospect asociadas a este usuario (por dirección)
+      const prospectProps = await q(
+        `SELECT p.id, p.address,
+                (SELECT image_url FROM property_images WHERE property_id = p.id ORDER BY id ASC LIMIT 1) AS cover
+         FROM properties p
+         WHERE p.created_by = ? AND p.review_status IN ('prospect', 'approved')
+         ORDER BY p.created_at DESC`,
+        [userId]
+      );
+
+      // Agrupar por request_id
       const groupMap = new Map();
-      for (const row of propRows) {
-        const c = contacts.find(ct => ct.agent_id === row._agent_id);
-        if (!c) continue;
+      for (const c of contacts) {
         const rid = c.request_id;
         if (!groupMap.has(rid)) {
+          const prop = prospectProps.find(p => p.address === c.address) || prospectProps[0] || {};
           groupMap.set(rid, {
+            property_id: prop.id || null,
             request_id: rid,
-            address: row.address,
-            city: row.city,
-            estate_type: row.estate_type,
-            price: row.price,
-            construction: row.construction,
-            bedrooms: row.bedrooms,
-            bathrooms: row.bathrooms,
-            type: row.type,
-            cover: row.cover,
-            created_at: row.created_at,
-            contacts_count: c.contacts_count,
-            contacted_agent_ids: c.contacted_agent_ids,
+            address: c.address,
+            city: c.city,
+            estate_type: c.estate_type,
+            price: c.price,
+            construction: c.construction,
+            bedrooms: c.bedrooms,
+            bathrooms: c.bathrooms,
+            type: c.type,
+            cover: prop.cover || null,
+            created_at: c.created_at,
+            contacts_count: 0,
+            contacted_agent_ids: '',
             agents: [],
           });
         }
-        const agentContact = contacts.find(ct => ct.agent_id === row._agent_id && ct.request_id === rid);
-        if (agentContact) {
-          groupMap.get(rid).agents.push({
-            id: agentContact.agent_id,
-            name: agentContact.name,
-            last_name: agentContact.last_name,
-            profile_photo: agentContact.profile_photo,
-            property_id: row.id,
-          });
-        }
+        const group = groupMap.get(rid);
+        group.contacts_count++;
+        group.contacted_agent_ids += (group.contacted_agent_ids ? ',' : '') + c.agent_id;
+        group.agents.push({
+          id: c.agent_id,
+          name: c.name,
+          last_name: c.last_name,
+          profile_photo: c.profile_photo,
+          phone: c.phone,
+          contact_status: c.contact_status,
+          property_id: group.property_id,
+        });
       }
       rows = Array.from(groupMap.values());
+
+      console.log('[prospects/owner] DEBUG contacts:', JSON.stringify(contacts.map(c => ({
+        request_id: c.request_id, agent_id: c.agent_id, address: c.address, price: c.price,
+      }))));
+      console.log('[prospects/owner] DEBUG prospectProps:', JSON.stringify(prospectProps.map(p => ({
+        id: p.id, address: p.address,
+      }))));
+      console.log('[prospects/owner] DEBUG groups:', JSON.stringify(rows.map(r => ({
+        request_id: r.request_id, property_id: r.property_id, address: r.address, price: r.price,
+        agents_count: r.agents.length,
+      }))));
     }
 
     res.json(rows);
@@ -498,7 +535,7 @@ router.post('/api/find-agent/prospects/:propertyId/respond', authenticateToken, 
 
     // Verificar que el agente fue contactado por el dueño
     const [contact] = await q(
-      'SELECT id FROM owner_agent_contacts WHERE user_id = ? AND agent_id = ?',
+      'SELECT id, request_id FROM owner_agent_contacts WHERE user_id = ? AND agent_id = ?',
       [property.created_by, agentId]
     );
     if (!contact) return res.status(403).json({ error: 'No autorizado' });
@@ -513,14 +550,26 @@ router.post('/api/find-agent/prospects/:propertyId/respond', authenticateToken, 
         return res.status(409).json({ error: 'Esta propiedad ya fue aceptada por otro agente' });
       }
 
+      // Publicar directamente al ser aceptada por un agente
+      await q(
+        'UPDATE properties SET review_status = ?, is_published = 1 WHERE id = ?',
+        ['approved', propertyId]
+      );
+
       await q('UPDATE owner_agent_contacts SET status = ? WHERE id = ?', ['accepted', contact.id]);
 
       // Rechazar automáticamente a los demás agentes contactados para esta propiedad
       await q(
         `UPDATE owner_agent_contacts SET status = 'rejected'
          WHERE user_id = ? AND agent_id != ? AND status != 'accepted'
-           AND request_id = (SELECT request_id FROM owner_agent_contacts WHERE id = ?)`,
+           AND request_id = (SELECT t.request_id FROM (SELECT request_id FROM owner_agent_contacts WHERE id = ?) t)`,
         [property.created_by, agentId, contact.id]
+      );
+
+      // Actualizar request a accepted
+      await q(
+        'UPDATE owner_agent_requests SET status = ? WHERE id = ?',
+        ['accepted', contact.request_id]
       );
 
       // Notificar al propietario
@@ -534,6 +583,17 @@ router.post('/api/find-agent/prospects/:propertyId/respond', authenticateToken, 
       res.json({ ok: true, action: 'accepted' });
     } else {
       await q('UPDATE owner_agent_contacts SET status = ? WHERE id = ?', ['rejected', contact.id]);
+
+      // Si todos los contactos del request fueron rechazados, marcar request como rejected
+      const [{ pending }] = await q(
+        `SELECT COUNT(*) AS pending FROM owner_agent_contacts
+         WHERE request_id = ? AND status != 'rejected'`,
+        [contact.request_id]
+      );
+      if (pending === 0) {
+        await q('UPDATE owner_agent_requests SET status = ? WHERE id = ?', ['rejected', contact.request_id]);
+      }
+
       res.json({ ok: true, action: 'rejected' });
     }
   } catch (err) {
