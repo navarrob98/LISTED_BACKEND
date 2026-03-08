@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const Sentry = require('@sentry/node');
 
 function authenticateToken(req, res, next) {
   // El token debe enviarse en el header Authorization: Bearer <token>
@@ -15,6 +16,7 @@ function authenticateToken(req, res, next) {
       return res.status(401).json({ error: 'Token inválido.', code: 'TOKEN_INVALID' });
     }
     req.user = user;
+    Sentry.setUser({ id: user.id });
     next();
   });
 }

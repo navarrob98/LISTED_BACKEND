@@ -1,3 +1,5 @@
+const Sentry = require('@sentry/node');
+
 module.exports = function initSockets(io, pool, helpers) {
   const { sendPushToUser, buildDeliveryUrlFromSecure, isMutedForReceiver } = helpers;
 
@@ -10,6 +12,10 @@ module.exports = function initSockets(io, pool, helpers) {
 
     socket.on('disconnect', (reason) => {
       console.log('[socket] client disconnected:', socket.id, reason);
+    });
+
+    socket.on('error', (err) => {
+      Sentry.captureException(err, { tags: { socket_event: 'error' } });
     });
 
     // Enviar mensaje (texto, archivo, property_card o appointment_card)
@@ -55,6 +61,7 @@ module.exports = function initSockets(io, pool, helpers) {
 
       pool.query(sql, vals, async (err, result) => {
         if (err) {
+          Sentry.captureException(err, { tags: { socket_event: 'send_message' } });
           console.error('[send_message] INSERT ERROR', { code: err.code });
           return;
         }

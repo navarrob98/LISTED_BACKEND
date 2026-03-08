@@ -1,4 +1,5 @@
 require('dotenv').config({ path: 'temporary.env' });
+const Sentry = require('./utils/sentry');
 
 const express = require('express');
 const http = require('http');
@@ -86,6 +87,7 @@ initSockets(io, pool, helpers);
 
 // ── Global error handler ──────────────────────────────
 app.use((err, req, res, next) => {
+  Sentry.captureException(err);
   console.error('Unhandled error:', err);
   if (res.headersSent) return next(err);
   res.status(500).json({ error: 'Error interno del servidor' });
@@ -93,10 +95,12 @@ app.use((err, req, res, next) => {
 
 // ── Graceful shutdown ────────────────────────────────────
 function gracefulShutdown() {
-  server.close(() => {
-    io.close(() => {
-      redis.quit().then(() => {
-        pool.end(() => process.exit(0));
+  Sentry.close(2000).finally(() => {
+    server.close(() => {
+      io.close(() => {
+        redis.quit().then(() => {
+          pool.end(() => process.exit(0));
+        });
       });
     });
   });
@@ -104,6 +108,17 @@ function gracefulShutdown() {
 }
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
+
+process.on('unhandledRejection', (reason) => {
+  Sentry.captureException(reason);
+  console.error('Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  Sentry.captureException(err);
+  console.error('Uncaught Exception:', err);
+  gracefulShutdown();
+});
 
 // ── Start ─────────────────────────────────────────────
 server.listen(port, '0.0.0.0', () => {

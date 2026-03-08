@@ -11,6 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@sentry/node": "^10.42.0",
     "@socket.io/redis-adapter": "^8.3.0",
     "bcrypt": "^6.0.0",
     "body-parser": "^2.2.0",
