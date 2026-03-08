@@ -918,16 +918,23 @@ async function handleAvailableSlots(req, res) {
     const [endHour, endMin] = work_end.split(':').map(Number);
     const endTime = endHour * 60 + (endMin || 0);
 
+    // Disable slots less than 30 min away for today
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0, 10);
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+    const isToday = date === todayStr;
+
     for (let h = startHour; h * 60 < endTime; h++) {
       const timeStr = `${String(h).padStart(2, '0')}:00:00`;
       const hourPrefix = `${String(h).padStart(2, '0')}:`;
       const isAgentBusy = [...agentBookedTimes].some(t => t.startsWith(hourPrefix));
       const isClientBusy = [...clientBookedTimes].some(t => t.startsWith(hourPrefix));
       const isCalBlocked = slotOverlapsCalBlocks(h * 60, (h + 1) * 60, calBlocks);
+      const isTooSoon = isToday && (h * 60 - currentMinutes) < 30;
 
       slots.push({
         time: timeStr,
-        available: !isAgentBusy && !isClientBusy && !isCalBlocked,
+        available: !isAgentBusy && !isClientBusy && !isCalBlocked && !isTooSoon,
       });
     }
 

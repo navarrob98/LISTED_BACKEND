@@ -495,7 +495,9 @@ Responde SOLO con las 3 opciones separadas por ||| sin números ni explicaciones
     if (citaFullMatch && allowAppointmentTags) {
       suggestAppointment = true;
       extractedDate = citaFullMatch[1];
-      extractedTime = citaFullMatch[2] + ':00';
+      const [eHour, eMin] = citaFullMatch[2].split(':').map(Number);
+      const roundedHour = eMin > 0 ? eHour + 1 : eHour;
+      extractedTime = `${String(roundedHour).padStart(2, '0')}:00:00`;
     } else if (result.includes('[CITA]') && allowAppointmentTags) {
       suggestAppointment = true;
     }
