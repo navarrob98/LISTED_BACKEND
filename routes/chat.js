@@ -26,35 +26,25 @@ router.get('/api/chat/file-url/:message_id', authenticateToken, (req, res) => {
 });
 
 // GET /api/chat/messages
-router.get('/api/chat/messages', authenticateToken, (req, res) => {
+router.get('/api/chat/messages', authenticateToken, async (req, res) => {
   const { user_id, property_id } = req.query;
   const me = req.user.id;
-  console.log('[chat/messages] req', { me, user_id, property_id });
   if (!user_id) return res.status(400).json({ error: 'Faltan campos' });
 
   const page = parseInt(req.query.page, 10) || 1;
   const limit = parseInt(req.query.limit, 10) || 30;
   const offset = (page - 1) * limit;
 
-  // Build WHERE params for both count and main queries
-  const whereParams = [me, user_id, user_id, me];
   let propertyFilter = '';
+  const baseParams = [me, user_id, user_id, me];
   if (property_id) {
     propertyFilter = ' AND cm.property_id = ?';
-    whereParams.push(property_id);
+    baseParams.push(property_id);
   }
 
-  // COUNT query
-  const countQuery = `
-    SELECT COUNT(*) AS total FROM chat_messages cm
-    WHERE cm.is_deleted = 0
-      AND ((cm.sender_id = ? AND cm.receiver_id = ?) OR (cm.sender_id = ? AND cm.receiver_id = ?))
-      ${propertyFilter}
-  `;
-
-  // Main query with inverse pagination (get most recent page, then reorder ASC)
+  // Single query: COUNT via SQL_CALC_FOUND_ROWS + data in one roundtrip
   const query = `
-    SELECT * FROM (
+    SELECT SQL_CALC_FOUND_ROWS sub.* FROM (
       SELECT
         cm.*,
         CASE WHEN cm.message_type = 'property_card' THEN p.id END as cp_id,
@@ -86,31 +76,14 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
     ORDER BY sub.created_at ASC
   `;
 
-  const mainParams = [...whereParams, limit, offset];
+  try {
+    const conn = await pool.promise().getConnection();
+    try {
+      const [results] = await conn.query(query, [...baseParams, limit, offset]);
+      const [[{ total }]] = await conn.query('SELECT FOUND_ROWS() AS total');
+      conn.release();
 
-  // Marca los mensajes recibidos como leídos
-  const markAsRead = `
-    UPDATE chat_messages
-    SET is_read = 1
-    WHERE receiver_id = ? AND sender_id = ? AND (property_id = ? OR ? IS NULL)
-  `;
-
-  console.log('[chat/messages] whereParams', whereParams);
-  pool.query(countQuery, whereParams, (countErr, countRows) => {
-    if (countErr) {
-      console.error('[chat/messages] COUNT ERROR', { code: countErr.code, sqlMessage: countErr.sqlMessage });
-      return res.status(500).json({ error: 'No se pudo obtener los mensajes' });
-    }
-
-    const total = countRows[0].total;
-    const totalPages = Math.ceil(total / limit);
-
-    pool.query(query, mainParams, (err, results) => {
-      if (err) {
-        console.error('[chat/messages] DB ERROR', { code: err.code, sqlMessage: err.sqlMessage });
-        return res.status(500).json({ error: 'No se pudo obtener los mensajes' });
-      }
-      console.log('[chat/messages] rows returned:', results.length);
+      const totalPages = Math.ceil(total / limit);
 
       const ttl = Number(process.env.CLD_DEFAULT_URL_TTL_SECONDS || 300);
       const mapped = results.map(row => {
@@ -118,13 +91,9 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
 
         if (row.message_type === 'property_card' && row.cp_id) {
           msg.card_property = {
-            id: row.cp_id,
-            address: row.cp_address,
-            type: row.cp_type,
-            price: row.cp_price,
-            monthly_pay: row.cp_monthly_pay,
-            estate_type: row.cp_estate_type,
-            first_image: row.cp_first_image,
+            id: row.cp_id, address: row.cp_address, type: row.cp_type,
+            price: row.cp_price, monthly_pay: row.cp_monthly_pay,
+            estate_type: row.cp_estate_type, first_image: row.cp_first_image,
           };
         } else if (row.message_type === 'property_card') {
           msg.card_property = null;
@@ -132,32 +101,15 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
 
         if (row.message_type === 'appointment_card' && row.ca_id) {
           msg.card_appointment = {
-            id: row.ca_id,
-            appointment_date: row.ca_date,
-            appointment_time: row.ca_time,
-            status: row.ca_status,
-            property_address: row.ca_property_address,
-            requester_id: row.ca_requester_id,
-            agent_id: row.ca_agent_id,
+            id: row.ca_id, appointment_date: row.ca_date, appointment_time: row.ca_time,
+            status: row.ca_status, property_address: row.ca_property_address,
+            requester_id: row.ca_requester_id, agent_id: row.ca_agent_id,
           };
         } else if (row.message_type === 'appointment_card') {
           msg.card_appointment = null;
         }
 
-        delete msg.cp_id;
-        delete msg.cp_address;
-        delete msg.cp_type;
-        delete msg.cp_price;
-        delete msg.cp_monthly_pay;
-        delete msg.cp_estate_type;
-        delete msg.cp_first_image;
-        delete msg.ca_id;
-        delete msg.ca_date;
-        delete msg.ca_time;
-        delete msg.ca_status;
-        delete msg.ca_requester_id;
-        delete msg.ca_agent_id;
-        delete msg.ca_property_address;
+        for (const k of ['cp_id','cp_address','cp_type','cp_price','cp_monthly_pay','cp_estate_type','cp_first_image','ca_id','ca_date','ca_time','ca_status','ca_requester_id','ca_agent_id','ca_property_address']) delete msg[k];
 
         if (msg.file_url) {
           msg.signed_file_url = signedDeliveryUrlFromSecure(msg.file_url, ttl, msg.file_name);
@@ -165,17 +117,22 @@ router.get('/api/chat/messages', authenticateToken, (req, res) => {
         return msg;
       });
 
-      pool.query(markAsRead, [me, user_id, property_id || null, property_id || null], () => {
-        res.json({
-          data: mapped,
-          page,
-          totalPages,
-          total,
-          hasMore: page < totalPages,
-        });
-      });
-    });
-  });
+      // Fire-and-forget: mark as read without blocking the response
+      pool.query(
+        'UPDATE chat_messages SET is_read = 1 WHERE receiver_id = ? AND sender_id = ? AND (property_id = ? OR ? IS NULL)',
+        [me, user_id, property_id || null, property_id || null],
+        () => {}
+      );
+
+      res.json({ data: mapped, page, totalPages, total, hasMore: page < totalPages });
+    } catch (e) {
+      conn.release();
+      throw e;
+    }
+  } catch (err) {
+    console.error('[chat/messages] DB ERROR', err);
+    res.status(500).json({ error: 'No se pudo obtener los mensajes' });
+  }
 });
 
 // GET /api/chat/mute-status
@@ -244,16 +201,15 @@ router.put('/api/chat/mute', authenticateToken, (req, res) => {
 });
 
 // GET /api/chat/my-chats
-router.get('/api/chat/my-chats', authenticateToken, (req, res) => {
+router.get('/api/chat/my-chats', authenticateToken, async (req, res) => {
   const userId = req.user.id;
-  console.log('[my-chats] req userId:', userId);
 
   const page = parseInt(req.query.page, 10) || 1;
   const limit = parseInt(req.query.limit, 10) || 20;
   const offset = (page - 1) * limit;
 
   const sql = `
-    SELECT
+    SELECT SQL_CALC_FOUND_ROWS
       t.chat_with_user_id,
       u.name AS chat_with_user_name,
       u.last_name AS chat_with_user_last_name,
@@ -312,89 +268,25 @@ router.get('/api/chat/my-chats', authenticateToken, (req, res) => {
     LIMIT ? OFFSET ?
   `;
 
-  const countSql = `
-    SELECT COUNT(*) AS total FROM (
-      SELECT
-        t.chat_with_user_id,
-        t.property_id
-      FROM (
-        SELECT
-          IF(sender_id = ?, receiver_id, sender_id) AS chat_with_user_id,
-          property_id,
-          MAX(id) AS last_msg_id
-        FROM chat_messages
-        WHERE (sender_id = ? OR receiver_id = ?)
-          AND is_deleted = 0
-        GROUP BY chat_with_user_id, property_id
-      ) t
-      JOIN chat_messages cm ON cm.id = t.last_msg_id
-      JOIN users u          ON u.id = t.chat_with_user_id
-      LEFT JOIN properties p ON p.id = t.property_id
-      LEFT JOIN chat_mutes cmute
-        ON cmute.user_id = ?
-       AND cmute.other_user_id = t.chat_with_user_id
-       AND (cmute.property_id <=> t.property_id)
-      LEFT JOIN hidden_chats h
-        ON h.user_id = ?
-       AND h.chat_with_user_id = t.chat_with_user_id
-       AND (h.property_id <=> t.property_id)
-      WHERE h.user_id IS NULL
-    ) sub
-  `;
+  const params = [userId, userId, userId, userId, userId, userId, limit, offset];
 
-  // 6 placeholders for main query + 2 for LIMIT/OFFSET
-  const params = [
-    userId, // unread_count: m.receiver_id = ?
-    userId, // IF(sender_id = ?, ...)
-    userId, // WHERE sender_id = ?
-    userId, // WHERE receiver_id = ?
-    userId, // cmute.user_id = ?
-    userId, // h.user_id = ?
-    limit,
-    offset,
-  ];
+  try {
+    const conn = await pool.promise().getConnection();
+    try {
+      const [rows] = await conn.query(sql, params);
+      const [[{ total }]] = await conn.query('SELECT FOUND_ROWS() AS total');
+      conn.release();
 
-  // 5 placeholders for count query (same as main minus unread_count)
-  const countParams = [
-    userId, // IF(sender_id = ?, ...)
-    userId, // WHERE sender_id = ?
-    userId, // WHERE receiver_id = ?
-    userId, // cmute.user_id = ?
-    userId, // h.user_id = ?
-  ];
-
-  pool.query(countSql, countParams, (countErr, countRows) => {
-    if (countErr) {
-      console.error('[my-chats] COUNT ERROR', {
-        code: countErr.code,
-        sqlMessage: countErr.sqlMessage,
-        sql: countErr.sql,
-      });
-      return res.status(500).json({ error: 'No se pudieron obtener los chats' });
+      const totalPages = Math.ceil(total / limit);
+      res.json({ data: rows, page, totalPages, total, hasMore: page < totalPages });
+    } catch (e) {
+      conn.release();
+      throw e;
     }
-
-    const total = countRows[0].total;
-    const totalPages = Math.ceil(total / limit);
-
-    pool.query(sql, params, (err, rows) => {
-      if (!err) console.log('[my-chats] rows returned:', rows.length);
-      if (err) {
-        console.error('[my-chats] SQL ERROR', {
-          code: err.code,
-          sqlMessage: err.sqlMessage,
-          sql: err.sql,
-        });
-        return res.status(500).json({ error: 'No se pudieron obtener los chats' });
-      }
-      res.json({
-        data: rows,
-        page,
-        totalPages,
-        total,
-        hasMore: page < totalPages,
-      });
-    });
-  });
+  } catch (err) {
+    console.error('[my-chats] SQL ERROR', err);
+    res.status(500).json({ error: 'No se pudieron obtener los chats' });
+  }
 });
 
 // POST /api/chat/hide-chat

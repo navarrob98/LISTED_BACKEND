@@ -949,6 +949,122 @@ async function handleAvailableSlots(req, res) {
 router.get('/api/appointments/available-slots/:agentId', authenticateToken, handleAvailableSlots);
 router.get('/api/appointments/available-slots', authenticateToken, handleAvailableSlots);
 
+// GET /api/appointments/first-available-day/:agentId
+// Busca el primer día con slots disponibles en un rango, en 1 sola llamada.
+// Query: ?days=14&client_id=123
+router.get('/api/appointments/first-available-day/:agentId', authenticateToken, async (req, res) => {
+  try {
+    const agentId = req.params.agentId;
+    const clientId = req.query.client_id || null;
+    const maxDays = Math.min(parseInt(req.query.days) || 14, 60);
+
+    // 1. Agent info
+    const userIds = clientId ? [agentId, clientId] : [agentId];
+    const [userRows] = await pool.promise().query(
+      'SELECT id, work_start, work_end, agent_type FROM users WHERE id IN (?)',
+      [userIds]
+    );
+    const agentRow = userRows.find(u => u.agent_type && u.agent_type !== 'regular' && u.work_start && u.work_end);
+    if (!agentRow) {
+      return res.json({ found: false, date: null, slots: [] });
+    }
+
+    const { work_start, work_end } = agentRow;
+    const [startHour] = work_start.split(':').map(Number);
+    const [endHour, endMin] = work_end.split(':').map(Number);
+    const endTime = endHour * 60 + (endMin || 0);
+
+    // 2. Generate date range
+    const dates = [];
+    for (let i = 0; i < maxDays; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() + i);
+      dates.push(d.toISOString().slice(0, 10));
+    }
+
+    // 3. Batch query: all agent appointments in range
+    const [agentAppts] = await pool.promise().query(
+      `SELECT appointment_date, appointment_time FROM appointments
+       WHERE agent_id = ? AND appointment_date BETWEEN ? AND ? AND status IN ('pending', 'confirmed')`,
+      [agentRow.id, dates[0], dates[dates.length - 1]]
+    );
+    const agentBookedMap = {};
+    agentAppts.forEach(r => {
+      const d = typeof r.appointment_date === 'string' ? r.appointment_date : r.appointment_date.toISOString().slice(0, 10);
+      if (!agentBookedMap[d]) agentBookedMap[d] = new Set();
+      agentBookedMap[d].add(r.appointment_time);
+    });
+
+    // 4. Batch query: client appointments in range
+    const clientBookedMap = {};
+    if (clientId) {
+      const clientRow = userRows.find(u => String(u.id) !== String(agentRow.id));
+      if (clientRow) {
+        const [clientAppts] = await pool.promise().query(
+          `SELECT appointment_date, appointment_time FROM appointments
+           WHERE (requester_id = ? OR agent_id = ?)
+             AND appointment_date BETWEEN ? AND ? AND status IN ('pending', 'confirmed')`,
+          [clientRow.id, clientRow.id, dates[0], dates[dates.length - 1]]
+        );
+        clientAppts.forEach(r => {
+          const d = typeof r.appointment_date === 'string' ? r.appointment_date : r.appointment_date.toISOString().slice(0, 10);
+          if (!clientBookedMap[d]) clientBookedMap[d] = new Set();
+          clientBookedMap[d].add(r.appointment_time);
+        });
+      }
+    }
+
+    // 5. Batch query: calendar blocks in range
+    const [calBlocks] = await pool.promise().query(
+      'SELECT block_date, block_start, block_end, is_all_day FROM agent_calendar_blocks WHERE agent_id = ? AND block_date BETWEEN ? AND ? AND is_available = 0',
+      [agentRow.id, dates[0], dates[dates.length - 1]]
+    );
+    const calBlockMap = {};
+    calBlocks.forEach(b => {
+      const d = typeof b.block_date === 'string' ? b.block_date : b.block_date.toISOString().slice(0, 10);
+      if (!calBlockMap[d]) calBlockMap[d] = [];
+      calBlockMap[d].push(b);
+    });
+
+    // 6. Iterate dates, generate slots, find first with availability
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0, 10);
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+
+    for (const dateStr of dates) {
+      const agentBooked = agentBookedMap[dateStr] || new Set();
+      const clientBooked = clientBookedMap[dateStr] || new Set();
+      const dayBlocks = calBlockMap[dateStr] || [];
+      const isToday = dateStr === todayStr;
+
+      const slots = [];
+      let hasAvailable = false;
+
+      for (let h = startHour; h * 60 < endTime; h++) {
+        const timeStr = `${String(h).padStart(2, '0')}:00:00`;
+        const hourPrefix = `${String(h).padStart(2, '0')}:`;
+        const isAgentBusy = [...agentBooked].some(t => t.startsWith(hourPrefix));
+        const isClientBusy = [...clientBooked].some(t => t.startsWith(hourPrefix));
+        const isCalBlocked = slotOverlapsCalBlocks(h * 60, (h + 1) * 60, dayBlocks);
+        const isTooSoon = isToday && (h * 60 - currentMinutes) < 30;
+        const avail = !isAgentBusy && !isClientBusy && !isCalBlocked && !isTooSoon;
+
+        slots.push({ time: timeStr, available: avail });
+        if (avail) hasAvailable = true;
+      }
+
+      if (hasAvailable) {
+        return res.json({ found: true, date: dateStr, slots, work_start, work_end });
+      }
+    }
+
+    res.json({ found: false, date: null, slots: [] });
+  } catch (e) {
+    console.error('[GET /api/appointments/first-available-day] error', e);
+    res.status(500).json({ error: 'Error al buscar disponibilidad' });
+  }
+});
+
 // PUT /api/appointments/:id/reschedule
 router.put('/api/appointments/:id/reschedule', authenticateToken, async (req, res) => {
   try {
