@@ -61,7 +61,14 @@ router.post('/properties/add', authenticateToken, async (req, res) => {
       water_heater,
       furnished,
       pets_allowed,
+      listing_status,
     } = req.body || {};
+
+    // Validar listing_status si viene
+    const ALLOWED_LISTING_STATUS = ['disponible', 'en_venta', 'apartada', 'vendida'];
+    if (listing_status && !ALLOWED_LISTING_STATUS.includes(listing_status)) {
+      return res.status(400).json({ error: 'listing_status inválido' });
+    }
 
     const created_by = req.user.id;
 
@@ -103,7 +110,8 @@ router.post('/properties/add', authenticateToken, async (req, res) => {
         clubhouse, gym, common_pool, playground, park_garden, sports_court, event_room, bbq_area,
         maintenance_fee,
         service_room, roof_garden, private_garden, storage_room, study_office, fitted_kitchen, closets, cistern, water_heater,
-        furnished, pets_allowed
+        furnished, pets_allowed,
+        listing_status
       ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?,
@@ -121,7 +129,8 @@ router.post('/properties/add', authenticateToken, async (req, res) => {
         ?, ?, ?, ?, ?, ?, ?, ?,
         ?,
         ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?
+        ?, ?,
+        ?
       )
     `;
 
@@ -201,6 +210,8 @@ router.post('/properties/add', authenticateToken, async (req, res) => {
       // Extras
       furnished ? 1 : 0,
       pets_allowed ? 1 : 0,
+
+      listing_status || 'disponible',
     ];
 
     const [result] = await pool.promise().query(query, values);
@@ -304,7 +315,14 @@ router.put('/properties/:id', authenticateToken, (req, res) => {
     water_heater: 'bool',
     furnished: 'bool',
     pets_allowed: 'bool',
+    listing_status: 'string',
   };
+
+  // Validar listing_status si viene
+  const ALLOWED_LISTING_STATUS = ['disponible', 'en_venta', 'apartada', 'vendida'];
+  if (incoming.listing_status && !ALLOWED_LISTING_STATUS.includes(incoming.listing_status)) {
+    return res.status(400).json({ error: 'listing_status inválido' });
+  }
 
   const setFragments = [];
   const values = [];
