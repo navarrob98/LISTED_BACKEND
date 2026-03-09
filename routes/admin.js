@@ -427,4 +427,90 @@ router.delete('/admin/reports/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /admin/metrics — dashboard KPIs
+router.get('/admin/metrics', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const conn = await pool.promise().getConnection();
+    try {
+      const [[totals]] = await conn.query(`
+        SELECT
+          (SELECT COUNT(*) FROM users WHERE agent_type NOT IN ('admin')) AS totalUsers,
+          (SELECT COUNT(*) FROM users WHERE agent_type IN ('brokerage','individual','seller') AND agent_verification_status = 'pending') AS pendingAgents,
+          (SELECT COUNT(*) FROM users WHERE agent_type IN ('brokerage','individual','seller') AND agent_verification_status = 'verified') AS verifiedAgents,
+          (SELECT COUNT(*) FROM users WHERE agent_type IN ('brokerage','individual','seller') AND agent_verification_status = 'rejected') AS rejectedAgents,
+          (SELECT COUNT(*) FROM properties WHERE review_status = 'pending' AND is_published = 0) AS pendingProperties,
+          (SELECT COUNT(*) FROM properties WHERE review_status = 'approved') AS approvedProperties,
+          (SELECT COUNT(*) FROM properties WHERE review_status = 'rejected') AS rejectedProperties,
+          (SELECT COUNT(*) FROM reports WHERE status = 'pending') AS pendingReports,
+          (SELECT COUNT(*) FROM reports) AS totalReports,
+          (SELECT COUNT(*) FROM users WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) AND agent_type NOT IN ('admin')) AS newUsersWeek,
+          (SELECT COUNT(*) FROM properties WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)) AS newPropertiesWeek,
+          (SELECT COUNT(*) FROM chat_messages WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)) AS messagesWeek
+      `);
+
+      // Users by day (last 30 days)
+      const [usersByDay] = await conn.query(`
+        SELECT DATE(created_at) AS day, COUNT(*) AS count
+        FROM users
+        WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+          AND agent_type NOT IN ('admin')
+        GROUP BY DATE(created_at)
+        ORDER BY day
+      `);
+
+      // Properties by day (last 30 days)
+      const [propertiesByDay] = await conn.query(`
+        SELECT DATE(created_at) AS day, COUNT(*) AS count
+        FROM properties
+        WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+        GROUP BY DATE(created_at)
+        ORDER BY day
+      `);
+
+      // Agent types breakdown
+      const [agentTypes] = await conn.query(`
+        SELECT agent_type, COUNT(*) AS count
+        FROM users
+        WHERE agent_type IN ('brokerage','individual','seller')
+        GROUP BY agent_type
+      `);
+
+      // Property types breakdown
+      const [propertyTypes] = await conn.query(`
+        SELECT type, COUNT(*) AS count
+        FROM properties
+        WHERE review_status = 'approved'
+        GROUP BY type
+        ORDER BY count DESC
+        LIMIT 10
+      `);
+
+      // Report reasons breakdown
+      const [reportReasons] = await conn.query(`
+        SELECT reason, COUNT(*) AS count
+        FROM reports
+        GROUP BY reason
+        ORDER BY count DESC
+      `);
+
+      conn.release();
+
+      res.json({
+        totals,
+        usersByDay,
+        propertiesByDay,
+        agentTypes,
+        propertyTypes,
+        reportReasons,
+      });
+    } catch (e) {
+      conn.release();
+      throw e;
+    }
+  } catch (e) {
+    console.error('[GET /admin/metrics] error', e);
+    res.status(500).json({ error: 'Error al obtener métricas' });
+  }
+});
+
 module.exports = router;
