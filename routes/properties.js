@@ -86,11 +86,11 @@ router.post('/properties/add', authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "Usuario no encontrado" });
     }
 
-    // Nueva regla:
-    // - Todos pueden agregar propiedades (incluye agentes de cualquier tipo).
-    // - Todas las propiedades pasan por revisión de propiedad.
-    const finalReviewStatus = "pending";
-    const finalIsPublished = 0;
+    // Agentes verificados publican directo, el resto pasa por revisión
+    const user = uRows[0];
+    const isVerifiedAgent = user.agent_verification_status === 'verified';
+    const finalReviewStatus = isVerifiedAgent ? "approved" : "pending";
+    const finalIsPublished = isVerifiedAgent ? 1 : 0;
 
     const query = `
       INSERT INTO properties (
