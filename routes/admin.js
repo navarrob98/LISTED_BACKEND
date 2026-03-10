@@ -435,7 +435,7 @@ router.get('/admin/metrics', authenticateToken, requireAdmin, async (req, res) =
       const [[totals]] = await conn.query(`
         SELECT
           (SELECT COUNT(*) FROM users WHERE agent_type NOT IN ('admin')) AS totalUsers,
-          (SELECT COUNT(*) FROM users WHERE agent_type IN ('brokerage','individual','seller') AND agent_verification_status = 'pending') AS pendingAgents,
+          (SELECT COUNT(*) FROM users u2 WHERE u2.agent_type IN ('brokerage','individual','seller') AND u2.agent_verification_status = 'pending' AND EXISTS (SELECT 1 FROM agent_credentials ac WHERE ac.user_id = u2.id AND ac.credential_id IS NOT NULL AND ac.credential_id <> '')) AS pendingAgents,
           (SELECT COUNT(*) FROM users WHERE agent_type IN ('brokerage','individual','seller') AND agent_verification_status = 'verified') AS verifiedAgents,
           (SELECT COUNT(*) FROM users WHERE agent_type IN ('brokerage','individual','seller') AND agent_verification_status = 'rejected') AS rejectedAgents,
           (SELECT COUNT(*) FROM properties WHERE review_status = 'pending' AND is_published = 0) AS pendingProperties,

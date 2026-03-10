@@ -344,18 +344,21 @@ router.post('/api/find-agent/contact', authenticateToken, async (req, res) => {
       propertyId = existingProp.id;
     } else {
       // Crear propiedad prospecto solo la primera vez
+      const isRentProspect = request.operation_type === 'renta';
       const propResult = await q(
         `INSERT INTO properties (
           estate_type, address, city, lat, lng, land, construction,
-          bedrooms, bathrooms, parking_spaces, price, type,
+          bedrooms, bathrooms, parking_spaces, price, monthly_pay, type,
           created_by, review_status, is_published
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prospect', 0)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prospect', 0)`,
         [
           request.estate_type, request.address, request.city,
           request.lat, request.lng,
           request.land_area, request.construction_area,
           request.bedrooms, request.bathrooms, request.parking_spaces,
-          request.desired_price, request.operation_type,
+          isRentProspect ? null : request.desired_price,
+          isRentProspect ? request.desired_price : null,
+          request.operation_type,
           userId,
         ]
       );
