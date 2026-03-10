@@ -107,19 +107,24 @@ router.post('/api/find-agent/estimate', authenticateToken, async (req, res) => {
     }
 
     const conArea = Number(construction_area);
+    const isRent = input.operation_type === 'renta';
 
-    // Traer comparables amplios: misma ciudad y tipo, con precio válido
+    // Para venta: comparar con propiedades en venta (price)
+    // Para renta: comparar con propiedades en renta (monthly_pay)
+    const priceCol = isRent ? 'monthly_pay' : 'price';
+    const typeFilter = isRent ? 'renta' : 'venta';
+
     const rows = await q(
-      `SELECT price, construction, land, bedrooms, bathrooms, parking_spaces,
+      `SELECT ${priceCol} AS comp_price, construction, land, bedrooms, bathrooms, parking_spaces,
               private_pool, gated_community, gym, common_pool, clubhouse,
               bbq_area, roof_garden, private_garden, fitted_kitchen,
               furnished, service_room, storage_room, study_office,
               cctv, alarm, surveillance_24_7, controlled_access
        FROM properties
-       WHERE city = ? AND estate_type = ? AND is_published = 1
-         AND price IS NOT NULL AND price > 0
+       WHERE city = ? AND estate_type = ? AND type = ? AND is_published = 1
+         AND ${priceCol} IS NOT NULL AND ${priceCol} > 0
          AND construction IS NOT NULL AND construction > 0`,
-      [city, estate_type]
+      [city, estate_type, typeFilter]
     );
 
     if (rows.length < 3) {
@@ -154,7 +159,7 @@ router.post('/api/find-agent/estimate', authenticateToken, async (req, res) => {
 
     const scored = rows.map(r => ({
       ...r,
-      pm2: r.price / r.construction,
+      pm2: r.comp_price / r.construction,
       score: similarityScore(inputData, r),
     }));
 
@@ -172,10 +177,12 @@ router.post('/api/find-agent/estimate', authenticateToken, async (req, res) => {
     }
     let avgPM2 = weightTotal > 0 ? weightedSum / weightTotal : top.reduce((s, r) => s + r.pm2, 0) / top.length;
 
-    // Ajustes por antigüedad
-    const age = Number(input.age_years) || 0;
-    if (age > 20) avgPM2 *= 0.90;
-    else if (age > 10) avgPM2 *= 0.95;
+    // Ajustes por antigüedad (solo para venta — en renta el valor no baja tanto por edad)
+    if (!isRent) {
+      const age = Number(input.age_years) || 0;
+      if (age > 20) avgPM2 *= 0.90;
+      else if (age > 10) avgPM2 *= 0.95;
+    }
 
     // Ajustes por condición
     const cond = input.condition;
@@ -192,6 +199,7 @@ router.post('/api/find-agent/estimate', authenticateToken, async (req, res) => {
       avg_price_per_m2: Math.round(avgPM2),
       comparables_count: rows.length,
       top_matches: top.length,
+      operation_type: isRent ? 'renta' : 'venta',
     });
   } catch (err) {
     console.error('[find-agent/estimate]', err);
@@ -364,10 +372,13 @@ router.post('/api/find-agent/contact', authenticateToken, async (req, res) => {
     }
 
     // Construir mensaje automático
-    const opLabel = request.operation_type === 'venta' ? 'vender' : 'rentar';
+    const isRent = request.operation_type === 'renta';
+    const opLabel = isRent ? 'rentar' : 'vender';
     const estMin = request.estimated_min ? Number(request.estimated_min).toLocaleString('es-MX') : '?';
     const estMax = request.estimated_max ? Number(request.estimated_max).toLocaleString('es-MX') : '?';
-    const message = `Hola, tengo una ${request.estate_type} en ${request.city} de ${request.construction_area || '?'}m², ${request.bedrooms || '?'} rec, ${request.bathrooms || '?'} baños. Valuación estimada: $${estMin} - $${estMax}. Documentación: ${request.doc_percentage}% lista. Me interesa que me ayudes a ${opLabel}.`;
+    const valLabel = isRent ? 'Renta estimada' : 'Valuación estimada';
+    const suffix = isRent ? '/mes' : '';
+    const message = `Hola, tengo una ${request.estate_type} en ${request.city} de ${request.construction_area || '?'}m², ${request.bedrooms || '?'} rec, ${request.bathrooms || '?'} baños. ${valLabel}: $${estMin} - $${estMax}${suffix}. Documentación: ${request.doc_percentage}% lista. Me interesa que me ayudes a ${opLabel}.`;
 
     // Crear chat_message con property_id
     await q(
