@@ -542,15 +542,19 @@ router.post('/api/find-agent/prospects/:propertyId/respond', authenticateToken, 
 
     // Verificar que la propiedad prospecto existe
     const [property] = await q(
-      'SELECT id, created_by FROM properties WHERE id = ? AND review_status = ?',
+      'SELECT id, created_by, address, estate_type, city FROM properties WHERE id = ? AND review_status = ?',
       [propertyId, 'prospect']
     );
     if (!property) return res.status(404).json({ error: 'Propiedad no encontrada' });
 
-    // Verificar que el agente fue contactado por el dueño
+    // Verificar que el agente fue contactado por el dueño (vinculado a esta propiedad)
     const [contact] = await q(
-      'SELECT id, request_id FROM owner_agent_contacts WHERE user_id = ? AND agent_id = ?',
-      [property.created_by, agentId]
+      `SELECT oac.id, oac.request_id FROM owner_agent_contacts oac
+       JOIN owner_agent_requests r ON r.id = oac.request_id
+       WHERE oac.user_id = ? AND oac.agent_id = ?
+         AND r.address = ? AND r.estate_type = ? AND r.city = ?
+       ORDER BY oac.id DESC LIMIT 1`,
+      [property.created_by, agentId, property.address, property.estate_type, property.city]
     );
     if (!contact) return res.status(403).json({ error: 'No autorizado' });
 
@@ -627,15 +631,20 @@ router.get('/api/find-agent/seller-context/:propertyId', authenticateToken, asyn
 
     // Buscar la propiedad prospect y su request asociado
     const [prop] = await q(
-      'SELECT id, created_by FROM properties WHERE id = ? AND review_status = ?',
+      'SELECT id, created_by, address, estate_type, city FROM properties WHERE id = ? AND review_status = ?',
       [propertyId, 'prospect']
     );
     if (!prop) return res.status(404).json({ ok: false, error: 'No encontrada' });
 
-    // Buscar el request original del owner
+    // Buscar el contacto que corresponde a esta propiedad específica
+    // Vincular por address+estate_type+city del request que coincida con la propiedad
     const [contact] = await q(
-      'SELECT request_id FROM owner_agent_contacts WHERE user_id = ? AND agent_id = ?',
-      [prop.created_by, agentId]
+      `SELECT oac.request_id FROM owner_agent_contacts oac
+       JOIN owner_agent_requests r ON r.id = oac.request_id
+       WHERE oac.user_id = ? AND oac.agent_id = ?
+         AND r.address = ? AND r.estate_type = ? AND r.city = ?
+       ORDER BY oac.id DESC LIMIT 1`,
+      [prop.created_by, agentId, prop.address, prop.estate_type, prop.city]
     );
     if (!contact) return res.status(403).json({ ok: false, error: 'No autorizado' });
 
