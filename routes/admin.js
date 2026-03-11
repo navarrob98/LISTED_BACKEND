@@ -513,4 +513,111 @@ router.get('/admin/metrics', authenticateToken, requireAdmin, async (req, res) =
   }
 });
 
+// ────────────────────────────────────────────────
+// GET /admin/bans — lista de usuarios y IPs baneados
+// ────────────────────────────────────────────────
+router.get('/admin/bans', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const [users] = await pool.promise().query(
+      `SELECT id, name, last_name, email, agent_type, banned_at, ban_reason, last_ip
+       FROM users WHERE is_banned = 1 ORDER BY banned_at DESC`
+    );
+    const [ips] = await pool.promise().query(
+      `SELECT * FROM banned_ips ORDER BY created_at DESC`
+    );
+    res.json({ bannedUsers: users, bannedIPs: ips });
+  } catch (e) {
+    console.error('[GET /admin/bans]', e);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// ────────────────────────────────────────────────
+// POST /admin/bans/user — banear usuario por email o id
+// ────────────────────────────────────────────────
+router.post('/admin/bans/user', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { user_id, email, reason, ban_ip } = req.body;
+    if (!user_id && !email) return res.status(400).json({ error: 'Se requiere user_id o email' });
+
+    let targetId = user_id;
+    if (!targetId && email) {
+      const [[found]] = await pool.promise().query('SELECT id FROM users WHERE email = ?', [email.trim().toLowerCase()]);
+      if (!found) return res.status(404).json({ error: 'Usuario no encontrado' });
+      targetId = found.id;
+    }
+
+    // No banear admins
+    const [[target]] = await pool.promise().query('SELECT agent_type, last_ip FROM users WHERE id = ?', [targetId]);
+    if (!target) return res.status(404).json({ error: 'Usuario no encontrado' });
+    if (target.agent_type === 'admin') return res.status(400).json({ error: 'No se puede banear un admin' });
+
+    await pool.promise().query(
+      'UPDATE users SET is_banned = 1, banned_at = NOW(), ban_reason = ? WHERE id = ?',
+      [reason || null, targetId]
+    );
+
+    // Opcionalmente banear su IP también
+    if (ban_ip && target.last_ip) {
+      await pool.promise().query(
+        'INSERT IGNORE INTO banned_ips (ip, reason, banned_by) VALUES (?, ?, ?)',
+        [target.last_ip, reason || null, req.user.id]
+      );
+    }
+
+    res.json({ ok: true, banned_user_id: targetId });
+  } catch (e) {
+    console.error('[POST /admin/bans/user]', e);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// ────────────────────────────────────────────────
+// POST /admin/bans/ip — banear una IP directamente
+// ────────────────────────────────────────────────
+router.post('/admin/bans/ip', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { ip, reason } = req.body;
+    if (!ip) return res.status(400).json({ error: 'Se requiere ip' });
+
+    await pool.promise().query(
+      'INSERT IGNORE INTO banned_ips (ip, reason, banned_by) VALUES (?, ?, ?)',
+      [ip.trim(), reason || null, req.user.id]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[POST /admin/bans/ip]', e);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// ────────────────────────────────────────────────
+// DELETE /admin/bans/user/:id — desbanear usuario
+// ────────────────────────────────────────────────
+router.delete('/admin/bans/user/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    await pool.promise().query(
+      'UPDATE users SET is_banned = 0, banned_at = NULL, ban_reason = NULL WHERE id = ?',
+      [req.params.id]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[DELETE /admin/bans/user]', e);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// ────────────────────────────────────────────────
+// DELETE /admin/bans/ip/:id — desbanear IP
+// ────────────────────────────────────────────────
+router.delete('/admin/bans/ip/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    await pool.promise().query('DELETE FROM banned_ips WHERE id = ?', [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[DELETE /admin/bans/ip]', e);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
 module.exports = router;
