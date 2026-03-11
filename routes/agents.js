@@ -491,7 +491,8 @@ router.get('/agents/:id', (req, res) => {
   const { id } = req.params;
 
   pool.query(
-    `SELECT id, name, last_name, phone, work_start, work_end, agent_verification_status, profile_photo
+    `SELECT id, name, last_name, phone, work_start, work_end, agent_verification_status, profile_photo,
+            avg_rating, rating_count
      FROM users
      WHERE id = ?
        AND agent_type IN ('brokerage','individual')

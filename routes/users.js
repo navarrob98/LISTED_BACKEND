@@ -141,6 +141,59 @@ router.get('/users/:id/profile-photo', authenticateToken, async (req, res) => {
   }
 });
 
+// GET /users/me/business-card — datos para la tarjeta digital del agente
+router.get('/users/me/business-card', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const [[user]] = await pool.promise().query(
+      `SELECT u.name, u.last_name, u.email, u.phone, u.profile_photo,
+              u.agent_type, u.brokerage_name, u.cities, u.created_at,
+              u.agent_verification_status, u.avg_rating, u.rating_count,
+              ac.type AS credential_type, ac.state AS credential_state,
+              ac.issuer AS credential_issuer
+       FROM users u
+       LEFT JOIN agent_credentials ac ON ac.id = (
+         SELECT id FROM agent_credentials WHERE user_id = u.id ORDER BY id DESC LIMIT 1
+       )
+       WHERE u.id = ?`,
+      [userId]
+    );
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    const isVerified = user.agent_verification_status === 'verified';
+    let cities = [];
+    try { cities = user.cities ? JSON.parse(user.cities) : []; } catch {}
+
+    // Contar propiedades activas
+    const [[{ count: activeListings }]] = await pool.promise().query(
+      'SELECT COUNT(*) AS count FROM properties WHERE created_by = ? AND is_published = 1',
+      [userId]
+    );
+
+    res.json({
+      name: user.name,
+      last_name: user.last_name,
+      email: user.email,
+      phone: user.phone,
+      profile_photo: user.profile_photo,
+      agent_type: user.agent_type,
+      brokerage_name: user.brokerage_name || null,
+      cities,
+      created_at: user.created_at,
+      is_verified: isVerified,
+      credential_type: user.credential_type || null,
+      credential_state: user.credential_state || null,
+      credential_issuer: user.credential_issuer || null,
+      active_listings: activeListings,
+      avg_rating: user.avg_rating ? parseFloat(user.avg_rating) : null,
+      rating_count: user.rating_count || 0,
+    });
+  } catch (err) {
+    console.error('[business-card]', err);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
 // POST /users/me/profile-photo/sign-upload
 router.post('/users/me/profile-photo/sign-upload', authenticateToken, async (req, res) => {
   try {

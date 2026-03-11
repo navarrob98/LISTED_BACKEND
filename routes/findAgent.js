@@ -275,6 +275,7 @@ router.get('/api/find-agent/agents', authenticateToken, async (req, res) => {
 
     const rows = await q(
       `SELECT u.id, u.name, u.last_name, u.profile_photo, u.agent_type,
+        u.avg_rating, u.rating_count,
         (SELECT COUNT(*) FROM properties WHERE created_by = u.id AND is_published = 1 AND city = ?) AS active_listings,
         (SELECT type FROM agent_credentials WHERE user_id = u.id LIMIT 1) AS credential_type
        FROM users u

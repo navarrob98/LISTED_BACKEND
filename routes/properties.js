@@ -65,7 +65,7 @@ router.post('/properties/add', authenticateToken, async (req, res) => {
     } = req.body || {};
 
     // Validar listing_status si viene
-    const ALLOWED_LISTING_STATUS = ['disponible', 'en_venta', 'apartada', 'vendida'];
+    const ALLOWED_LISTING_STATUS = ['disponible', 'apartada', 'no_disponible'];
     if (listing_status && !ALLOWED_LISTING_STATUS.includes(listing_status)) {
       return res.status(400).json({ error: 'listing_status inválido' });
     }
@@ -249,7 +249,7 @@ router.post('/properties/add', authenticateToken, async (req, res) => {
 });
 
 // PUT /properties/:id
-router.put('/properties/:id', authenticateToken, (req, res) => {
+router.put('/properties/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const incoming = req.body || {};
 
@@ -316,12 +316,38 @@ router.put('/properties/:id', authenticateToken, (req, res) => {
     furnished: 'bool',
     pets_allowed: 'bool',
     listing_status: 'string',
+    is_published: 'bool',
+    status_change_count: 'int',
   };
 
   // Validar listing_status si viene
-  const ALLOWED_LISTING_STATUS = ['disponible', 'en_venta', 'apartada', 'vendida'];
+  const ALLOWED_LISTING_STATUS = ['disponible', 'apartada', 'no_disponible'];
   if (incoming.listing_status && !ALLOWED_LISTING_STATUS.includes(incoming.listing_status)) {
     return res.status(400).json({ error: 'listing_status inválido' });
+  }
+
+  // Si se marca como no_disponible, despublicar
+  if (incoming.listing_status === 'no_disponible') {
+    incoming.is_published = 0;
+  } else if (incoming.listing_status === 'disponible' || incoming.listing_status === 'apartada') {
+    incoming.is_published = 1;
+  }
+
+  // Límite de cambios de estado (máx 3 veces a no_disponible)
+  if (incoming.listing_status === 'no_disponible') {
+    try {
+      const [[propCheck]] = await pool.promise().query(
+        'SELECT listing_status, status_change_count FROM properties WHERE id = ? AND (created_by = ? OR managed_by = ?)',
+        [id, req.user.id, req.user.id]
+      );
+      if (propCheck && propCheck.listing_status !== 'no_disponible') {
+        const count = (propCheck.status_change_count || 0) + 1;
+        if (count > 3) {
+          return res.status(400).json({ error: 'Has alcanzado el límite de cambios de estado para esta propiedad' });
+        }
+        incoming.status_change_count = count;
+      }
+    } catch {}
   }
 
   const setFragments = [];
