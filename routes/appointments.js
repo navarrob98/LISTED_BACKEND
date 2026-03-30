@@ -4,6 +4,23 @@ const pool = require('../db/pool');
 const authenticateToken = require('../middleware/authenticateToken');
 const { sendPushToUser } = require('../utils/helpers');
 
+// io is injected after Socket.io is initialized in backend.js
+let io = null;
+router.setIo = (ioInstance) => { io = ioInstance; };
+
+function emitAppointmentUpdated(appointment) {
+  if (!io) return;
+  const payload = {
+    id: appointment.id,
+    status: appointment.status,
+    appointment_date: appointment.appointment_date,
+    appointment_time: appointment.appointment_time,
+    property_id: appointment.property_id,
+  };
+  io.to('user_' + appointment.agent_id).emit('appointment_updated', payload);
+  io.to('user_' + appointment.requester_id).emit('appointment_updated', payload);
+}
+
 // Helper: convert "HH:MM:SS" → minutes since midnight
 function timeToMin(t) {
   const [h, m] = String(t).split(':').map(Number);
@@ -481,6 +498,8 @@ router.put('/api/appointments/:id/client-accept', authenticateToken, async (req,
       [appointmentId]
     );
 
+    emitAppointmentUpdated({ ...appointment, status: 'confirmed' });
+
     // Notify the agent
     try {
       const [clientRows] = await pool.promise().query(
@@ -634,6 +653,8 @@ router.put('/api/appointments/:id/confirm', authenticateToken, async (req, res) 
       [appointmentId]
     );
 
+    emitAppointmentUpdated({ ...appointment, status: 'confirmed' });
+
     // Notificar al solicitante
     try {
       await sendPushToUser({
@@ -688,6 +709,8 @@ router.put('/api/appointments/:id/cancel', authenticateToken, async (req, res) =
       'UPDATE appointments SET status = "cancelled", cancellation_reason = ?, updated_at = NOW() WHERE id = ?',
       [cancellation_reason || null, appointmentId]
     );
+
+    emitAppointmentUpdated({ ...appointment, status: 'cancelled' });
 
     // Notificar a la otra parte
     const notifyUserId = String(userId) === String(appointment.agent_id)
@@ -1137,6 +1160,13 @@ router.put('/api/appointments/:id/reschedule', authenticateToken, async (req, re
        WHERE id = ?`,
       [appointment_date, appointment_time, notes || null, newStatus, appointmentId]
     );
+
+    emitAppointmentUpdated({
+      ...appointment,
+      status: newStatus,
+      appointment_date,
+      appointment_time,
+    });
 
     // Notificar a la otra parte
     const notifyUserId = String(userId) === String(appointment.agent_id)

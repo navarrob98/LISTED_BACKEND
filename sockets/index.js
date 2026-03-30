@@ -1,4 +1,195 @@
 const Sentry = require('@sentry/node');
+const { generateAutoReply } = require('../utils/aiChatAutoReply');
+
+// ── Find the nearest available slot for an agent (next 7 days from fromDate) ─────
+async function findNextAvailableSlot(pool, agentId, clientId, fromDate) {
+  const [[agent]] = await pool.promise().query(
+    'SELECT work_start, work_end FROM users WHERE id = ? LIMIT 1',
+    [agentId]
+  );
+  if (!agent || !agent.work_start || !agent.work_end) return null;
+
+  const [wsH] = agent.work_start.split(':').map(Number);
+  const [weH, weM] = agent.work_end.split(':').map(Number);
+  const workEndMin = weH * 60 + (weM || 0);
+  const base = fromDate ? new Date(fromDate + 'T00:00:00') : new Date();
+
+  for (let dayOffset = fromDate ? 0 : 1; dayOffset <= 7; dayOffset++) {
+    const d = new Date(base);
+    d.setDate(d.getDate() + dayOffset);
+    const dateStr = d.toISOString().split('T')[0];
+
+    const [booked] = await pool.promise().query(
+      `SELECT appointment_time FROM appointments WHERE agent_id = ? AND appointment_date = ? AND status IN ('pending','confirmed')`,
+      [agentId, dateStr]
+    );
+    const bookedSet = new Set(booked.map(r => r.appointment_time));
+
+    if (clientId) {
+      const [clientBooked] = await pool.promise().query(
+        `SELECT appointment_time FROM appointments WHERE (requester_id = ? OR agent_id = ?) AND appointment_date = ? AND status IN ('pending','confirmed')`,
+        [clientId, clientId, dateStr]
+      );
+      clientBooked.forEach(r => bookedSet.add(r.appointment_time));
+    }
+
+    for (let h = wsH; h * 60 < workEndMin; h++) {
+      const t = `${String(h).padStart(2, '0')}:00:00`;
+      if (!bookedSet.has(t)) return { date: dateStr, time: t };
+    }
+  }
+  return null;
+}
+
+// ── Resolve a date+time against agent work hours — adjust if outside or taken ────
+async function resolveSlot(pool, agentId, clientId, date, time) {
+  const [[agent]] = await pool.promise().query(
+    'SELECT work_start, work_end FROM users WHERE id = ? LIMIT 1',
+    [agentId]
+  );
+  if (!agent || !agent.work_start || !agent.work_end) return { date, time };
+
+  const [wsH] = agent.work_start.split(':').map(Number);
+  const [weH, weM] = agent.work_end.split(':').map(Number);
+  const workEndMin = weH * 60 + (weM || 0);
+  const reqH = parseInt(time.split(':')[0], 10);
+  const reqMin = reqH * 60;
+
+  // If within hours and not taken, use it
+  if (reqMin >= wsH * 60 && reqMin < workEndMin) {
+    const [taken] = await pool.promise().query(
+      `SELECT id FROM appointments WHERE agent_id = ? AND appointment_date = ? AND appointment_time = ? AND status IN ('pending','confirmed') LIMIT 1`,
+      [agentId, date, time]
+    );
+    if (!taken.length) return { date, time };
+  }
+
+  // Otherwise find first free slot on that date within work hours
+  const [booked] = await pool.promise().query(
+    `SELECT appointment_time FROM appointments WHERE agent_id = ? AND appointment_date = ? AND status IN ('pending','confirmed')`,
+    [agentId, date]
+  );
+  const bookedSet = new Set(booked.map(r => r.appointment_time));
+  if (clientId) {
+    const [clientBooked] = await pool.promise().query(
+      `SELECT appointment_time FROM appointments WHERE (requester_id = ? OR agent_id = ?) AND appointment_date = ? AND status IN ('pending','confirmed')`,
+      [clientId, clientId, date]
+    );
+    clientBooked.forEach(r => bookedSet.add(r.appointment_time));
+  }
+  for (let h = wsH; h * 60 < workEndMin; h++) {
+    const t = `${String(h).padStart(2, '0')}:00:00`;
+    if (!bookedSet.has(t)) return { date, time: t };
+  }
+
+  // No slots on that date — find next available from that day onwards
+  return findNextAvailableSlot(pool, agentId, clientId, date);
+}
+
+// ── Create appointment and emit appointment_card from backend (AI flow) ──────────
+async function createAiAppointment({ pool, io, sendPushToUser, agentId, clientId, propertyId, date, time }) {
+  // Skip if already in the past
+  const dt = new Date(`${date}T${time}`);
+  if (dt < new Date()) return;
+
+  // Skip if a confirmed appointment already exists for this triplet
+  const [[confirmed]] = await pool.promise().query(
+    `SELECT id FROM appointments WHERE property_id = ? AND requester_id = ? AND agent_id = ? AND status = 'confirmed' LIMIT 1`,
+    [propertyId, clientId, agentId]
+  );
+  if (confirmed) return;
+
+  // Adjust date/time to agent work hours if needed
+  const resolved = await resolveSlot(pool, agentId, clientId, date, time);
+  if (!resolved) return;
+  date = resolved.date;
+  time = resolved.time;
+
+  // Cancel existing pending appointments for same property+agent+client
+  const [oldPending] = await pool.promise().query(
+    `SELECT id FROM appointments WHERE property_id = ? AND requester_id = ? AND agent_id = ? AND status = 'pending'`,
+    [propertyId, clientId, agentId]
+  );
+  if (oldPending.length) {
+    await pool.promise().query(
+      `UPDATE appointments SET status = 'cancelled', cancellation_reason = 'Reemplazada por propuesta de IA', updated_at = NOW() WHERE id IN (?)`,
+      [oldPending.map(r => r.id)]
+    );
+  }
+
+  // Create appointment (requester = client, agent = agent)
+  const [apptResult] = await pool.promise().query(
+    `INSERT INTO appointments (property_id, requester_id, agent_id, appointment_date, appointment_time, notes, status)
+     VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+    [propertyId, clientId, agentId, date, time, 'Propuesta por asistente IA']
+  );
+  const appointmentId = apptResult.insertId;
+
+  // Insert appointment_card chat message (from agent to client)
+  const [chatResult] = await pool.promise().query(
+    `INSERT INTO chat_messages (sender_id, receiver_id, property_id, message, message_type, shared_property_id)
+     VALUES (?, ?, ?, '', 'appointment_card', ?)`,
+    [agentId, clientId, propertyId, appointmentId]
+  );
+
+  // Fetch appointment details for the card
+  const [[appt]] = await pool.promise().query(
+    `SELECT a.id, a.appointment_date, a.appointment_time, a.status, a.requester_id, a.agent_id,
+            p.address AS property_address
+     FROM appointments a
+     JOIN properties p ON p.id = a.property_id
+     WHERE a.id = ?`,
+    [appointmentId]
+  );
+
+  const cardMsg = {
+    id: chatResult.insertId,
+    property_id: propertyId,
+    sender_id: agentId,
+    receiver_id: clientId,
+    message: '',
+    file_url: null,
+    file_name: null,
+    message_type: 'appointment_card',
+    shared_property_id: appointmentId,
+    created_at: new Date().toISOString(),
+    card_appointment: appt ? {
+      id: appt.id,
+      appointment_date: appt.appointment_date,
+      appointment_time: appt.appointment_time,
+      status: appt.status,
+      property_address: appt.property_address,
+      requester_id: appt.requester_id,
+      agent_id: appt.agent_id,
+    } : null,
+  };
+
+  io.to('user_' + agentId).emit('receive_message', cardMsg);
+  io.to('user_' + clientId).emit('receive_message', cardMsg);
+
+  // Push notification to client
+  try {
+    const [[agentUser]] = await pool.promise().query(
+      'SELECT name, last_name FROM users WHERE id = ? LIMIT 1',
+      [agentId]
+    );
+    const agentName = agentUser ? `${agentUser.name} ${agentUser.last_name}`.trim() : 'El agente';
+    const dateObj = new Date(`${date}T12:00:00`);
+    const formattedDate = dateObj.toLocaleDateString('es-MX', { weekday: 'long', day: 'numeric', month: 'long' });
+    const formattedTime = time.slice(0, 5);
+
+    await sendPushToUser({
+      userId: clientId,
+      title: 'Propuesta de cita',
+      body: `${agentName} te propone una visita el ${formattedDate} a las ${formattedTime}`,
+      data: {
+        type: 'appointment',
+        appointmentId: String(appointmentId),
+        propertyId: String(propertyId),
+      },
+    });
+  } catch {}
+}
 
 module.exports = function initSockets(io, pool, helpers) {
   const { sendPushToUser, buildDeliveryUrlFromSecure, isMutedForReceiver } = helpers;
@@ -148,35 +339,139 @@ module.exports = function initSockets(io, pool, helpers) {
         io.to('user_' + sender_id).emit('receive_message', msgObj);
         io.to('user_' + receiver_id).emit('receive_message', msgObj);
 
-        // PUSH: mandar al receptor (solo si NO está silenciado)
+        // Fetch receiver type once — used for both push decision and AI auto-reply
+        let receiverRow = null;
         try {
-          const pid = property_id ?? null;
-          const muted = await isMutedForReceiver(receiver_id, sender_id, pid);
+          const [[row]] = await pool.promise().query(
+            'SELECT agent_type, ai_chat_enabled FROM users WHERE id = ? LIMIT 1',
+            [receiver_id]
+          );
+          receiverRow = row || null;
+        } catch {}
+        const receiverIsAgent = receiverRow && ['individual', 'brokerage', 'seller'].includes(receiverRow.agent_type);
 
-          if (muted) {
-            console.log('[push] skipped (muted chat)', {
-              receiver_id,
-              sender_id,
-              property_id: pid
-            });
-          } else {
-            await sendPushToUser({
+        // PUSH: solo a clientes (regular). Los agentes reciben notificaciones únicamente
+        // cuando la IA los notifica explícitamente ([NOTIFICAR_AGENTE] o cita cerrada).
+        if (!receiverIsAgent) {
+          try {
+            const pid = property_id ?? null;
+            const muted = await isMutedForReceiver(receiver_id, sender_id, pid);
+            if (!muted) {
+              await sendPushToUser({
+                userId: receiver_id,
+                title: 'Nuevo mensaje',
+                body: messageSafe
+                  ? (messageSafe.length > 110 ? messageSafe.slice(0, 110) + '\u2026' : messageSafe)
+                  : (fileUrlSafe ? 'Te enviaron un archivo' : 'Nuevo mensaje'),
+                data: {
+                  type: 'chat',
+                  chatParams: {
+                    otherUserId: String(sender_id),
+                    propertyId: pid != null ? String(pid) : undefined,
+                  }
+                }
+              });
+            }
+          } catch (e) {
+            console.error('[push] error', e);
+          }
+        }
+
+        // ── AI auto-reply ────────────────────────────────────────────────────────
+        // Only trigger if: sender is a regular user, message is text, property_id exists
+        if (msgType !== 'text' || !property_id) return;
+        try {
+          const isAgent = receiverIsAgent;
+          const aiOn = receiverRow && receiverRow.ai_chat_enabled === 1;
+          if (!isAgent || !aiOn) return;
+
+          const [[senderRow]] = await pool.promise().query(
+            'SELECT agent_type FROM users WHERE id = ? LIMIT 1',
+            [sender_id]
+          );
+          if (!senderRow || senderRow.agent_type !== 'regular') return;
+
+          // Simulate typing delay (1.5–2.5s)
+          const delay = 1500 + Math.floor(Math.random() * 1000);
+          await new Promise(r => setTimeout(r, delay));
+
+          const { reply, suggestAppointment, modifyAppointment, extractedDate, extractedTime, notifyAgent } =
+            await generateAutoReply({ agentId: receiver_id, clientId: sender_id, propertyId: property_id });
+
+          if (!reply) return;
+
+          // Insert AI response as agent's message
+          const [aiResult] = await pool.promise().query(
+            `INSERT INTO chat_messages (property_id, sender_id, receiver_id, message, message_type)
+             VALUES (?, ?, ?, ?, 'text')`,
+            [property_id, receiver_id, sender_id, reply]
+          );
+
+          const aiMsg = {
+            id: aiResult.insertId,
+            property_id,
+            sender_id: receiver_id,
+            receiver_id: sender_id,
+            message: reply,
+            file_url: null,
+            file_name: null,
+            message_type: 'text',
+            shared_property_id: null,
+            created_at: new Date().toISOString(),
+            ai_generated: true,
+          };
+
+          io.to('user_' + receiver_id).emit('receive_message', aiMsg);
+          io.to('user_' + sender_id).emit('receive_message', aiMsg);
+
+          // ── AI appointment creation — handled entirely in backend ────────────
+          // The client cannot call quick-invite (agent-only), so we create the
+          // appointment here and emit the appointment_card directly.
+          if (suggestAppointment || modifyAppointment) {
+            try {
+              let apptDate = extractedDate;
+              let apptTime = extractedTime;
+
+              if (!apptDate || !apptTime) {
+                const slot = await findNextAvailableSlot(pool, receiver_id, sender_id);
+                if (slot) {
+                  apptDate = slot.date;
+                  apptTime = slot.time;
+                }
+              }
+
+              if (apptDate && apptTime) {
+                await createAiAppointment({
+                  pool, io, sendPushToUser,
+                  agentId: receiver_id,
+                  clientId: sender_id,
+                  propertyId: property_id,
+                  date: apptDate,
+                  time: apptTime,
+                });
+              }
+            } catch (apptErr) {
+              console.error('[ai-auto-reply] appointment creation error', apptErr?.message);
+            }
+          }
+
+          // Notify agent if AI was uncertain
+          if (notifyAgent) {
+            sendPushToUser({
               userId: receiver_id,
-              title: 'Nuevo mensaje',
-              body: messageSafe
-                ? (messageSafe.length > 110 ? messageSafe.slice(0, 110) + '\u2026' : messageSafe)
-                : (fileUrlSafe ? 'Te enviaron un archivo' : 'Nuevo mensaje'),
+              title: 'Revisión requerida',
+              body: `Un cliente preguntó algo que tu asistente de IA no pudo responder sobre la propiedad.`,
               data: {
                 type: 'chat',
                 chatParams: {
                   otherUserId: String(sender_id),
-                  propertyId: pid != null ? String(pid) : undefined,
-                }
-              }
+                  propertyId: String(property_id),
+                },
+              },
             });
           }
-        } catch (e) {
-          console.error('[push] error', e);
+        } catch (aiErr) {
+          console.error('[ai-auto-reply] error', aiErr?.message);
         }
     });
   });

@@ -346,4 +346,52 @@ router.put('/api/chat/mark-read', authenticateToken, (req, res) => {
   });
 });
 
+// GET /api/chat/ai-summary — AI-generated conversation summary for agents
+router.get('/api/chat/ai-summary', authenticateToken, async (req, res) => {
+  try {
+    const agentId = req.user.id;
+    const { other_user_id, property_id } = req.query;
+
+    if (!other_user_id) return res.status(400).json({ error: 'other_user_id requerido' });
+
+    const [[me]] = await pool.promise().query(
+      'SELECT agent_type FROM users WHERE id = ? LIMIT 1',
+      [agentId]
+    );
+    if (!me || me.agent_type === 'regular') {
+      return res.status(403).json({ error: 'Solo agentes' });
+    }
+
+    const [msgs] = await pool.promise().query(
+      `SELECT sender_id, message, message_type, created_at
+       FROM chat_messages
+       WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+         AND (property_id <=> ?) AND is_deleted = 0
+       ORDER BY created_at DESC LIMIT 40`,
+      [agentId, other_user_id, other_user_id, agentId, property_id ?? null]
+    );
+
+    if (!msgs.length) return res.json({ summary: null });
+
+    const lines = msgs.reverse()
+      .filter(m => m.message_type === 'text' && m.message)
+      .map(m => `${String(m.sender_id) === String(agentId) ? 'Agente' : 'Cliente'}: ${m.message}`);
+
+    if (!lines.length) return res.json({ summary: null });
+
+    const { aiGenerate } = require('../utils/ai');
+
+    const systemPrompt = `Eres un asistente que genera resúmenes ultra-concisos de conversaciones de ventas inmobiliarias para el agente. El agente leerá esto para ponerse al corriente en segundos.`;
+    const userPrompt = `Conversación:\n${lines.join('\n')}\n\nResumen en máximo 3-4 líneas: qué busca o preguntó el cliente, puntos clave, estado actual (¿cita agendada? ¿algo pendiente para el agente?). Directo, sin encabezados, en español.`;
+
+    const cachePrefix = `chat_sum_${agentId}_${other_user_id}_${property_id ?? 'null'}`;
+    const summary = await aiGenerate(systemPrompt, userPrompt, { cacheTTL: 5 * 60 * 1000, cachePrefix });
+
+    res.json({ summary: summary.trim() });
+  } catch (e) {
+    console.error('[GET /api/chat/ai-summary] error', e);
+    res.status(500).json({ error: 'No se pudo generar el resumen' });
+  }
+});
+
 module.exports = router;

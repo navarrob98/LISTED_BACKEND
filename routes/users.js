@@ -141,6 +141,19 @@ router.get('/users/:id/profile-photo', authenticateToken, async (req, res) => {
   }
 });
 
+// PUT /users/me/ai-chat — toggle AI auto-reply
+router.put('/users/me/ai-chat', authenticateToken, async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled requerido (boolean)' });
+    await pool.promise().query('UPDATE users SET ai_chat_enabled = ? WHERE id = ?', [enabled ? 1 : 0, req.user.id]);
+    res.json({ ok: true, ai_chat_enabled: enabled });
+  } catch (e) {
+    console.error('[PUT /users/me/ai-chat]', e);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
 // GET /users/me/business-card — datos para la tarjeta digital del agente
 router.get('/users/me/business-card', authenticateToken, async (req, res) => {
   try {

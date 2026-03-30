@@ -84,6 +84,7 @@ io.use((socket, next) => {
 });
 
 initSockets(io, pool, helpers);
+require('./routes/appointments').setIo(io);
 
 // ── Global error handler ──────────────────────────────
 app.use((err, req, res, next) => {
