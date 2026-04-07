@@ -421,7 +421,7 @@ const forgotPasswordIpLimiter = rateLimit({
   max: 5,                   // 5 requests por IP en la ventana
   standardHeaders: true,
   legacyHeaders: false,
-  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:forgotpw:' }),
+  store: new RedisStore({ sendCommand: (...args) => redis.infra.call(...args), prefix: 'rl:forgotpw:' }),
   handler: (req, res) => res.status(429).json({ ok: true }),
 });
 

@@ -69,7 +69,7 @@ function buildPropertyContext(p) {
 }
 
 // ── Main auto-reply generator ────────────────────────────────────────────────────
-async function generateAutoReply({ agentId, clientId, propertyId }) {
+async function generateAutoReply({ agentId, clientId, propertyId, isPendingNotify = false }) {
   // 1. Fetch property
   let property = null;
   if (propertyId) {
@@ -126,28 +126,39 @@ async function generateAutoReply({ agentId, clientId, propertyId }) {
       if (appointments.length > 0) {
         const a = appointments[0];
         const t = String(a.appointment_time).slice(0, 5);
+        // Normalize appointment_date to YYYY-MM-DD string regardless of how mysql2 returns it
+        const apptDateStr = typeof a.appointment_date === 'string'
+          ? a.appointment_date.split('T')[0]
+          : a.appointment_date instanceof Date
+            ? a.appointment_date.toISOString().split('T')[0]
+            : String(a.appointment_date);
         if (a.status === 'confirmed') {
-          appointmentNote = `\nCITAS: Ya hay una cita CONFIRMADA para el ${a.appointment_date} a las ${t}. NO uses [CITA] ni [MODIFICAR_CITA]. Prepara al cliente para la visita con entusiasmo.`;
+          appointmentNote = `\nCITAS: Ya hay una cita CONFIRMADA para el ${apptDateStr} a las ${t}. NO uses [CITA] ni [MODIFICAR_CITA]. Prepara al cliente para la visita con entusiasmo.`;
         } else {
-          appointmentNote = `\nCITAS: Hay una propuesta de visita PENDIENTE para el ${a.appointment_date} a las ${t}. NO propongas otra cita. Menciona que está pendiente de confirmar.`;
+          appointmentNote = `\nCITAS: Hay una propuesta de visita PENDIENTE para el ${apptDateStr} a las ${t}. NO propongas otra cita. Menciona que está pendiente de confirmar.`;
         }
       } else {
-        appointmentNote = '\nCITAS: No hay citas agendadas. Cuando el cliente muestre interés genuino en ver la propiedad, usa [CITA] para proponer visita.';
+        appointmentNote = `\nCITAS: No hay citas agendadas. Cuando el cliente muestre interés genuino en ver la propiedad, usa [CITA] para proponer visita. Al proponer la visita, menciona en una frase natural que una vez que confirme la cita, ${agentName || 'el agente'} tomará el seguimiento personalmente desde ese momento.`;
       }
     } catch {}
   }
 
-  // 5. Today's date context
-  const todayISO = new Date().toISOString().split('T')[0];
+  // 5. Today's date context — use Mexico City timezone so the AI never gets UTC date
+  // (e.g. at 7pm Mexico time, UTC is already next day, causing off-by-one date errors)
+  const todayISO = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Mexico_City' }); // returns YYYY-MM-DD
   const dayNames = ['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
-  const todayDayName = dayNames[new Date().getDay()];
+  const todayDayName = dayNames[new Date(todayISO + 'T12:00:00').getDay()];
 
   const propertyContext = buildPropertyContext(property);
   const isFirstReply = totalClientMsgs <= 1;
 
   // 6. System prompt — sales-focused conversational assistant
   const firstContactNote = isFirstReply
-    ? `\nPRIMER CONTACTO: Saluda calurosamente identificándote como el equipo de ${agentName || 'el agente'}, confirma disponibilidad en una sola frase, y haz UNA pregunta de calificación para entender al cliente.`
+    ? `\nPRIMER CONTACTO: El cliente ya está interesado en esta propiedad específica — NO preguntes si busca alguna propiedad. Salúdalo con confianza identificándote como el equipo de ${agentName || 'el agente'}, hazle saber que tienes toda la información de esta propiedad y que estás aquí para resolver cualquier duda al momento. Proyecta seguridad: eres el experto en esta propiedad. Cierra con UNA pregunta abierta para entender qué le interesa saber (precio, características, visita, etc.).`
+    : '';
+
+  const pendingNotifyNote = isPendingNotify
+    ? `\nNOTIFICACIÓN PENDIENTE: Le preguntaste al cliente si deseaba que consultaras al agente y estás esperando su respuesta. Analiza su mensaje: si confirma (dice "sí", "sí por favor", "adelante", "claro", "ok", "hazlo", etc.) responde brevemente confirmando que ya notificaste al agente y agrega [CONFIRMAR_NOTIFICAR] al final. Si declina ("no", "no importa", "mejor no", etc.) o cambia de tema sin confirmar, responde normalmente y ayúdalo SIN agregar [CONFIRMAR_NOTIFICAR]. NO uses [NOTIFICAR_AGENTE] en este mensaje.`
     : '';
 
   const systemPrompt = `Eres el asesor digital de ${agentName || 'el agente'} en Listed, plataforma inmobiliaria de México. Atiendes por WhatsApp en su nombre. Tu objetivo: ganarte la confianza del cliente y cerrar una visita.
@@ -184,7 +195,7 @@ TAGS DE CITA — agrégalos SOLO si el cliente pide visitar o ver la propiedad d
 - [CITA:YYYY-MM-DD:HH:MM] — siempre que haya cualquier referencia de fecha u hora, resuélvela al valor real.
 - [MODIFICAR_CITA] o [MODIFICAR_CITA:YYYY-MM-DD:HH:MM] — para cambiar una cita existente, mismas reglas de resolución.
 - NO usar por interés general ni saludos. En caso de duda, NO lo uses.${appointmentNote}
-${firstContactNote}
+${firstContactNote}${pendingNotifyNote}
 ${propertyContext}`;
 
   const userPrompt = `Conversación reciente:\n${chatHistory || '(sin mensajes previos)'}\n\nResponde ÚNICAMENTE al último mensaje del Cliente. No anticipes lo que preguntará después.`;
@@ -198,7 +209,8 @@ ${propertyContext}`;
   let modifyAppointment = false;
   let extractedDate = null;
   let extractedTime = null;
-  let notifyAgent = false;
+  let pendingNotify = false;
+  let confirmNotify = false;
 
   // Guard: require at least 2 client messages before allowing appointment tags
   const allowAppointmentTags = totalClientMsgs >= 2;
@@ -223,7 +235,11 @@ ${propertyContext}`;
   }
 
   if (reply.includes('[NOTIFICAR_AGENTE]')) {
-    notifyAgent = true;
+    pendingNotify = true;
+  }
+
+  if (reply.includes('[CONFIRMAR_NOTIFICAR]')) {
+    confirmNotify = true;
   }
 
   // Clean all tags from text
@@ -233,6 +249,7 @@ ${propertyContext}`;
     .replace(/\[MODIFICAR_CITA:\d{4}-\d{2}-\d{2}:\d{2}:\d{2}\]/g, '')
     .replace(/\[MODIFICAR_CITA\]/g, '')
     .replace(/\[NOTIFICAR_AGENTE\]/g, '')
+    .replace(/\[CONFIRMAR_NOTIFICAR\]/g, '')
     .trim();
 
   return {
@@ -241,7 +258,8 @@ ${propertyContext}`;
     modifyAppointment,
     extractedDate,
     extractedTime,
-    notifyAgent,
+    pendingNotify,
+    confirmNotify,
   };
 }
 

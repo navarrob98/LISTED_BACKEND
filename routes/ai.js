@@ -37,7 +37,7 @@ const descriptionLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   validate: { xForwardedForHeader: false, ip: false },
-  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:ai:desc:' }),
+  store: new RedisStore({ sendCommand: (...args) => redis.infra.call(...args), prefix: 'rl:ai:desc:' }),
   handler: (_req, res) => res.status(429).json({ ok: false, error: 'rate_limit', message: 'Demasiados intentos. Intenta en unos minutos.' }),
 });
 
@@ -48,7 +48,7 @@ const smartRepliesLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   validate: { xForwardedForHeader: false, ip: false },
-  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:ai:replies:' }),
+  store: new RedisStore({ sendCommand: (...args) => redis.infra.call(...args), prefix: 'rl:ai:replies:' }),
   handler: (_req, res) => res.status(429).json({ ok: false, error: 'rate_limit' }),
 });
 
@@ -59,7 +59,7 @@ const assistantLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   validate: false,
-  store: new RedisStore({ sendCommand: (...args) => redis.call(...args), prefix: 'rl:ai:assist:' }),
+  store: new RedisStore({ sendCommand: (...args) => redis.infra.call(...args), prefix: 'rl:ai:assist:' }),
   handler: (_req, res) => res.status(429).json({ ok: false, error: 'rate_limit', message: 'Has enviado muchos mensajes. Espera unos minutos.' }),
 });
 
@@ -405,10 +405,11 @@ router.post('/api/ai/smart-replies', authenticateToken, smartRepliesLimiter, asy
       else if (appointments.find(a => a.status === 'pending')) conversationStage = 'cita_pendiente';
     }
 
-    // Build today's date for the AI to resolve relative dates ("jueves", "mañana", etc.)
-    const todayISO = new Date().toISOString().split('T')[0];
+    // Build today's date for the AI — use Mexico City timezone (toISOString gives UTC which
+    // is one day ahead of local Mexican time in the evenings, causing off-by-one date errors)
+    const todayISO = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Mexico_City' });
     const dayNames = ['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
-    const todayDayName = dayNames[new Date().getDay()];
+    const todayDayName = dayNames[new Date(todayISO + 'T12:00:00').getDay()];
 
     const systemPrompt = `Eres un agente inmobiliario mexicano profesional y astuto escribiendo por WhatsApp.${agentNameStr ? ' Te llamas ' + agentNameStr + '.' : ''}${clientNameStr ? ' Le escribes a ' + clientNameStr + '.' : ''}
 Hoy es ${todayDayName} ${todayISO}.
@@ -569,7 +570,9 @@ router.post('/api/ai/assistant', optionalAuth, assistantLimiter, async (req, res
         [userId, 'user', message.trim()]);
 
       history = await q(
-        'SELECT role, message FROM ai_conversations WHERE user_id = ? ORDER BY created_at DESC LIMIT 8',
+        `SELECT role, message FROM ai_conversations
+         WHERE user_id = ? AND message NOT REGEXP 'ID [0-9]+:'
+         ORDER BY created_at DESC LIMIT 8`,
         [userId]
       );
       history.reverse();
@@ -597,20 +600,127 @@ router.post('/api/ai/assistant', optionalAuth, assistantLimiter, async (req, res
       }
     }
 
+    // ── Financial context ──
     let buyingPowerContext = '';
+    let bpSuggestedPrice = null;
+    let bpMonthlyTarget = null;
     if (userId) {
       try {
-        const [bp] = await q(
-          'SELECT suggested FROM buying_power WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+        const rows = await q(
+          'SELECT suggested_price, monthly_target, down_payment FROM buying_power WHERE user_id = ? LIMIT 1',
           [userId]
         );
-        if (bp?.suggested) {
-          buyingPowerContext = `\n\nCapacidad de compra estimada del usuario: $${Number(bp.suggested).toLocaleString('es-MX')}`;
+        const bp = rows[0];
+        if (bp) {
+          if (bp.suggested_price) bpSuggestedPrice = bp.suggested_price;
+          if (bp.monthly_target)  bpMonthlyTarget  = bp.monthly_target;
+          const lines = [];
+          if (bp.suggested_price) lines.push(`Precio máximo de compra: $${Number(bp.suggested_price).toLocaleString('es-MX')} MXN`);
+          if (bp.monthly_target)  lines.push(`Renta mensual máxima: $${Number(bp.monthly_target).toLocaleString('es-MX')} MXN/mes`);
+          if (bp.down_payment)    lines.push(`Enganche disponible: $${Number(bp.down_payment).toLocaleString('es-MX')} MXN`);
+          if (lines.length) buyingPowerContext = `\n\nPerfil financiero del usuario:\n${lines.join('\n')}`;
         }
-      } catch { /* table may not exist */ }
+      } catch {}
+      try {
+        const rows = await q(
+          'SELECT estimated_monthly_income, family_size, has_pets FROM tenant_profiles WHERE user_id = ? LIMIT 1',
+          [userId]
+        );
+        const tp = rows[0];
+        if (tp) {
+          const lines = [];
+          if (tp.estimated_monthly_income) lines.push(`Ingreso mensual estimado: $${Number(tp.estimated_monthly_income).toLocaleString('es-MX')} MXN`);
+          if (tp.family_size) lines.push(`Tamaño de familia: ${tp.family_size} persona(s)`);
+          if (tp.has_pets != null) lines.push(`Tiene mascotas: ${tp.has_pets ? 'sí' : 'no'}`);
+          if (lines.length) buyingPowerContext += (buyingPowerContext ? '\n' : '\n\nPerfil del usuario:\n') + lines.join('\n');
+        }
+      } catch {}
     }
 
-    const systemPrompt = `Eres un asistente virtual de LISTED, un marketplace inmobiliario en México. SOLO puedes responder preguntas relacionadas con bienes raíces e inmuebles.
+    // ── Property search for Andrei ──
+    let searchedProperties = [];
+    let detectedType = null;
+    if (userId) {
+      try {
+        // Use ONLY user messages (not AI responses) to avoid contamination
+        const userOnlyText = [
+          ...history.filter(h => h.role === 'user').slice(-5).map(h => h.message),
+          message.trim(),
+        ].join(' ').toLowerCase();
+
+        // Broad intent detection — catches initial asks, follow-ups, and natural phrasing
+        const PROPERTY_WORDS = /propiedades?|casas?|departamentos?|deptos?|inmuebles?|opciones?/i;
+        const hasSearchIntent = (
+          // Explicit search verbs
+          /\b(busco|buscando|buscar|muestrame|muéstrame|muestra|recomienda|recomiendame)\b/i.test(userOnlyText) ||
+          // "quiero" + property/intent word anywhere in sentence
+          /\bquiero\b.{0,40}\b(ver|comprar|rentar|encontrar|buscar|propiedades?|casas?|departamentos?|deptos?|opciones?)\b/i.test(userOnlyText) ||
+          // property word + location preposition ("casas en", "propiedades por", "deptos de")
+          new RegExp(PROPERTY_WORDS.source + String.raw`\b.{0,30}\b(en|de|por|cerca)\b`, 'i').test(userOnlyText) ||
+          // explicit operation type
+          /\b(en venta|en renta|para (comprar|rentar|vender))\b/i.test(userOnlyText) ||
+          // follow-up phrases
+          /\b(más opciones|otras opciones|algo (diferente|más|mejor|más barato|más grande|más chico)|hay algo|tienen (algo|más)|tienes (algo|más))\b/i.test(userOnlyText) ||
+          // "hay/tienen/tienes" + property word
+          /\b(hay|tienen|tienes)\b.{0,20}\b(casas?|departamentos?|deptos?|propiedades?|inmuebles?)\b/i.test(userOnlyText)
+        );
+
+        if (hasSearchIntent) {
+          // Extract criteria from all user messages
+          const criteria = {};
+
+          if (/\b(rent[ao]r?|arrendar|en renta|para rentar)\b/.test(userOnlyText)) criteria.type = 'renta';
+          else if (/\b(comprar?|compra\b|adquirir|en venta|para comprar)\b/.test(userOnlyText)) criteria.type = 'venta';
+          detectedType = criteria.type || null;
+
+          if (/\bdepartamentos?\b/.test(userOnlyText) || /\bdeptos?\b/.test(userOnlyText)) criteria.estate_type = 'Departamento';
+          else if (/\bcasas?\b/.test(userOnlyText)) criteria.estate_type = 'Casa';
+
+          const bedMatch = userOnlyText.match(/(\d+)\s*(rec[aá]maras?|cuartos?|habitaciones?)/);
+          if (bedMatch) criteria.bedrooms = parseInt(bedMatch[1], 10);
+
+          // Zone: match after location prepositions, filter generic stopwords
+          const ZONE_STOPWORDS = /^(el|la|los|las|un|una|esa|este|ese|que|venta|renta|algo|casa|depto|departamento|todo)$/;
+          // Try multi-word zone first, then single word
+          const zoneMatch =
+            userOnlyText.match(/(?:en|zona|colonia|sector|por|cerca de)\s+([a-záéíóúüñ][a-záéíóúüñ ]{1,23}[a-záéíóúüñ])(?=\s*[,.\n?¿]|\s+\w|$)/i) ||
+            userOnlyText.match(/(?:en|zona|colonia|sector|por)\s+([a-záéíóúüñ]{3,20})(?=\s|,|\.|\?|$)/i);
+          if (zoneMatch) {
+            const zone = zoneMatch[1].trim();
+            if (!ZONE_STOPWORDS.test(zone) && zone.length >= 3) {
+              criteria.zone = zone;
+            }
+          }
+
+          // Helper: run query with given filters
+          const runSearch = async (c) => {
+            const conds = ['is_published = 1'];
+            const prms = [];
+            if (c.type)        { conds.push('type = ?');         prms.push(c.type); }
+            if (c.zone)        { conds.push('address LIKE ?');   prms.push(`%${c.zone}%`); }
+            if (c.estate_type) { conds.push('estate_type = ?');  prms.push(c.estate_type); }
+            if (c.bedrooms)    { conds.push('bedrooms >= ?');    prms.push(c.bedrooms); }
+            return q(
+              `SELECT id, address, type, price, monthly_pay, bedrooms, estate_type,
+                (SELECT image_url FROM property_images WHERE property_id = properties.id ORDER BY id ASC LIMIT 1) AS first_image
+               FROM properties WHERE ${conds.join(' AND ')} ORDER BY id DESC LIMIT 5`,
+              prms
+            );
+          };
+
+          // Progressive relaxation: full criteria → drop bedrooms → drop estate_type → zone+type only → type only → any published
+          let props = await runSearch(criteria);
+          if (!props.length && criteria.bedrooms)    props = await runSearch({ ...criteria, bedrooms: undefined });
+          if (!props.length && criteria.estate_type) props = await runSearch({ ...criteria, bedrooms: undefined, estate_type: undefined });
+          if (!props.length && criteria.zone)        props = await runSearch({ type: criteria.type });
+          if (!props.length)                         props = await runSearch({});
+
+          searchedProperties = props;
+        }
+      } catch {}
+    }
+
+    const systemPrompt = `Eres AndreI, agente inmobiliario virtual de LISTED, un marketplace inmobiliario en México. SOLO puedes responder preguntas relacionadas con bienes raíces e inmuebles.
 
 Temas PERMITIDOS:
 - Compraventa y renta de propiedades en México
@@ -626,22 +736,39 @@ Temas PERMITIDOS:
 Si el usuario pregunta CUALQUIER cosa que NO esté relacionada con bienes raíces, inmuebles o los temas de arriba, responde EXACTAMENTE: "Solo puedo ayudarte con temas relacionados a bienes raíces. ¿Tienes alguna duda sobre compra, renta, créditos hipotecarios o propiedades?"
 No hagas excepciones. No respondas preguntas de cultura general, matemáticas, animales, deportes, tecnología, cocina ni ningún otro tema.
 
+BÚSQUEDA DE PROPIEDADES:
+Cuando el usuario pida ver propiedades y no encontraste resultados, di exactamente eso: "No encontré propiedades disponibles con esos criterios en este momento." No sugieras zonas, no hagas listas de colonias, no inventes opciones, no repitas preguntas que ya hiciste. Si ya tienes la información de lo que busca (zona, tipo, precio), no la pidas de nuevo.
+
 Reglas de formato:
 - Responde en español mexicano natural y profesional
 - Máximo 150 palabras por respuesta. Sé BREVE y directo — ve al grano sin rodeos ni introducciones largas
 - No repitas la pregunta del usuario ni uses frases de relleno como "Claro, con gusto te explico", "Es una excelente pregunta", etc. Ve directo a la respuesta
-- Usa bullets o listas cortas cuando aplique, en vez de párrafos largos
+- Usa bullets o listas cortas cuando aplique en temas generales, nunca para propiedades
 - No uses emojis
 - No inventes datos específicos de precios de zonas; si no estás seguro, indica que los precios varían
 - Cuando sea relevante, sugiere usar herramientas de la app como la calculadora Infonavit o el perfil de capacidad de compra${propertyContext}${buyingPowerContext}`;
 
+    // ── If properties found, bypass AI entirely — return template + cards ──
+    if (searchedProperties.length > 0) {
+      let bpHint = '';
+      if (bpSuggestedPrice && detectedType !== 'renta') {
+        bpHint = ` Tomé en cuenta tu capacidad de compra de $${Number(bpSuggestedPrice).toLocaleString('es-MX')} MXN para estos resultados.`;
+      } else if (bpMonthlyTarget && detectedType === 'renta') {
+        bpHint = ` Tomé en cuenta tu presupuesto de renta de $${Number(bpMonthlyTarget).toLocaleString('es-MX')}/mes para estos resultados.`;
+      }
+      const templateReply = `Aquí tienes algunas opciones disponibles en LISTED.${bpHint}`;
+      if (userId) {
+        await q('INSERT INTO ai_conversations (user_id, role, message) VALUES (?, ?, ?)',
+          [userId, 'assistant', templateReply]);
+      }
+      return res.json({ ok: true, reply: templateReply, properties: searchedProperties.slice(0, 3) });
+    }
+
     // ── Build messages array ──
     let aiMessages;
     if (history.length > 0) {
-      // Logged-in user with history
       aiMessages = history.map(h => ({ role: h.role, content: h.message }));
     } else {
-      // Anonymous user: single-turn
       aiMessages = [{ role: 'user', content: message.trim() }];
     }
 
@@ -650,14 +777,12 @@ Reglas de formato:
       cachePrefix: 'assistant',
     });
 
-    // Save assistant reply (only for logged-in users)
     if (userId) {
       await q('INSERT INTO ai_conversations (user_id, role, message) VALUES (?, ?, ?)',
         [userId, 'assistant', reply]);
-
     }
 
-    return res.json({ ok: true, reply });
+    return res.json({ ok: true, reply, properties: [] });
   } catch (err) {
     console.error('[ai:assistant]', err.message, err.stack);
     if (err.message === 'AI_DISABLED') {
@@ -747,7 +872,9 @@ router.get('/api/ai/assistant/history', optionalAuth, async (req, res) => {
     if (!userId) return res.json({ ok: true, messages: [] });
 
     const rows = await q(
-      'SELECT role, message, created_at FROM ai_conversations WHERE user_id = ? ORDER BY created_at ASC LIMIT 15',
+      `SELECT role, message, created_at FROM ai_conversations
+       WHERE user_id = ? AND message NOT REGEXP 'ID [0-9]+:'
+       ORDER BY created_at ASC LIMIT 15`,
       [userId]
     );
     return res.json({ ok: true, messages: rows });

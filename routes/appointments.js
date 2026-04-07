@@ -3,6 +3,30 @@ const router = express.Router();
 const pool = require('../db/pool');
 const authenticateToken = require('../middleware/authenticateToken');
 const { sendPushToUser } = require('../utils/helpers');
+const { isAiSessionEnded, endAiSession } = require('../utils/aiSession');
+
+// ── Send an AI-generated text message in a chat thread ───────────────────────
+async function insertAiTextMessage(pool, io, { agentId, clientId, propertyId, message }) {
+  const [result] = await pool.promise().query(
+    `INSERT INTO chat_messages (sender_id, receiver_id, property_id, message, message_type)
+     VALUES (?, ?, ?, ?, 'text')`,
+    [agentId, clientId, propertyId ?? null, message]
+  );
+  const msgObj = {
+    id: result.insertId,
+    property_id: propertyId ?? null,
+    sender_id: agentId,
+    receiver_id: clientId,
+    message,
+    message_type: 'text',
+    created_at: new Date().toISOString(),
+    ai_generated: true,
+  };
+  if (io) {
+    io.to('user_' + agentId).emit('receive_message', msgObj);
+    io.to('user_' + clientId).emit('receive_message', msgObj);
+  }
+}
 
 // io is injected after Socket.io is initialized in backend.js
 let io = null;
@@ -500,6 +524,38 @@ router.put('/api/appointments/:id/client-accept', authenticateToken, async (req,
 
     emitAppointmentUpdated({ ...appointment, status: 'confirmed' });
 
+    // If AI session is active: send warm farewell message, then end session
+    try {
+      if (io && !(await isAiSessionEnded(pool, appointment.agent_id, appointment.requester_id, appointment.property_id))) {
+        // Format date for the confirmation message
+        const rawDate = appointment.appointment_date;
+        const dateStr = typeof rawDate === 'string' ? rawDate.split('T')[0] : rawDate.toISOString().split('T')[0];
+        const dateObj = new Date(dateStr + 'T12:00:00');
+        const formattedDate = dateObj.toLocaleDateString('es-MX', { weekday: 'long', day: 'numeric', month: 'long' });
+        const timeStr = String(appointment.appointment_time).slice(0, 5);
+
+        const [[agentRow]] = await pool.promise().query('SELECT name FROM users WHERE id = ? LIMIT 1', [appointment.agent_id]);
+        const agentName = agentRow?.name || 'el agente';
+
+        const confirmMsg = `¡Perfecto, su visita quedó confirmada para el ${formattedDate} a las ${timeStr}! Fue un gusto atenderle. ${agentName} le dará seguimiento a partir de ahora. ¡Hasta pronto y que tenga excelente día!`;
+        await insertAiTextMessage(pool, io, {
+          agentId: appointment.agent_id,
+          clientId: appointment.requester_id,
+          propertyId: appointment.property_id,
+          message: confirmMsg,
+        });
+
+        await endAiSession(pool, io, {
+          agentId: appointment.agent_id,
+          clientId: appointment.requester_id,
+          propertyId: appointment.property_id,
+          reason: 'appointment',
+        });
+      }
+    } catch (aiErr) {
+      console.error('[client-accept] endAiSession error', aiErr?.message);
+    }
+
     // Notify the agent
     try {
       const [clientRows] = await pool.promise().query(
@@ -712,6 +768,22 @@ router.put('/api/appointments/:id/cancel', authenticateToken, async (req, res) =
 
     emitAppointmentUpdated({ ...appointment, status: 'cancelled' });
 
+    // If the CLIENT cancelled and AI session is still active, re-engage to try to rebook
+    try {
+      const clientCancelled = String(userId) === String(appointment.requester_id);
+      if (clientCancelled && io && !(await isAiSessionEnded(pool, appointment.agent_id, appointment.requester_id, appointment.property_id))) {
+        const reengageMsg = 'Veo que la cita fue cancelada. ¿Hay algo que le preocupó o preferiría en un horario diferente? Con gusto le busco otra opción que le venga mejor.';
+        await insertAiTextMessage(pool, io, {
+          agentId: appointment.agent_id,
+          clientId: appointment.requester_id,
+          propertyId: appointment.property_id,
+          message: reengageMsg,
+        });
+      }
+    } catch (aiErr) {
+      console.error('[cancel] ai reengage error', aiErr?.message);
+    }
+
     // Notificar a la otra parte
     const notifyUserId = String(userId) === String(appointment.agent_id)
       ? appointment.requester_id
@@ -812,7 +884,7 @@ router.get('/api/appointments/next-available/:id1', authenticateToken, async (re
     for (let dayOffset = 1; dayOffset <= 7; dayOffset++) {
       const d = new Date(now);
       d.setDate(d.getDate() + dayOffset);
-      const dateStr = d.toISOString().split('T')[0];
+      const dateStr = d.toLocaleDateString('sv-SE', { timeZone: 'America/Mexico_City' });
 
       // Citas del agente
       const [booked] = await pool.promise().query(

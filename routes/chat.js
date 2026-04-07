@@ -3,6 +3,10 @@ const router = express.Router();
 const pool = require('../db/pool');
 const authenticateToken = require('../middleware/authenticateToken');
 const { signedDeliveryUrlFromSecure, buildDeliveryUrlFromSecure } = require('../utils/helpers');
+const { isAiSessionEnded, endAiSession } = require('../utils/aiSession');
+
+let io = null;
+router.setIo = (ioInstance) => { io = ioInstance; };
 
 // GET /api/chat/file-url/:message_id
 router.get('/api/chat/file-url/:message_id', authenticateToken, (req, res) => {
@@ -124,7 +128,21 @@ router.get('/api/chat/messages', authenticateToken, async (req, res) => {
         () => {}
       );
 
-      res.json({ data: mapped, page, totalPages, total, hasMore: page < totalPages });
+      // Fetch ai_chat_enabled + name for the other user (non-blocking — best effort)
+      let aiChatEnabled = false;
+      let agentName = null;
+      try {
+        const [[otherUser]] = await conn.query(
+          'SELECT ai_chat_enabled, name FROM users WHERE id = ? LIMIT 1',
+          [user_id]
+        );
+        if (otherUser) {
+          aiChatEnabled = !!otherUser.ai_chat_enabled;
+          agentName = otherUser.name || null;
+        }
+      } catch {}
+
+      res.json({ data: mapped, page, totalPages, total, hasMore: page < totalPages, ai_chat_enabled: aiChatEnabled, agent_name: agentName });
     } catch (e) {
       conn.release();
       throw e;
@@ -391,6 +409,38 @@ router.get('/api/chat/ai-summary', authenticateToken, async (req, res) => {
   } catch (e) {
     console.error('[GET /api/chat/ai-summary] error', e);
     res.status(500).json({ error: 'No se pudo generar el resumen' });
+  }
+});
+
+// POST /api/chat/end-ai-session — agent manually takes over the conversation
+router.post('/api/chat/end-ai-session', authenticateToken, async (req, res) => {
+  try {
+    const agentId = req.user.id;
+    const { client_id, property_id } = req.body;
+
+    if (!client_id) return res.status(400).json({ error: 'client_id requerido' });
+
+    const [[me]] = await pool.promise().query(
+      'SELECT agent_type FROM users WHERE id = ? LIMIT 1', [agentId]
+    );
+    if (!me || me.agent_type === 'regular') {
+      return res.status(403).json({ error: 'Solo agentes' });
+    }
+
+    const already = await isAiSessionEnded(pool, agentId, client_id, property_id ?? null);
+    if (already) return res.json({ ok: true, alreadyEnded: true });
+
+    await endAiSession(pool, io, {
+      agentId,
+      clientId: client_id,
+      propertyId: property_id ?? null,
+      reason: 'agent_takeover',
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[POST /api/chat/end-ai-session] error', e);
+    res.status(500).json({ error: 'Error al finalizar sesión IA' });
   }
 });
 

@@ -1,5 +1,6 @@
 const Sentry = require('@sentry/node');
 const { generateAutoReply } = require('../utils/aiChatAutoReply');
+const redis = require('../db/redis');
 
 // ── Find the nearest available slot for an agent (next 7 days from fromDate) ─────
 async function findNextAvailableSlot(pool, agentId, clientId, fromDate) {
@@ -17,7 +18,7 @@ async function findNextAvailableSlot(pool, agentId, clientId, fromDate) {
   for (let dayOffset = fromDate ? 0 : 1; dayOffset <= 7; dayOffset++) {
     const d = new Date(base);
     d.setDate(d.getDate() + dayOffset);
-    const dateStr = d.toISOString().split('T')[0];
+    const dateStr = d.toLocaleDateString('sv-SE', { timeZone: 'America/Mexico_City' });
 
     const [booked] = await pool.promise().query(
       `SELECT appointment_time FROM appointments WHERE agent_id = ? AND appointment_date = ? AND status IN ('pending','confirmed')`,
@@ -190,6 +191,8 @@ async function createAiAppointment({ pool, io, sendPushToUser, agentId, clientId
     });
   } catch {}
 }
+
+const { isAiSessionEnded, endAiSession } = require('../utils/aiSession');
 
 module.exports = function initSockets(io, pool, helpers) {
   const { sendPushToUser, buildDeliveryUrlFromSecure, isMutedForReceiver } = helpers;
@@ -391,12 +394,23 @@ module.exports = function initSockets(io, pool, helpers) {
           );
           if (!senderRow || senderRow.agent_type !== 'regular') return;
 
+          // Skip AI if session was already ended for this triplet
+          const sessionEnded = await isAiSessionEnded(pool, receiver_id, sender_id, property_id);
+          if (sessionEnded) return;
+
+          // Check if a [NOTIFICAR_AGENTE] confirmation is pending for this triplet
+          const pendingKey = `ai:pn:${receiver_id}:${sender_id}:${property_id ?? 'null'}`;
+          let isPendingNotify = false;
+          try {
+            isPendingNotify = !!(await redis.get(pendingKey));
+          } catch {}
+
           // Simulate typing delay (1.5–2.5s)
           const delay = 1500 + Math.floor(Math.random() * 1000);
           await new Promise(r => setTimeout(r, delay));
 
-          const { reply, suggestAppointment, modifyAppointment, extractedDate, extractedTime, notifyAgent } =
-            await generateAutoReply({ agentId: receiver_id, clientId: sender_id, propertyId: property_id });
+          const { reply, suggestAppointment, modifyAppointment, extractedDate, extractedTime, pendingNotify, confirmNotify } =
+            await generateAutoReply({ agentId: receiver_id, clientId: sender_id, propertyId: property_id, isPendingNotify });
 
           if (!reply) return;
 
@@ -449,14 +463,27 @@ module.exports = function initSockets(io, pool, helpers) {
                   date: apptDate,
                   time: apptTime,
                 });
+                // Session ends when client *confirms* the appointment, not here
               }
             } catch (apptErr) {
               console.error('[ai-auto-reply] appointment creation error', apptErr?.message);
             }
           }
 
-          // Notify agent if AI was uncertain
-          if (notifyAgent) {
+          // Two-step [NOTIFICAR_AGENTE] flow
+          if (isPendingNotify && confirmNotify) {
+            // Client confirmed — end session and notify agent
+            try {
+              await redis.del(pendingKey);
+            } catch {}
+            try {
+              await endAiSession(pool, io, {
+                agentId: receiver_id,
+                clientId: sender_id,
+                propertyId: property_id,
+                reason: 'uncertain',
+              });
+            } catch {}
             sendPushToUser({
               userId: receiver_id,
               title: 'Revisión requerida',
@@ -469,6 +496,16 @@ module.exports = function initSockets(io, pool, helpers) {
                 },
               },
             });
+          } else if (isPendingNotify && !confirmNotify) {
+            // Client declined or changed topic — clear pending state, session continues
+            try {
+              await redis.del(pendingKey);
+            } catch {}
+          } else if (pendingNotify) {
+            // AI just flagged uncertainty — set pending state, wait for client response
+            try {
+              await redis.set(pendingKey, '1', 'EX', 86400);
+            } catch {}
           }
         } catch (aiErr) {
           console.error('[ai-auto-reply] error', aiErr?.message);

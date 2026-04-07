@@ -67,8 +67,10 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: allowedOrigins, methods: ['GET', 'POST'] } });
 
 // ── Socket.io Redis adapter (multi-worker pub/sub) ──
-const pubClient = redis.duplicate();
-const subClient = redis.duplicate();
+// Use the infra client (enableOfflineQueue: true) so psubscribe/subscribe
+// issued by the adapter constructor queue up until Redis connects.
+const pubClient = redis.infra.duplicate();
+const subClient = redis.infra.duplicate();
 io.adapter(createAdapter(pubClient, subClient));
 
 // ── Socket.io JWT authentication middleware ──
@@ -85,6 +87,7 @@ io.use((socket, next) => {
 
 initSockets(io, pool, helpers);
 require('./routes/appointments').setIo(io);
+require('./routes/chat').setIo(io);
 
 // ── Global error handler ──────────────────────────────
 app.use((err, req, res, next) => {
