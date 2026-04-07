@@ -551,155 +551,137 @@ Responde SOLO con las 3 opciones separadas por ||| sin números ni explicaciones
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Feature 3: Buyer assistant
+// Feature 3: Buyer assistant (AndreI)
 // ═══════════════════════════════════════════════════════════════════════════════
 router.post('/api/ai/assistant', optionalAuth, assistantLimiter, async (req, res) => {
   try {
     const userId = req.user?.id || null;
-    const { message, propertyIds } = req.body;
+    const { message } = req.body;
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ ok: false, error: 'Se requiere un mensaje.' });
     }
 
-    // ── Conversation history (only for logged-in users) ──
-    let history = [];
+    // ── Save user message + load history ──────────────────────────────────────
     if (userId) {
-
       await q('INSERT INTO ai_conversations (user_id, role, message) VALUES (?, ?, ?)',
         [userId, 'user', message.trim()]);
+    }
 
-      history = await q(
+    let history = [];
+    if (userId) {
+      const rows = await q(
         `SELECT role, message FROM ai_conversations
-         WHERE user_id = ? AND message NOT REGEXP 'ID [0-9]+:'
-         ORDER BY created_at DESC LIMIT 8`,
+         WHERE user_id = ? ORDER BY created_at DESC LIMIT 10`,
         [userId]
       );
-      history.reverse();
+      history = rows.reverse();
     }
 
-    // ── Property enrichment (only for logged-in users with IDs) ──
-    let propertyContext = '';
-    if (userId && propertyIds && Array.isArray(propertyIds) && propertyIds.length > 0) {
-      const ids = propertyIds.slice(0, 5).map(Number).filter(n => n > 0);
-      if (ids.length > 0) {
-        const placeholders = ids.map(() => '?').join(',');
-        const props = await q(
-          `SELECT id, type, estate_type, price, monthly_pay, address, bedrooms, bathrooms, land, construction
-           FROM properties WHERE id IN (${placeholders}) LIMIT 5`,
-          ids
-        );
-        if (props.length > 0) {
-          propertyContext = '\n\nPropiedades que el usuario ha visto recientemente:\n' +
-            props.map(p => {
-              const priceStr = p.price ? `$${Number(p.price).toLocaleString('es-MX')}` :
-                               p.monthly_pay ? `$${Number(p.monthly_pay).toLocaleString('es-MX')}/mes` : 'precio no disponible';
-              return `- ${ESTATE_LABELS[p.estate_type] || p.estate_type} en ${p.address || 'ubicación no especificada'}, ${priceStr}`;
-            }).join('\n');
-        }
-      }
-    }
-
-    // ── Financial context ──
-    let buyingPowerContext = '';
-    let bpSuggestedPrice = null;
-    let bpMonthlyTarget = null;
+    // ── Full user context ─────────────────────────────────────────────────────
+    let userProfileBlock = '';
     if (userId) {
       try {
-        const rows = await q(
-          'SELECT suggested_price, monthly_target, down_payment FROM buying_power WHERE user_id = ? LIMIT 1',
-          [userId]
-        );
-        const bp = rows[0];
-        if (bp) {
-          if (bp.suggested_price) bpSuggestedPrice = bp.suggested_price;
-          if (bp.monthly_target)  bpMonthlyTarget  = bp.monthly_target;
-          const lines = [];
-          if (bp.suggested_price) lines.push(`Precio máximo de compra: $${Number(bp.suggested_price).toLocaleString('es-MX')} MXN`);
-          if (bp.monthly_target)  lines.push(`Renta mensual máxima: $${Number(bp.monthly_target).toLocaleString('es-MX')} MXN/mes`);
-          if (bp.down_payment)    lines.push(`Enganche disponible: $${Number(bp.down_payment).toLocaleString('es-MX')} MXN`);
-          if (lines.length) buyingPowerContext = `\n\nPerfil financiero del usuario:\n${lines.join('\n')}`;
+        const ctx = await getUserContextCached(userId);
+        const { buying_power: bp, infonavit: inf, tenant_profile: tp, qualifying: qp } = ctx;
+        const lines = [];
+        if (qp?.intent) {
+          const intentLabel = qp.intent === 'buy' ? 'comprar' : qp.intent === 'rent' ? 'rentar' : 'invertir';
+          lines.push(`Intención del usuario: ${intentLabel}`);
         }
-      } catch {}
-      try {
-        const rows = await q(
-          'SELECT estimated_monthly_income, family_size, has_pets FROM tenant_profiles WHERE user_id = ? LIMIT 1',
-          [userId]
-        );
-        const tp = rows[0];
-        if (tp) {
-          const lines = [];
-          if (tp.estimated_monthly_income) lines.push(`Ingreso mensual estimado: $${Number(tp.estimated_monthly_income).toLocaleString('es-MX')} MXN`);
-          if (tp.family_size) lines.push(`Tamaño de familia: ${tp.family_size} persona(s)`);
-          if (tp.has_pets != null) lines.push(`Tiene mascotas: ${tp.has_pets ? 'sí' : 'no'}`);
-          if (lines.length) buyingPowerContext += (buyingPowerContext ? '\n' : '\n\nPerfil del usuario:\n') + lines.join('\n');
+        if (qp?.purchase_timeline) lines.push(`Timeline de compra: ${qp.purchase_timeline} meses`);
+        if (bp?.suggested_price)   lines.push(`Capacidad de compra calculada: $${Number(bp.suggested_price).toLocaleString('es-MX')} MXN`);
+        if (bp?.monthly_target)    lines.push(`Presupuesto de renta: $${Number(bp.monthly_target).toLocaleString('es-MX')} MXN/mes`);
+        if (bp?.down_payment)      lines.push(`Enganche disponible: $${Number(bp.down_payment).toLocaleString('es-MX')} MXN`);
+        if (bp?.monthly_income)    lines.push(`Ingreso mensual: $${Number(bp.monthly_income).toLocaleString('es-MX')} MXN`);
+        if (inf?.credit_amount)    lines.push(`Crédito Infonavit disponible: $${Number(inf.credit_amount).toLocaleString('es-MX')} MXN`);
+        if (tp?.estimated_monthly_income) lines.push(`Ingreso mensual (perfil renta): $${Number(tp.estimated_monthly_income).toLocaleString('es-MX')} MXN`);
+        if (tp?.family_size)  lines.push(`Tamaño de familia: ${tp.family_size} persona(s)`);
+        if (tp?.has_pets != null) lines.push(`Mascotas: ${tp.has_pets ? 'sí' : 'no'}`);
+        if (qp?.has_pre_approval) lines.push(`Pre-aprobación hipotecaria: ${qp.pre_approval_bank || 'sí'}${qp.pre_approval_amount ? ` por $${Number(qp.pre_approval_amount).toLocaleString('es-MX')}` : ''}`);
+        if (qp?.credit_score_range && qp.credit_score_range !== 'unknown') lines.push(`Historial crediticio: ${qp.credit_score_range}`);
+        if (qp?.bureau_status && qp.bureau_status !== 'unknown') {
+          const bl = qp.bureau_status === 'clean' ? 'limpio' : qp.bureau_status === 'minor_issues' ? 'algunos detalles menores' : 'temas importantes que resolver';
+          lines.push(`Buró de crédito: ${bl}`);
         }
-      } catch {}
+        if (lines.length > 0) {
+          userProfileBlock = `\nPERFIL DEL USUARIO (úsalo para personalizar tus respuestas — no lo cites literalmente):\n${lines.join('\n')}\n`;
+        }
+      } catch { /* non-critical */ }
     }
 
-    // ── Property search for Andrei ──
+    // ── Property search ───────────────────────────────────────────────────────
     let searchedProperties = [];
-    let detectedType = null;
+    let hasSearchIntent = false;
+    let isProactiveSearch = false;
+    let zoneRequested = null;
+    let zoneRelaxed = false;
+
     if (userId) {
       try {
-        // Use ONLY user messages (not AI responses) to avoid contamination
-        const userOnlyText = [
-          ...history.filter(h => h.role === 'user').slice(-5).map(h => h.message),
-          message.trim(),
-        ].join(' ').toLowerCase();
-
-        // Broad intent detection — catches initial asks, follow-ups, and natural phrasing
+        const currentMsgLower = message.trim().toLowerCase();
         const PROPERTY_WORDS = /propiedades?|casas?|departamentos?|deptos?|inmuebles?|opciones?/i;
-        const hasSearchIntent = (
-          // Explicit search verbs
-          /\b(busco|buscando|buscar|muestrame|muéstrame|muestra|recomienda|recomiendame)\b/i.test(userOnlyText) ||
-          // "quiero" + property/intent word anywhere in sentence
-          /\bquiero\b.{0,40}\b(ver|comprar|rentar|encontrar|buscar|propiedades?|casas?|departamentos?|deptos?|opciones?)\b/i.test(userOnlyText) ||
-          // property word + location preposition ("casas en", "propiedades por", "deptos de")
-          new RegExp(PROPERTY_WORDS.source + String.raw`\b.{0,30}\b(en|de|por|cerca)\b`, 'i').test(userOnlyText) ||
-          // explicit operation type
-          /\b(en venta|en renta|para (comprar|rentar|vender))\b/i.test(userOnlyText) ||
-          // follow-up phrases
-          /\b(más opciones|otras opciones|algo (diferente|más|mejor|más barato|más grande|más chico)|hay algo|tienen (algo|más)|tienes (algo|más))\b/i.test(userOnlyText) ||
-          // "hay/tienen/tienes" + property word
-          /\b(hay|tienen|tienes)\b.{0,20}\b(casas?|departamentos?|deptos?|propiedades?|inmuebles?)\b/i.test(userOnlyText)
+
+        // Explicit search: user is directly asking to see properties
+        hasSearchIntent = (
+          /\b(busco|buscando|buscar|muestrame|mu[eé]strame|muestra(me)?|recomienda(me)?|m[aá]ndame|dame|dime|ense[nñ]ame)\b/i.test(currentMsgLower) ||
+          /\b(quiero|quisiera|necesito)\b.{0,50}\b(ver|comprar|rentar|encontrar|buscar|propiedades?|casas?|departamentos?|deptos?|opciones?|inmuebles?)\b/i.test(currentMsgLower) ||
+          new RegExp(PROPERTY_WORDS.source + String.raw`\b.{0,30}\b(en|de|por|cerca)\b`, 'i').test(currentMsgLower) ||
+          /\b(en venta|en renta)\b/i.test(currentMsgLower) ||
+          /\b(m[aá]s opciones|otras opciones|algo (diferente|m[aá]s|mejor|m[aá]s barato|m[aá]s grande|m[aá]s chico))\b/i.test(currentMsgLower) ||
+          /\b(hay|tienen|tienes)\b.{0,20}\b(casas?|departamentos?|deptos?|propiedades?|inmuebles?|opciones?)\b/i.test(currentMsgLower) ||
+          /\ba ver\b.{0,40}\b(casas?|departamentos?|deptos?|propiedades?|opciones?|inmuebles?)\b/i.test(currentMsgLower)
         );
 
-        if (hasSearchIntent) {
-          // Extract criteria from all user messages
+        const historyCtx = history.filter(h => h.role === 'user').slice(-3).map(h => h.message).join(' ').toLowerCase();
+
+        const detectType = (text) => {
+          if (/\b(rent[ao]r?|arrendar|en renta)\b/i.test(text)) return 'renta';
+          if (/\b(comprar?|compra\b|adquirir|en venta)\b/i.test(text)) return 'venta';
+          return null;
+        };
+        const ZONE_STOPWORDS = /^(el|la|los|las|un|una|esa|este|ese|que|venta|renta|algo|casa|depto|departamento|todo|opciones?|propiedades?)$/;
+        const extractZone = (text) => {
+          const m =
+            text.match(/(?:en|zona|colonia|sector|por|cerca de)\s+([a-záéíóúüñ][a-záéíóúüñ ]{1,23}[a-záéíóúüñ])(?=\s*[,.\n?¿]|\s+\w|$)/i) ||
+            text.match(/(?:en|zona|colonia|sector|por)\s+([a-záéíóúüñ]{3,20})(?=\s|,|\.|\?|$)/i);
+          if (!m) return null;
+          const z = m[1].trim();
+          return (!ZONE_STOPWORDS.test(z) && z.length >= 3) ? z : null;
+        };
+
+        // Proactive search: user mentions a specific zone or property type in conversation
+        // even without explicitly requesting listings — show relevant options organically
+        if (!hasSearchIntent) {
+          const proactiveZone = extractZone(currentMsgLower);
+          const proactiveType = detectType(currentMsgLower) || detectType(historyCtx);
+          if (proactiveZone || (proactiveType && history.length >= 3)) {
+            isProactiveSearch = true;
+          }
+        }
+
+        if (hasSearchIntent || isProactiveSearch) {
           const criteria = {};
+          criteria.type = detectType(currentMsgLower) || detectType(historyCtx) || null;
+          criteria.zone = extractZone(currentMsgLower) || extractZone(historyCtx) || null;
+          zoneRequested = criteria.zone;
 
-          if (/\b(rent[ao]r?|arrendar|en renta|para rentar)\b/.test(userOnlyText)) criteria.type = 'renta';
-          else if (/\b(comprar?|compra\b|adquirir|en venta|para comprar)\b/.test(userOnlyText)) criteria.type = 'venta';
-          detectedType = criteria.type || null;
+          const fullCtx = historyCtx + ' ' + currentMsgLower;
+          if (/\bdepartamentos?\b/.test(currentMsgLower) || /\bdeptos?\b/.test(currentMsgLower)) criteria.estate_type = 'Departamento';
+          else if (/\bcasas?\b/.test(currentMsgLower)) criteria.estate_type = 'Casa';
+          else if (/\bdepartamentos?\b/.test(fullCtx) || /\bdeptos?\b/.test(fullCtx)) criteria.estate_type = 'Departamento';
+          else if (/\bcasas?\b/.test(fullCtx)) criteria.estate_type = 'Casa';
 
-          if (/\bdepartamentos?\b/.test(userOnlyText) || /\bdeptos?\b/.test(userOnlyText)) criteria.estate_type = 'Departamento';
-          else if (/\bcasas?\b/.test(userOnlyText)) criteria.estate_type = 'Casa';
-
-          const bedMatch = userOnlyText.match(/(\d+)\s*(rec[aá]maras?|cuartos?|habitaciones?)/);
+          const bedMatch = (currentMsgLower + ' ' + historyCtx).match(/(\d+)\s*(rec[aá]maras?|cuartos?|habitaciones?)/);
           if (bedMatch) criteria.bedrooms = parseInt(bedMatch[1], 10);
 
-          // Zone: match after location prepositions, filter generic stopwords
-          const ZONE_STOPWORDS = /^(el|la|los|las|un|una|esa|este|ese|que|venta|renta|algo|casa|depto|departamento|todo)$/;
-          // Try multi-word zone first, then single word
-          const zoneMatch =
-            userOnlyText.match(/(?:en|zona|colonia|sector|por|cerca de)\s+([a-záéíóúüñ][a-záéíóúüñ ]{1,23}[a-záéíóúüñ])(?=\s*[,.\n?¿]|\s+\w|$)/i) ||
-            userOnlyText.match(/(?:en|zona|colonia|sector|por)\s+([a-záéíóúüñ]{3,20})(?=\s|,|\.|\?|$)/i);
-          if (zoneMatch) {
-            const zone = zoneMatch[1].trim();
-            if (!ZONE_STOPWORDS.test(zone) && zone.length >= 3) {
-              criteria.zone = zone;
-            }
-          }
-
-          // Helper: run query with given filters
           const runSearch = async (c) => {
             const conds = ['is_published = 1'];
             const prms = [];
-            if (c.type)        { conds.push('type = ?');         prms.push(c.type); }
-            if (c.zone)        { conds.push('address LIKE ?');   prms.push(`%${c.zone}%`); }
-            if (c.estate_type) { conds.push('estate_type = ?');  prms.push(c.estate_type); }
-            if (c.bedrooms)    { conds.push('bedrooms >= ?');    prms.push(c.bedrooms); }
+            if (c.type)        { conds.push('type = ?');        prms.push(c.type); }
+            if (c.zone)        { conds.push('address LIKE ?');  prms.push(`%${c.zone}%`); }
+            if (c.estate_type) { conds.push('estate_type = ?'); prms.push(c.estate_type); }
+            if (c.bedrooms)    { conds.push('bedrooms >= ?');   prms.push(c.bedrooms); }
             return q(
               `SELECT id, address, type, price, monthly_pay, bedrooms, estate_type,
                 (SELECT image_url FROM property_images WHERE property_id = properties.id ORDER BY id ASC LIMIT 1) AS first_image
@@ -708,69 +690,70 @@ router.post('/api/ai/assistant', optionalAuth, assistantLimiter, async (req, res
             );
           };
 
-          // Progressive relaxation: full criteria → drop bedrooms → drop estate_type → zone+type only → type only → any published
           let props = await runSearch(criteria);
           if (!props.length && criteria.bedrooms)    props = await runSearch({ ...criteria, bedrooms: undefined });
           if (!props.length && criteria.estate_type) props = await runSearch({ ...criteria, bedrooms: undefined, estate_type: undefined });
-          if (!props.length && criteria.zone)        props = await runSearch({ type: criteria.type });
+          if (!props.length && criteria.type)        props = await runSearch({ zone: criteria.zone });
           if (!props.length)                         props = await runSearch({});
+
+          // Track if results don't match the requested zone
+          if (props.length > 0 && criteria.zone) {
+            zoneRelaxed = !props.some(p => (p.address || '').toLowerCase().includes(criteria.zone.toLowerCase()));
+          }
 
           searchedProperties = props;
         }
-      } catch {}
+      } catch { /* non-critical */ }
     }
 
-    const systemPrompt = `Eres AndreI, agente inmobiliario virtual de LISTED, un marketplace inmobiliario en México. SOLO puedes responder preguntas relacionadas con bienes raíces e inmuebles.
-
-Temas PERMITIDOS:
-- Compraventa y renta de propiedades en México
-- Créditos hipotecarios (bancarios, Infonavit, Fovissste, cofinavit)
-- Costos de escrituración, avalúo, comisiones, impuestos de propiedad
-- Requisitos legales, documentación, contratos de compraventa y arrendamiento
-- Mercado inmobiliario mexicano, zonas, plusvalía
-- Consejos para compradores, vendedores y renteros
-- Procesos de mudanza relacionados con compra/renta
-- Mantenimiento básico del hogar en contexto de compra/renta
-- Uso de herramientas de la app LISTED (calculadora Infonavit, capacidad de compra, favoritos, citas)
-
-Si el usuario pregunta CUALQUIER cosa que NO esté relacionada con bienes raíces, inmuebles o los temas de arriba, responde EXACTAMENTE: "Solo puedo ayudarte con temas relacionados a bienes raíces. ¿Tienes alguna duda sobre compra, renta, créditos hipotecarios o propiedades?"
-No hagas excepciones. No respondas preguntas de cultura general, matemáticas, animales, deportes, tecnología, cocina ni ningún otro tema.
-
-BÚSQUEDA DE PROPIEDADES:
-Cuando el usuario pida ver propiedades y no encontraste resultados, di exactamente eso: "No encontré propiedades disponibles con esos criterios en este momento." No sugieras zonas, no hagas listas de colonias, no inventes opciones, no repitas preguntas que ya hiciste. Si ya tienes la información de lo que busca (zona, tipo, precio), no la pidas de nuevo.
-
-Reglas de formato:
-- Responde en español mexicano natural y profesional
-- Máximo 150 palabras por respuesta. Sé BREVE y directo — ve al grano sin rodeos ni introducciones largas
-- No repitas la pregunta del usuario ni uses frases de relleno como "Claro, con gusto te explico", "Es una excelente pregunta", etc. Ve directo a la respuesta
-- Usa bullets o listas cortas cuando aplique en temas generales, nunca para propiedades
-- No uses emojis
-- No inventes datos específicos de precios de zonas; si no estás seguro, indica que los precios varían
-- Cuando sea relevante, sugiere usar herramientas de la app como la calculadora Infonavit o el perfil de capacidad de compra${propertyContext}${buyingPowerContext}`;
-
-    // ── If properties found, bypass AI entirely — return template + cards ──
+    // ── Build property context note for AI ────────────────────────────────────
+    let propertyPromptNote = '';
     if (searchedProperties.length > 0) {
-      let bpHint = '';
-      if (bpSuggestedPrice && detectedType !== 'renta') {
-        bpHint = ` Tomé en cuenta tu capacidad de compra de $${Number(bpSuggestedPrice).toLocaleString('es-MX')} MXN para estos resultados.`;
-      } else if (bpMonthlyTarget && detectedType === 'renta') {
-        bpHint = ` Tomé en cuenta tu presupuesto de renta de $${Number(bpMonthlyTarget).toLocaleString('es-MX')}/mes para estos resultados.`;
+      const propList = searchedProperties.slice(0, 3).map(p => {
+        const price = p.price ? `$${Number(p.price).toLocaleString('es-MX')}` :
+                      p.monthly_pay ? `$${Number(p.monthly_pay).toLocaleString('es-MX')}/mes` : 'precio no disponible';
+        return `• ${p.estate_type || 'Propiedad'} — ${p.address || 'sin dirección'} — ${price}${p.bedrooms ? ` — ${p.bedrooms} rec.` : ''}`;
+      }).join('\n');
+
+      const zoneNote = (zoneRelaxed && zoneRequested)
+        ? ` (No se encontraron propiedades en "${zoneRequested}" — estas son de otras zonas. Díselo al usuario de forma natural.)`
+        : '';
+
+      if (hasSearchIntent) {
+        propertyPromptNote = `\n\nPROPIEDADES A MOSTRAR${zoneNote} — se enviarán como tarjetas visuales, NO las listes en tu respuesta:\n${propList}\nRESPUESTA REQUERIDA: El usuario pidió ver propiedades. DEBES presentarlas. Di algo breve como "Te comparto estas opciones disponibles" o similar. NO hagas más preguntas de filtrado — el usuario ya quiere ver resultados.`;
+      } else {
+        // Proactive: mention naturally, don't force it
+        propertyPromptNote = `\n\nPROPIEDADES DISPONIBLES (se enviarán como tarjetas si las mencionas)${zoneNote}:\n${propList}\nSi es relevante en tu respuesta, puedes mencionar brevemente que hay opciones disponibles. No lo fuerces si no encaja.`;
       }
-      const templateReply = `Aquí tienes algunas opciones disponibles en LISTED.${bpHint}`;
-      if (userId) {
-        await q('INSERT INTO ai_conversations (user_id, role, message) VALUES (?, ?, ?)',
-          [userId, 'assistant', templateReply]);
-      }
-      return res.json({ ok: true, reply: templateReply, properties: searchedProperties.slice(0, 3) });
+    } else if (hasSearchIntent) {
+      propertyPromptNote = '\n\nBÚSQUEDA: No hay propiedades publicadas disponibles en este momento. Comunícalo directamente.';
     }
 
-    // ── Build messages array ──
-    let aiMessages;
-    if (history.length > 0) {
-      aiMessages = history.map(h => ({ role: h.role, content: h.message }));
-    } else {
-      aiMessages = [{ role: 'user', content: message.trim() }];
-    }
+    // ── System prompt ─────────────────────────────────────────────────────────
+    const systemPrompt = `Eres AndreI, asesor inmobiliario virtual de LISTED, plataforma de bienes raíces en México.
+${userProfileBlock}
+QUIÉN ERES:
+Experto en el mercado inmobiliario mexicano. Conoces créditos hipotecarios (Infonavit, Fovissste, bancarios, cofinavit), costos de compraventa, procesos legales, plusvalía y zonas. Tu rol es asesorar Y conectar al usuario con propiedades reales disponibles en LISTED.
+
+CÓMO RESPONDER:
+- Responde lo que preguntan. Informativo cuando preguntan, propiedades cuando las piden.
+- Usa el perfil del usuario para personalizar tus respuestas. Si tiene capacidad de compra o crédito Infonavit, menciónalo cuando sea relevante.
+- Cuando sea natural, aprovecha para mostrar que hay opciones reales disponibles. Eres un asesor que también tiene inventario — úsalo.
+- Sé conversacional. Adapta tu nivel. Ve al grano sin frases de relleno.
+- Bullets o listas cuando organices información, no en cada mensaje.
+- Español mexicano natural. Sin emojis.
+
+MOSTRAR PROPIEDADES — REGLA CRÍTICA:
+Cuando el sistema te indica "PROPIEDADES A MOSTRAR" con la etiqueta "RESPUESTA REQUERIDA", DEBES presentar las propiedades en tu respuesta. No es opcional. Di algo como "Te comparto estas opciones disponibles en LISTED" y punto. No hagas más preguntas de filtrado, no pidas más información. El usuario ya pidió ver — muéstrale.
+
+LÍMITES:
+Solo bienes raíces e inmuebles en México. Para temas completamente ajenos, redirige: "Mi especialidad es bienes raíces. ¿Te ayudo con alguna duda sobre propiedades, créditos o inversión?"
+${propertyPromptNote}`;
+
+    // ── Call AI ───────────────────────────────────────────────────────────────
+    const aiMessages = history.length > 0
+      ? history.map(h => ({ role: h.role, content: h.message }))
+      : [{ role: 'user', content: message.trim() }];
 
     const reply = await aiGenerateMessages(systemPrompt, aiMessages, {
       cacheTTL: 0,
@@ -782,7 +765,7 @@ Reglas de formato:
         [userId, 'assistant', reply]);
     }
 
-    return res.json({ ok: true, reply, properties: [] });
+    return res.json({ ok: true, reply, properties: searchedProperties.slice(0, 3) });
   } catch (err) {
     console.error('[ai:assistant]', err.message, err.stack);
     if (err.message === 'AI_DISABLED') {
@@ -900,6 +883,17 @@ router.post('/api/ai/assistant/cleanup', authenticateToken, async (req, res) => 
     return res.json({ ok: true });
   } catch (err) {
     console.error('[ai:cleanup]', err.message);
+    return res.json({ ok: true });
+  }
+});
+
+// ── Reset: delete ALL conversation history ────────────────────────────────────
+router.post('/api/ai/assistant/reset', authenticateToken, async (req, res) => {
+  try {
+    await q('DELETE FROM ai_conversations WHERE user_id = ?', [req.user.id]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[ai:reset]', err.message);
     return res.json({ ok: true });
   }
 });
