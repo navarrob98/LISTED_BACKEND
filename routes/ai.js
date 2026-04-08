@@ -572,10 +572,14 @@ router.post('/api/ai/assistant', optionalAuth, assistantLimiter, async (req, res
     if (userId) {
       const rows = await q(
         `SELECT role, message FROM ai_conversations
-         WHERE user_id = ? ORDER BY created_at DESC LIMIT 10`,
+         WHERE user_id = ? ORDER BY created_at DESC LIMIT 6`,
         [userId]
       );
-      history = rows.reverse();
+      // Trim long messages (verbose AI replies re-sent as context waste tokens)
+      history = rows.reverse().map(r => ({
+        ...r,
+        message: r.message.length > 400 ? r.message.slice(0, 397) + '…' : r.message,
+      }));
     }
 
     // ── Full user context ─────────────────────────────────────────────────────
@@ -755,9 +759,14 @@ ${propertyPromptNote}`;
       ? history.map(h => ({ role: h.role, content: h.message }))
       : [{ role: 'user', content: message.trim() }];
 
+    // Cache generic informational questions (no user-specific data, no property search)
+    // These are identical across users: "cómo funciona Infonavit", "documentos para rentar", etc.
+    const isGenericQuestion = !hasSearchIntent && !isProactiveSearch && !userProfileBlock;
+    const assistantCacheTTL = isGenericQuestion ? 7200 : 0; // 2h cache for generic info
+
     const reply = await aiGenerateMessages(systemPrompt, aiMessages, {
-      cacheTTL: 0,
-      cachePrefix: 'assistant',
+      cacheTTL: assistantCacheTTL,
+      cachePrefix: 'asst',
     });
 
     if (userId) {

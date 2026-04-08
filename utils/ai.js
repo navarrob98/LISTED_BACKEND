@@ -105,7 +105,7 @@ async function callGemini(systemPrompt, userPrompt) {
   const body = {
     system_instruction: { parts: [{ text: systemPrompt }] },
     contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-    generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+    generationConfig: { temperature: 0.7, maxOutputTokens: 600 },
   };
 
   const res = await fetchWithTimeout(GEMINI_URL, {
@@ -144,7 +144,7 @@ async function callGroq(systemPrompt, userPrompt) {
       { role: 'user',   content: userPrompt },
     ],
     temperature: 0.7,
-    max_tokens: 1024,
+    max_tokens: 600,
   };
 
   const res = await fetchWithTimeout(GROQ_URL, {
@@ -176,7 +176,7 @@ async function callGroqMessages(systemPrompt, messages) {
       ...messages,
     ],
     temperature: 0.7,
-    max_tokens: 1024,
+    max_tokens: 600,
   };
 
   const res = await fetchWithTimeout(GROQ_URL, {
@@ -228,7 +228,7 @@ async function callGeminiMessages(systemPrompt, messages) {
   const body = {
     system_instruction: { parts: [{ text: systemPrompt }] },
     contents,
-    generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+    generationConfig: { temperature: 0.7, maxOutputTokens: 600 },
   };
 
   const res = await fetchWithTimeout(GEMINI_URL, {
