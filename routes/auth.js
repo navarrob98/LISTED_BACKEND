@@ -81,6 +81,17 @@ const validateResetLimiter = rateLimit({
   handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
 });
 
+const appleSignin = require('apple-signin-auth');
+
+const appleAuthIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args) => redis.infra.call(...args), prefix: 'rl:aauth:' }),
+  handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos.' }),
+});
+
 const googleClient = new OAuth2Client();
 
 // POST /users/register
@@ -427,6 +438,85 @@ router.post('/auth/google', googleAuthIpLimiter, async (req, res) => {
     });
   } catch (e) {
     console.error('[auth/google] error', e);
+    return res.status(500).json({ error: 'Error de servidor' });
+  }
+});
+
+// POST /auth/apple
+router.post('/auth/apple', appleAuthIpLimiter, async (req, res) => {
+  try {
+    const { identityToken, fullName } = req.body || {};
+    if (!identityToken) return res.status(400).json({ error: 'Falta identityToken' });
+
+    let payload;
+    try {
+      payload = await appleSignin.verifyIdToken(identityToken, {
+        audience: 'com.bsadesarrollo.listed',
+        ignoreExpiration: false,
+      });
+    } catch (verifyErr) {
+      console.error('[auth/apple] verifyIdToken failed:', verifyErr.message);
+      return res.status(401).json({ error: 'Token de Apple inválido' });
+    }
+
+    const { email, sub: appleUserId } = payload;
+    if (!email) return res.status(400).json({ error: 'No se recibió email de Apple' });
+
+    const givenName = fullName?.givenName || '';
+    const familyName = fullName?.familyName || '';
+
+    const selSql = `
+      SELECT id, name, last_name, email, phone, work_start, work_end,
+            agent_type, brokerage_name, cities, agent_verification_status, agent_rejection_reason
+      FROM users
+      WHERE email = ?
+      LIMIT 1
+    `;
+    pool.query(selSql, [email], async (err, rows) => {
+      if (err) {
+        console.error('[auth/apple] select error', err);
+        return res.status(500).json({ error: 'Error de servidor' });
+      }
+
+      let userRow;
+      if (rows && rows.length) {
+        userRow = rows[0];
+      } else {
+        const randomPass = crypto.randomBytes(18).toString('hex');
+        const hashed = await bcrypt.hash(randomPass, 12);
+
+        const insSql = `
+        INSERT INTO users (name, last_name, email, password, agent_type, email_verified, work_start, work_end)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        `;
+        const vals = [givenName, familyName, email, hashed, 'regular', null, null];
+        pool.query(insSql, vals, async (insErr, result) => {
+          if (insErr) {
+            console.error('[auth/apple] insert error', insErr);
+            return res.status(500).json({ error: 'No se pudo crear el usuario' });
+          }
+          userRow = {
+            id: result.insertId,
+            name: givenName,
+            last_name: familyName,
+            email,
+            phone: null,
+            work_start: null,
+            work_end: null,
+            agent_type: 'regular',
+            agent_verification_status: 'not_required',
+            brokerage_name: null,
+            cities: null,
+          };
+          await issueToken(res, userRow);
+        });
+        return;
+      }
+
+      await issueToken(res, userRow);
+    });
+  } catch (e) {
+    console.error('[auth/apple] error', e);
     return res.status(500).json({ error: 'Error de servidor' });
   }
 });
