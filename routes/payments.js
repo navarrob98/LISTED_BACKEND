@@ -88,7 +88,7 @@ router.post('/payments/promote/create-intent', express.json(), authenticateToken
     }
 
     // 2) Crea registro en promotions
-    const amount = 10000; // 100 MXN en centavos
+    const amount = 9900; // 99 MXN en centavos
     const currency = 'mxn';
     const [ins] = await pool.promise().query(
       `INSERT INTO promotions (property_id, user_id, amount_cents, currency, status)
