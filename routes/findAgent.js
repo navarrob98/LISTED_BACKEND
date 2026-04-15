@@ -591,13 +591,17 @@ router.post('/api/find-agent/prospects/:propertyId/respond', authenticateToken, 
         ['accepted', contact.request_id]
       );
 
-      // Notificar al propietario
-      sendPushToUser({
-        userId: property.created_by,
-        title: 'Agente aceptó tu propiedad',
-        body: 'Un agente ha aceptado gestionar tu propiedad.',
-        data: { type: 'prospect_accepted' },
-      });
+      // Notificar al propietario — fire-and-forget, no debe crashear el response
+      try {
+        await Promise.resolve(sendPushToUser({
+          userId: property.created_by,
+          title: 'Agente aceptó tu propiedad',
+          body: 'Un agente ha aceptado gestionar tu propiedad.',
+          data: { type: 'prospect_accepted' },
+        })).catch((e) => console.error('[find-agent/respond] push failed:', e?.message || e));
+      } catch (pushErr) {
+        console.error('[find-agent/respond] push sync error:', pushErr?.message || pushErr);
+      }
 
       res.json({ ok: true, action: 'accepted' });
     } else {

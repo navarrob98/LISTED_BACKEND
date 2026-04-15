@@ -68,23 +68,22 @@ router.post('/payments/promote/create-intent', express.json(), authenticateToken
     const { propertyId } = req.body || {};
     if (!propertyId) return res.status(400).json({ error: 'Falta propertyId', code: 'missing_property_id' });
 
-    // 1) Valida que la propiedad sea del usuario
+    // 1) Valida que la propiedad sea del usuario (creator) o esté managed por él
+    //    (caso: agente que aceptó una propiedad prospecto)
     const [rows] = await pool.promise().query(
-      'SELECT id, created_by FROM properties WHERE id=? LIMIT 1',
+      'SELECT id, created_by, managed_by, promoted_until FROM properties WHERE id=? LIMIT 1',
       [propertyId]
     );
-    // Verifica si ya está promocionada
-    const [prow] = await pool.promise().query(
-      'SELECT promoted_until FROM properties WHERE id=? LIMIT 1',
-      [propertyId]
-    );
-    const promotedUntil = Array.isArray(prow) && prow[0]?.promoted_until;
-    if (promotedUntil && new Date(promotedUntil).getTime() > Date.now()) {
-      return res.status(409).json({ error: 'already_promoted', message: 'La propiedad ya está promocionada.' });
-    }
     const prop = Array.isArray(rows) && rows[0];
     if (!prop) return res.status(404).json({ error: 'Propiedad no encontrada' });
-    if (String(prop.created_by) !== String(userId)) {
+
+    if (prop.promoted_until && new Date(prop.promoted_until).getTime() > Date.now()) {
+      return res.status(409).json({ error: 'already_promoted', message: 'La propiedad ya está promocionada.' });
+    }
+
+    const isOwner = String(prop.created_by) === String(userId);
+    const isManager = prop.managed_by != null && String(prop.managed_by) === String(userId);
+    if (!isOwner && !isManager) {
       return res.status(403).json({ error: 'No autorizad@' });
     }
 
@@ -152,8 +151,18 @@ router.post('/payments/promote/confirm', express.json(), authenticateToken, asyn
     if (!promo) {
       return res.status(404).json({ error: 'Promoción no encontrada' });
     }
+    // Acepta también si el user es manager de la propiedad
     if (String(promo.user_id) !== String(userId)) {
-      return res.status(403).json({ error: 'No autorizado' });
+      const [pcheck] = await pool.promise().query(
+        'SELECT created_by, managed_by FROM properties WHERE id=? LIMIT 1',
+        [promo.property_id]
+      );
+      const pp = Array.isArray(pcheck) && pcheck[0];
+      const allowed = pp && (
+        String(pp.created_by) === String(userId) ||
+        (pp.managed_by != null && String(pp.managed_by) === String(userId))
+      );
+      if (!allowed) return res.status(403).json({ error: 'No autorizado' });
     }
 
     // 3) Already paid (idempotent) — the webhook may have beaten us
