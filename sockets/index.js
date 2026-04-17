@@ -2,13 +2,23 @@ const Sentry = require('@sentry/node');
 const { generateAutoReply } = require('../utils/aiChatAutoReply');
 const redis = require('../db/redis');
 
+// Helper: valida que el agente tenga horario real (no 00:00-00:00 o vacío)
+function hasValidWorkSchedule(ws, we) {
+  if (!ws || !we) return false;
+  const parse = (t) => {
+    const [h, m] = String(t).split(':').map(Number);
+    return h * 60 + (m || 0);
+  };
+  return parse(we) > parse(ws);
+}
+
 // ── Find the nearest available slot for an agent (next 7 days from fromDate) ─────
 async function findNextAvailableSlot(pool, agentId, clientId, fromDate) {
   const [[agent]] = await pool.promise().query(
     'SELECT work_start, work_end FROM users WHERE id = ? LIMIT 1',
     [agentId]
   );
-  if (!agent || !agent.work_start || !agent.work_end) return null;
+  if (!agent || !hasValidWorkSchedule(agent.work_start, agent.work_end)) return null;
 
   const [wsH] = agent.work_start.split(':').map(Number);
   const [weH, weM] = agent.work_end.split(':').map(Number);
@@ -48,7 +58,9 @@ async function resolveSlot(pool, agentId, clientId, date, time) {
     'SELECT work_start, work_end FROM users WHERE id = ? LIMIT 1',
     [agentId]
   );
-  if (!agent || !agent.work_start || !agent.work_end) return { date, time };
+  // Si el agente NO tiene horario válido, retornamos null — no intentamos
+  // agendar a ciegas. El caller decidirá notificar al agente en lugar.
+  if (!agent || !hasValidWorkSchedule(agent.work_start, agent.work_end)) return null;
 
   const [wsH] = agent.work_start.split(':').map(Number);
   const [weH, weM] = agent.work_end.split(':').map(Number);
@@ -193,6 +205,31 @@ async function createAiAppointment({ pool, io, sendPushToUser, agentId, clientId
 }
 
 const { isAiSessionEnded, endAiSession } = require('../utils/aiSession');
+
+// Inserta mensaje de texto AI en chat (helper local)
+async function insertAiTextMessageInline(pool, io, { agentId, clientId, propertyId, message }) {
+  try {
+    const [result] = await pool.promise().query(
+      `INSERT INTO chat_messages (sender_id, receiver_id, property_id, message, message_type)
+       VALUES (?, ?, ?, ?, 'text')`,
+      [agentId, clientId, propertyId ?? null, message]
+    );
+    const msgObj = {
+      id: result.insertId,
+      property_id: propertyId ?? null,
+      sender_id: agentId,
+      receiver_id: clientId,
+      message,
+      message_type: 'text',
+      created_at: new Date().toISOString(),
+      ai_generated: true,
+    };
+    io.to('user_' + agentId).emit('receive_message', msgObj);
+    io.to('user_' + clientId).emit('receive_message', msgObj);
+  } catch (e) {
+    console.error('[insertAiTextMessageInline] error', e?.message);
+  }
+}
 
 module.exports = function initSockets(io, pool, helpers) {
   const { sendPushToUser, buildDeliveryUrlFromSecure, isMutedForReceiver } = helpers;
@@ -443,27 +480,59 @@ module.exports = function initSockets(io, pool, helpers) {
           // appointment here and emit the appointment_card directly.
           if (suggestAppointment || modifyAppointment) {
             try {
-              let apptDate = extractedDate;
-              let apptTime = extractedTime;
+              // Verificar que el agente tenga horario configurado ANTES de intentar.
+              // Si no, notificar al agente y no crear cita fantasma (era bug: AI
+              // decía "ya te agendé" pero nunca se creaba porque resolveSlot retornaba null).
+              const [[agentCheck]] = await pool.promise().query(
+                'SELECT work_start, work_end FROM users WHERE id = ? LIMIT 1',
+                [receiver_id]
+              );
+              const hasSchedule = agentCheck && hasValidWorkSchedule(agentCheck.work_start, agentCheck.work_end);
 
-              if (!apptDate || !apptTime) {
-                const slot = await findNextAvailableSlot(pool, receiver_id, sender_id);
-                if (slot) {
-                  apptDate = slot.date;
-                  apptTime = slot.time;
-                }
-              }
-
-              if (apptDate && apptTime) {
-                await createAiAppointment({
-                  pool, io, sendPushToUser,
+              if (!hasSchedule) {
+                // Notificar al agente: cliente pidió visita pero no tiene horario
+                sendPushToUser({
+                  userId: receiver_id,
+                  title: 'Cliente pidió una visita',
+                  body: 'Configura tu horario de atención para agendar citas automáticamente.',
+                  data: {
+                    type: 'chat',
+                    chatParams: {
+                      otherUserId: String(sender_id),
+                      propertyId: property_id != null ? String(property_id) : undefined,
+                    },
+                  },
+                });
+                // Insertar mensaje AI honesto (en vez de "ya te agendé")
+                await insertAiTextMessageInline(pool, io, {
                   agentId: receiver_id,
                   clientId: sender_id,
                   propertyId: property_id,
-                  date: apptDate,
-                  time: apptTime,
+                  message: `Déjame confirmar la disponibilidad con el agente y te aviso en cuanto tenga un horario para usted. Mientras, si tiene otra pregunta sobre la propiedad estoy para ayudarle.`,
                 });
-                // Session ends when client *confirms* the appointment, not here
+              } else {
+                let apptDate = extractedDate;
+                let apptTime = extractedTime;
+
+                if (!apptDate || !apptTime) {
+                  const slot = await findNextAvailableSlot(pool, receiver_id, sender_id);
+                  if (slot) {
+                    apptDate = slot.date;
+                    apptTime = slot.time;
+                  }
+                }
+
+                if (apptDate && apptTime) {
+                  await createAiAppointment({
+                    pool, io, sendPushToUser,
+                    agentId: receiver_id,
+                    clientId: sender_id,
+                    propertyId: property_id,
+                    date: apptDate,
+                    time: apptTime,
+                  });
+                  // Session ends when client *confirms* the appointment, not here
+                }
               }
             } catch (apptErr) {
               console.error('[ai-auto-reply] appointment creation error', apptErr?.message);

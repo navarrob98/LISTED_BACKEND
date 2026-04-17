@@ -51,6 +51,17 @@ function timeToMin(t) {
   return h * 60 + (m || 0);
 }
 
+// Helper: checa si el agente tiene horario válido configurado.
+// Rechaza null, vacío, o casos degenerados como 00:00:00-00:00:00 (default DB
+// que significa "no configurado"). También rechaza start >= end.
+function hasValidWorkSchedule(work_start, work_end) {
+  if (!work_start || !work_end) return false;
+  const startMin = timeToMin(work_start);
+  const endMin = timeToMin(work_end);
+  // 0-0 o start>=end son todos inválidos
+  return endMin > startMin;
+}
+
 // Helper: check if a slot overlaps with any calendar block
 function slotOverlapsCalBlocks(slotStartMin, slotEndMin, calBlocks) {
   return calBlocks.some(b => {
@@ -389,7 +400,15 @@ router.post('/api/appointments/quick-invite', authenticateToken, async (req, res
       'SELECT work_start, work_end FROM users WHERE id = ? LIMIT 1',
       [agentId]
     );
-    if (agentSchedule.length && agentSchedule[0].work_start && agentSchedule[0].work_end) {
+    // Bloquea quick-invite si el agente no configuró horario — era el bug donde
+    // un agente con 00:00-00:00 parecía aceptar cualquier hora.
+    if (agentSchedule.length && !hasValidWorkSchedule(agentSchedule[0].work_start, agentSchedule[0].work_end)) {
+      return res.status(400).json({
+        error: 'Debes configurar tu horario de atención antes de agendar citas',
+        code: 'NO_SCHEDULE',
+      });
+    }
+    if (agentSchedule.length && hasValidWorkSchedule(agentSchedule[0].work_start, agentSchedule[0].work_end)) {
       const { work_start, work_end } = agentSchedule[0];
       const [wsH, wsM] = work_start.split(':').map(Number);
       const [weH, weM] = work_end.split(':').map(Number);
@@ -866,11 +885,15 @@ router.get('/api/appointments/next-available/:id1', authenticateToken, async (re
 
     if (!userRows.length) return res.json({ found: false });
 
-    // Determinar quién es el agente (tiene horario)
-    const agentRow = userRows.find(u => u.agent_type && u.agent_type !== 'regular' && u.work_start && u.work_end);
-    const clientRow = userRows.find(u => !u.agent_type || u.agent_type === 'regular' || !u.work_start);
+    // Determinar quién es el agente (tiene horario válido)
+    const agentRow = userRows.find(u =>
+      u.agent_type && u.agent_type !== 'regular' && hasValidWorkSchedule(u.work_start, u.work_end)
+    );
+    const clientRow = userRows.find(u =>
+      !u.agent_type || u.agent_type === 'regular' || !hasValidWorkSchedule(u.work_start, u.work_end)
+    );
 
-    if (!agentRow) return res.json({ found: false });
+    if (!agentRow) return res.json({ found: false, reason: 'no_schedule' });
 
     const agentId = agentRow.id;
     const clientId = clientRow ? clientRow.id : null;
@@ -967,14 +990,23 @@ async function handleAvailableSlots(req, res) {
       return res.json({ available_slots: [], error: 'Usuario no encontrado' });
     }
 
-    // Determinar quién es el agente (tiene horario) y quién es el cliente (regular)
-    const agentRow = userRows.find(u => u.agent_type && u.agent_type !== 'regular' && u.work_start && u.work_end);
-    const clientRow = userRows.find(u => !u.agent_type || u.agent_type === 'regular' || !u.work_start);
+    // Determinar quién es el agente (tiene horario válido) y quién es el cliente (regular)
+    const agentRow = userRows.find(u =>
+      u.agent_type && u.agent_type !== 'regular' && hasValidWorkSchedule(u.work_start, u.work_end)
+    );
+    const clientRow = userRows.find(u =>
+      !u.agent_type || u.agent_type === 'regular' || !hasValidWorkSchedule(u.work_start, u.work_end)
+    );
 
     console.log('[available-slots] agentRow=%s clientRow=%s', agentRow?.id ?? 'NONE', clientRow?.id ?? 'NONE');
 
     if (!agentRow) {
-      return res.json({ available_slots: [], error: 'Ninguno de los usuarios tiene horario laboral configurado' });
+      // Distingue entre "no hay agente" y "agente no configuró horario"
+      const someoneIsAgent = userRows.some(u => u.agent_type && u.agent_type !== 'regular');
+      const reason = someoneIsAgent
+        ? 'El agente aún no configuró su horario de atención. Contáctalo directamente.'
+        : 'Ninguno de los usuarios tiene horario laboral configurado';
+      return res.json({ available_slots: [], error: reason, code: 'NO_SCHEDULE' });
     }
 
     const agentId = agentRow.id;
