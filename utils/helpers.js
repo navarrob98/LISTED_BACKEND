@@ -180,6 +180,23 @@ function isExpoToken(t) {
   return typeof t === 'string' && Expo.isExpoPushToken(t);
 }
 
+// Guarda una notificación en la cola de pendientes. Se entregará cuando el user
+// reconecte vía socket o vía cron que reintente push.
+async function queuePendingNotification(userId, title, body, data, errorMsg) {
+  try {
+    await pool.promise().query(
+      `INSERT INTO pending_notifications (user_id, title, body, data_json, attempts, last_error)
+       VALUES (?, ?, ?, ?, 1, ?)`,
+      [userId, title, body, JSON.stringify(data || {}), errorMsg || null]
+    );
+  } catch (e) {
+    // Si la tabla no existe aún (migración pendiente), log silently.
+    if (!/doesn't exist|Unknown/i.test(e.message)) {
+      console.error('[push] queue insert failed:', e.message);
+    }
+  }
+}
+
 async function sendPushToUser({ userId, title, body, data }) {
   return new Promise((resolve) => {
     console.log('[push] sendPushToUser', {
@@ -199,6 +216,7 @@ async function sendPushToUser({ userId, title, body, data }) {
       async (err, rows) => {
         if (err) {
           console.error('[push] db error', err);
+          await queuePendingNotification(userId, title, body, data, `db_error: ${err.message}`);
           return resolve(false);
         }
 
@@ -210,7 +228,10 @@ async function sendPushToUser({ userId, title, body, data }) {
           .filter((x) => isExpoToken(x.token));
 
         if (!tokens.length) {
-          console.log('[push] no active expo tokens for user', userId);
+          // Usuario sin tokens activos (offline, app desinstalada, o aún no logueado
+          // en este device). Encola para entregar cuando vuelva a conectar.
+          console.log('[push] no active tokens for user', userId, '→ queued');
+          await queuePendingNotification(userId, title, body, data, 'no_active_tokens');
           return resolve(true);
         }
 
@@ -226,17 +247,13 @@ async function sendPushToUser({ userId, title, body, data }) {
 
         try {
           const chunks = expo.chunkPushNotifications(messages);
-
-          // guardamos relación token -> ticket para poder desactivar si hace falta
-          const ticketMap = []; // [{ tokenId, token, ticket }]
+          const ticketMap = [];
 
           for (const chunk of chunks) {
             const tickets = await expo.sendPushNotificationsAsync(chunk);
-
             for (let i = 0; i < tickets.length; i++) {
               const ticket = tickets[i];
               const to = chunk[i]?.to;
-
               const match = tokens.find((x) => x.token === to);
               if (match) ticketMap.push({ tokenId: match.id, token: match.token, ticket });
             }
@@ -244,10 +261,16 @@ async function sendPushToUser({ userId, title, body, data }) {
 
           console.log('[push] tickets sent:', ticketMap.length);
 
-          // Desactivar tokens inválidos (DeviceNotRegistered)
           const invalidTokenIds = ticketMap
             .filter((x) => x.ticket?.status === 'error' && x.ticket?.details?.error === 'DeviceNotRegistered')
             .map((x) => x.tokenId);
+
+          // Si TODOS los tokens fallaron, encolar para reintentar. Si al menos uno
+          // entregó, no encolar (el user ya recibió en algún device).
+          const allErrored = ticketMap.length > 0 && ticketMap.every((x) => x.ticket?.status === 'error');
+          if (allErrored) {
+            await queuePendingNotification(userId, title, body, data, 'all_tickets_errored');
+          }
 
           if (!invalidTokenIds.length) return resolve(true);
 
@@ -262,11 +285,42 @@ async function sendPushToUser({ userId, title, body, data }) {
           );
         } catch (e) {
           console.error('[push] send error', e);
+          await queuePendingNotification(userId, title, body, data, `send_error: ${e.message}`);
           return resolve(false);
         }
       }
     );
   });
+}
+
+// Retorna notificaciones pendientes SIN marcar entregadas (socket decide cuándo marcar)
+async function getPendingNotificationsForUser(userId) {
+  try {
+    const [rows] = await pool.promise().query(
+      `SELECT id, title, body, data_json, created_at FROM pending_notifications
+       WHERE user_id = ? AND delivered_at IS NULL
+       ORDER BY created_at ASC
+       LIMIT 50`,
+      [userId]
+    );
+    return rows.map((r) => {
+      let data = {};
+      try { data = r.data_json ? (typeof r.data_json === 'string' ? JSON.parse(r.data_json) : r.data_json) : {}; } catch {}
+      return { id: r.id, title: r.title, body: r.body, data, created_at: r.created_at };
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function markNotificationsDelivered(ids) {
+  if (!ids?.length) return;
+  try {
+    await pool.promise().query(
+      `UPDATE pending_notifications SET delivered_at = NOW() WHERE id IN (?)`,
+      [ids]
+    );
+  } catch {}
 }
 
 function q(cxn, sql, params, step) {
@@ -458,6 +512,9 @@ module.exports = {
   buildResetWebUrl,
   isExpoToken,
   sendPushToUser,
+  queuePendingNotification,
+  getPendingNotificationsForUser,
+  markNotificationsDelivered,
   q,
   isMutedForReceiver,
   getActivePushTokens,

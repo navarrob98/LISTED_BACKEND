@@ -340,6 +340,17 @@ router.post('/api/appointments/quick-invite', authenticateToken, async (req, res
       return res.status(400).json({ error: 'Faltan campos obligatorios' });
     }
 
+    // Guard: un agente NO puede agendarse una cita consigo mismo. El frontend
+    // tenía un bug donde pasaba `client_id = agentId` cuando el param venía vacío,
+    // generando citas self-to-self. Servidor corta esto defensivamente.
+    if (String(client_id) === String(agentId)) {
+      console.warn('[quick-invite] self-appointment blocked: agent=%s client=%s', agentId, client_id);
+      return res.status(400).json({
+        error: 'No puedes agendar una cita contigo mismo',
+        code: 'SELF_APPOINTMENT',
+      });
+    }
+
     // Verify user is an agent
     const [agentRows] = await pool.promise().query(
       'SELECT id, agent_type, name, last_name FROM users WHERE id = ? LIMIT 1',

@@ -232,14 +232,45 @@ async function insertAiTextMessageInline(pool, io, { agentId, clientId, property
 }
 
 module.exports = function initSockets(io, pool, helpers) {
-  const { sendPushToUser, buildDeliveryUrlFromSecure, isMutedForReceiver } = helpers;
+  const {
+    sendPushToUser,
+    buildDeliveryUrlFromSecure,
+    isMutedForReceiver,
+    getPendingNotificationsForUser,
+    markNotificationsDelivered,
+  } = helpers;
 
   console.log('[sockets] initSockets called');
-  io.on('connection', (socket) => {
+  io.on('connection', async (socket) => {
     // userId is set by JWT middleware in backend.js
     const uid = socket.data.userId;
     console.log('[socket] client connected:', socket.id, 'userId:', uid);
     socket.join('user_' + uid);
+
+    // ── Drenar notificaciones pendientes al reconectar ───────────────────
+    // Si el user estuvo offline/sin red y se encolaron notifs, entregarlas
+    // ahora via socket (instantáneo, no depende del push). Marca delivered_at
+    // después de emitir.
+    if (uid && typeof getPendingNotificationsForUser === 'function') {
+      try {
+        const pending = await getPendingNotificationsForUser(uid);
+        if (pending.length > 0) {
+          console.log('[socket] delivering', pending.length, 'pending notifications to user', uid);
+          for (const n of pending) {
+            socket.emit('pending_notification', {
+              id: n.id,
+              title: n.title,
+              body: n.body,
+              data: n.data,
+              created_at: n.created_at,
+            });
+          }
+          await markNotificationsDelivered(pending.map((n) => n.id));
+        }
+      } catch (e) {
+        console.error('[socket] drain pending error:', e?.message);
+      }
+    }
 
     socket.on('disconnect', (reason) => {
       console.log('[socket] client disconnected:', socket.id, reason);
@@ -539,42 +570,51 @@ module.exports = function initSockets(io, pool, helpers) {
             }
           }
 
-          // Two-step [NOTIFICAR_AGENTE] flow
-          if (isPendingNotify && confirmNotify) {
-            // Client confirmed — end session and notify agent
+          // [NOTIFICAR_AGENTE] — notifica al agente INMEDIATAMENTE sin esperar
+          // confirmación del cliente. Si la IA dice "voy a notificar", hay que
+          // hacerlo de verdad — sino queda una promesa rota si el cliente no
+          // responde o cambia de tema.
+          //
+          // Mantenemos `pendingNotify` como guard de dedup para no spammear al
+          // agente con varias notificaciones en la misma sesión: si ya hay una
+          // notificación activa (Redis key), no volvemos a enviar.
+          if (pendingNotify || (isPendingNotify && confirmNotify)) {
             try {
-              await redis.del(pendingKey);
-            } catch {}
-            try {
-              await endAiSession(pool, io, {
-                agentId: receiver_id,
-                clientId: sender_id,
-                propertyId: property_id,
-                reason: 'uncertain',
-              });
-            } catch {}
-            sendPushToUser({
-              userId: receiver_id,
-              title: 'Revisión requerida',
-              body: `Un cliente preguntó algo que tu asistente de IA no pudo responder sobre la propiedad.`,
-              data: {
-                type: 'chat',
-                chatParams: {
-                  otherUserId: String(sender_id),
-                  propertyId: String(property_id),
-                },
-              },
-            });
+              const alreadyNotified = isPendingNotify; // ya había pending key antes → ya notificamos
+              if (!alreadyNotified) {
+                await endAiSession(pool, io, {
+                  agentId: receiver_id,
+                  clientId: sender_id,
+                  propertyId: property_id,
+                  reason: 'uncertain',
+                });
+
+                await sendPushToUser({
+                  userId: receiver_id,
+                  title: 'Revisión requerida',
+                  body: 'Un cliente preguntó algo que tu asistente de IA no pudo responder sobre la propiedad.',
+                  data: {
+                    type: 'chat',
+                    chatParams: {
+                      otherUserId: String(sender_id),
+                      propertyId: property_id != null ? String(property_id) : undefined,
+                    },
+                  },
+                });
+
+                // Marca pending key con TTL 24h para dedup en siguientes mensajes de la misma sesión
+                try { await redis.set(pendingKey, '1', 'EX', 86400); } catch {}
+              } else if (confirmNotify) {
+                // Cliente confirmó pero ya habíamos notificado → solo limpia la key
+                try { await redis.del(pendingKey); } catch {}
+              }
+            } catch (notifyErr) {
+              console.error('[ai-auto-reply] notify agent error', notifyErr?.message);
+            }
           } else if (isPendingNotify && !confirmNotify) {
-            // Client declined or changed topic — clear pending state, session continues
-            try {
-              await redis.del(pendingKey);
-            } catch {}
-          } else if (pendingNotify) {
-            // AI just flagged uncertainty — set pending state, wait for client response
-            try {
-              await redis.set(pendingKey, '1', 'EX', 86400);
-            } catch {}
+            // Cliente respondió a un pending sin confirmar — limpia la key para
+            // permitir nuevas notificaciones si aparece otra duda.
+            try { await redis.del(pendingKey); } catch {}
           }
         } catch (aiErr) {
           console.error('[ai-auto-reply] error', aiErr?.message);
