@@ -4,9 +4,10 @@ const pool = require('../db/pool');
 const authenticateToken = require('../middleware/authenticateToken');
 const bcrypt = require('bcrypt');
 const { gen6, sendVerificationEmail } = require('../utils/helpers');
+const { publicDetailLimiter, agentRegisterLimiter } = require('../middleware/publicRateLimiter');
 
-// POST /agents/register
-router.post('/agents/register', async (req, res) => {
+// POST /agents/register (público — rate limit fuerte contra spam de cuentas)
+router.post('/agents/register', agentRegisterLimiter, async (req, res) => {
   const {
     name,
     last_name,
@@ -486,8 +487,8 @@ router.post('/agents/update-credential-certificate', authenticateToken, async (r
   }
 });
 
-// GET /agents/:id
-router.get('/agents/:id', (req, res) => {
+// GET /agents/:id (público — rate limit para scrapers)
+router.get('/agents/:id', publicDetailLimiter, (req, res) => {
   const { id } = req.params;
 
   pool.query(

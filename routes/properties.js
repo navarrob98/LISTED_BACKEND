@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../db/pool');
 const authenticateToken = require('../middleware/authenticateToken');
+const { publicSearchLimiter, publicDetailLimiter } = require('../middleware/publicRateLimiter');
 
 // POST /properties/add
 router.post('/properties/add', authenticateToken, async (req, res) => {
@@ -464,8 +465,8 @@ router.put('/properties/:id', authenticateToken, async (req, res) => {
   });
 });
 
-// GET /properties
-router.get('/properties', (req, res) => {
+// GET /properties (público — con rate limit para frenar scrapers)
+router.get('/properties', publicSearchLimiter, (req, res) => {
   const { minLat, maxLat, minLng, maxLng } = req.query;
   if (
     minLat === undefined || maxLat === undefined ||
@@ -576,8 +577,8 @@ router.get('/properties/:id/chat', authenticateToken, (req, res) => {
   });
 });
 
-// GET /properties/:id
-router.get('/properties/:id', (req, res) => {
+// GET /properties/:id (público — rate limit más laxo para share/SEO)
+router.get('/properties/:id', publicDetailLimiter, (req, res) => {
   const { id } = req.params;
 
   const sql = `

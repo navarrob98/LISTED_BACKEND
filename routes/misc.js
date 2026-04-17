@@ -10,9 +10,25 @@ const {
   autocompleteKey, geocodeKey, reverseGeocodeKey, detailsKey, cityKey,
 } = require('../utils/geoCache');
 const { isKnownCity, normalizeCityKey } = require('../utils/knownCities');
+const { geoLimiter } = require('../middleware/publicRateLimiter');
 
 // In-flight dedup: evita que dos requests simultáneos lancen dos fetches al geocoder.
 const inflightGeocode = new Map();
+
+// Patrones de ataque conocidos: SSRF, LFI, path traversal, cloud metadata endpoints.
+// Un address/query real NUNCA contiene estos caracteres. Rechazamos antes de cachear
+// o llamar a APIs externas para no ensuciar Redis ni darle feedback al atacante.
+function isSuspiciousGeoInput(s) {
+  if (s.length > 200) return true;                      // inputs reales < 150 chars
+  if (/[<>"'`;|$(){}[\]\\]/.test(s)) return true;       // injection chars
+  if (/^\s*(file|http|https|ftp|gopher|dict|data):/i.test(s)) return true; // URL schemes
+  if (/\.\.[/\\]/.test(s)) return true;                 // path traversal (../)
+  if (/%2e%2e/i.test(s)) return true;                   // encoded path traversal
+  if (/\/(etc|root|proc|sys|var|home)\//i.test(s)) return true; // unix filesystem paths
+  if (/\b(169\.254|100\.100|metadata\.google|169-254)/i.test(s)) return true; // IMDS
+  if (/\b(aws|iam|security-credentials|computeMetadata|service-account)\b/i.test(s)) return true;
+  return false;
+}
 
 // POST /api/buying-power
 router.post('/api/buying-power', authenticateToken, (req, res) => {
@@ -303,10 +319,19 @@ router.put('/api/tenant-profile/:id', authenticateToken, (req, res) => {
 const NOMINATIM_UA = 'listed-app/1.0 (support@listed.com.mx)';
 
 // GET /api/places/autocomplete → Photon API
-router.get('/api/places/autocomplete', async (req, res) => {
+router.get('/api/places/autocomplete', geoLimiter, async (req, res) => {
   try {
     const input = req.query.input?.toString().trim() || '';
     if (!input) return res.status(400).json({ error: 'input requerido' });
+
+    if (isSuspiciousGeoInput(input)) {
+      console.warn('[autocomplete] suspicious input rejected:', {
+        ip: req.ip,
+        ua: req.headers['user-agent'],
+        sample: input.slice(0, 100),
+      });
+      return res.status(400).json({ error: 'input inválido' });
+    }
 
     const cacheKey = autocompleteKey('mx', input);
     const cached = await getCached(cacheKey);
@@ -346,7 +371,7 @@ router.get('/api/places/autocomplete', async (req, res) => {
 });
 
 // GET /api/places/details → Nominatim /lookup
-router.get('/api/places/details', async (req, res) => {
+router.get('/api/places/details', geoLimiter, async (req, res) => {
   try {
     const place_id = req.query.place_id?.toString();
     if (!place_id) return res.status(400).json({ error: 'place_id requerido' });
@@ -426,11 +451,28 @@ async function persistGeocodeResult(cacheKey, result, knownCityForMX, address) {
   }
 }
 
-router.get('/api/places/geocode', async (req, res) => {
+router.get('/api/places/geocode', geoLimiter, async (req, res) => {
   try {
     const address = req.query.address?.toString().trim() || '';
     const country = (req.query.country || 'MX').toString().toLowerCase();
     if (!address) return res.status(400).json({ error: 'address requerido' });
+
+    // Rechaza inputs maliciosos ANTES de cachear/buscar — previene pollution
+    // de Redis con payloads de SSRF/LFI y acelera la respuesta para el atacante.
+    if (isSuspiciousGeoInput(address)) {
+      console.warn('[geocode] suspicious address rejected:', {
+        ip: req.ip,
+        ua: req.headers['user-agent'],
+        sample: address.slice(0, 100),
+      });
+      return res.status(400).json({ error: 'address inválido' });
+    }
+
+    // Valida country code (2 letras ASCII). Evita que ?country=../ o similar
+    // termine en cache keys.
+    if (!/^[a-z]{2}$/.test(country)) {
+      return res.status(400).json({ error: 'country inválido' });
+    }
 
     // ── 1. Cache permanente de ciudades (TTL 1 año) ──
     // cityKey hardcodea namespace `geo:city:mx:`, así que solo aplica cuando country=mx;
@@ -486,11 +528,21 @@ router.get('/api/places/geocode', async (req, res) => {
 });
 
 // GET /api/places/reverse-geocode → Nominatim /reverse
-router.get('/api/places/reverse-geocode', async (req, res) => {
+router.get('/api/places/reverse-geocode', geoLimiter, async (req, res) => {
   try {
     const lat = req.query.lat?.toString();
     const lng = req.query.lng?.toString();
     if (!lat || !lng) return res.status(400).json({ error: 'lat y lng requeridos' });
+
+    // Valida que sean números reales en rango geográfico, no strings arbitrarios.
+    // Sin esto, ?lat=../../etc&lng=<svg> poluciona cache y Nominatim rechaza con 400
+    // (que cacheamos igual).
+    const latNum = parseFloat(lat);
+    const lngNum = parseFloat(lng);
+    if (!Number.isFinite(latNum) || latNum < -90 || latNum > 90 ||
+        !Number.isFinite(lngNum) || lngNum < -180 || lngNum > 180) {
+      return res.status(400).json({ error: 'lat/lng inválidos' });
+    }
 
     const cacheKey = reverseGeocodeKey(lat, lng);
     const cached = await getCached(cacheKey);

@@ -860,7 +860,7 @@ router.post('/api/ai/qualifying-profile', authenticateToken, async (req, res) =>
 });
 
 // ── Get assistant history ───────────────────────────────────────────────────────
-router.get('/api/ai/assistant/history', optionalAuth, async (req, res) => {
+router.get('/api/ai/assistant/history', optionalAuth, assistantLimiter, async (req, res) => {
   try {
     const userId = req.user?.id;
     if (!userId) return res.json({ ok: true, messages: [] });
