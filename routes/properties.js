@@ -331,7 +331,25 @@ router.put('/properties/:id', authenticateToken, async (req, res) => {
   if (incoming.listing_status === 'no_disponible') {
     incoming.is_published = 0;
   } else if (incoming.listing_status === 'disponible' || incoming.listing_status === 'apartada') {
-    incoming.is_published = 1;
+    // NO promover a is_published=1 automáticamente. Solo se publica si:
+    //   - review_status === 'approved' (ya pasó revisión), O
+    //   - el owner es agente verificado (publica directo)
+    // Sin este guard, cualquier regular editaba su propiedad pending y la
+    // publicaba sin revisión, apareciendo en el mapa.
+    const [[current]] = await pool.promise().query(
+      `SELECT p.review_status, u.agent_verification_status
+       FROM properties p JOIN users u ON u.id = p.created_by
+       WHERE p.id = ? LIMIT 1`,
+      [id]
+    );
+    if (current) {
+      const alreadyApproved = current.review_status === 'approved';
+      const isVerifiedAgent = current.agent_verification_status === 'verified';
+      incoming.is_published = (alreadyApproved || isVerifiedAgent) ? 1 : 0;
+    } else {
+      // Defensivo: si no pudimos leer, NO publiques
+      incoming.is_published = 0;
+    }
   }
 
   // Límite de cambios de estado (máx 3 veces a no_disponible)
@@ -481,12 +499,16 @@ router.get('/properties', publicSearchLimiter, (req, res) => {
 
   const whereParams = [Number(minLat), Number(maxLat), Number(minLng), Number(maxLng)];
 
+  // Doble guard: solo propiedades published Y aprobadas. Si quedó estado
+  // inconsistente por bugs pasados (is_published=1 + review_status='pending'),
+  // este filter las excluye del mapa público.
   const countQuery = `
     SELECT COUNT(*) AS total
     FROM properties p
     WHERE p.lat BETWEEN ? AND ?
       AND p.lng BETWEEN ? AND ?
       AND p.is_published = 1
+      AND p.review_status = 'approved'
   `;
 
   const query = `
@@ -505,6 +527,7 @@ router.get('/properties', publicSearchLimiter, (req, res) => {
     WHERE p.lat BETWEEN ? AND ?
       AND p.lng BETWEEN ? AND ?
       AND p.is_published = 1
+      AND p.review_status = 'approved'
     ORDER BY
       (p.promoted_until IS NOT NULL AND p.promoted_until > NOW()) DESC,
       p.id DESC
@@ -594,6 +617,7 @@ router.get('/properties/:id', publicDetailLimiter, (req, res) => {
     JOIN users u ON p.created_by = u.id
     WHERE p.id = ?
     AND p.is_published = 1
+    AND p.review_status = 'approved'
     LIMIT 1
   `;
 

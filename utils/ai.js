@@ -95,7 +95,7 @@ async function fetchWithTimeout(url, options, timeoutMs = TIMEOUT_MS) {
 }
 
 // ── Gemini call ─────────────────────────────────────────────────────────────────
-async function callGemini(systemPrompt, userPrompt) {
+async function callGemini(systemPrompt, userPrompt, opts = {}) {
   const key = GEMINI_KEY();
   if (!key) throw new Error('GEMINI_API_KEY not configured');
 
@@ -105,7 +105,10 @@ async function callGemini(systemPrompt, userPrompt) {
   const body = {
     system_instruction: { parts: [{ text: systemPrompt }] },
     contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-    generationConfig: { temperature: 0.7, maxOutputTokens: 600 },
+    generationConfig: {
+      temperature: typeof opts.temperature === 'number' ? opts.temperature : 0.7,
+      maxOutputTokens: opts.maxTokens || 600,
+    },
   };
 
   const res = await fetchWithTimeout(GEMINI_URL, {
@@ -133,7 +136,7 @@ async function callGemini(systemPrompt, userPrompt) {
 }
 
 // ── Groq call (OpenAI-compatible) ───────────────────────────────────────────────
-async function callGroq(systemPrompt, userPrompt) {
+async function callGroq(systemPrompt, userPrompt, opts = {}) {
   const key = GROQ_KEY();
   if (!key) throw new Error('GROQ_API_KEY not configured');
 
@@ -143,8 +146,8 @@ async function callGroq(systemPrompt, userPrompt) {
       { role: 'system', content: systemPrompt },
       { role: 'user',   content: userPrompt },
     ],
-    temperature: 0.7,
-    max_tokens: 600,
+    temperature: typeof opts.temperature === 'number' ? opts.temperature : 0.7,
+    max_tokens: opts.maxTokens || 600,
   };
 
   const res = await fetchWithTimeout(GROQ_URL, {
@@ -255,8 +258,10 @@ async function callGeminiMessages(systemPrompt, messages) {
 }
 
 // ── Main dual-provider call (simple prompt) ─────────────────────────────────────
-async function aiGenerate(systemPrompt, userPrompt, { cacheTTL = 0, cachePrefix = 'gen' } = {}) {
+async function aiGenerate(systemPrompt, userPrompt, { cacheTTL = 0, cachePrefix = 'gen', temperature, maxTokens } = {}) {
   if (!AI_ENABLED()) throw new Error('AI_DISABLED');
+
+  const callOpts = { temperature, maxTokens };
 
   // Check cache
   if (cacheTTL > 0) {
@@ -271,7 +276,7 @@ async function aiGenerate(systemPrompt, userPrompt, { cacheTTL = 0, cachePrefix 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     // Try Gemini
     try {
-      const result = await callGemini(systemPrompt, userPrompt);
+      const result = await callGemini(systemPrompt, userPrompt, callOpts);
       if (cacheTTL > 0) {
         const key = cacheKey(cachePrefix, { systemPrompt, userPrompt });
         await setCache(key, result, cacheTTL);
@@ -284,7 +289,7 @@ async function aiGenerate(systemPrompt, userPrompt, { cacheTTL = 0, cachePrefix 
 
     // Try Groq as fallback
     try {
-      const result = await callGroq(systemPrompt, userPrompt);
+      const result = await callGroq(systemPrompt, userPrompt, callOpts);
       if (cacheTTL > 0) {
         const key = cacheKey(cachePrefix, { systemPrompt, userPrompt });
         await setCache(key, result, cacheTTL);

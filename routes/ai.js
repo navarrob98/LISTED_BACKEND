@@ -189,28 +189,63 @@ router.post('/api/ai/property-description', authenticateToken, descriptionLimite
       ? '\n\n(Tip: completa más detalles de la propiedad para obtener una descripción más precisa y persuasiva)'
       : '';
 
-    const systemPrompt = `Eres el vendedor inmobiliario #1 de México. Tu trabajo NO es listar datos — es VENDER un estilo de vida.
+    // ── Variabilidad para forzar descripciones únicas ─────────────────
+    // Rotamos el "ángulo creativo" inicial para evitar aperturas repetitivas.
+    // Sin esto + cache, dos propiedades similares reciben la MISMA descripción.
+    const ANGLES = [
+      { name: 'escena', hint: 'Abre con una ESCENA concreta y cotidiana que el lector pueda visualizar (ej. "Domingos de desayuno en la terraza con el aroma de café recién hecho...")' },
+      { name: 'contraste', hint: 'Abre con un CONTRASTE entre la ciudad y el refugio que ofrece este lugar (ej. "Lejos del ruido de la ciudad, a sólo minutos del centro...")' },
+      { name: 'metafora', hint: 'Abre con una METÁFORA breve sobre el estilo de vida que representa (ej. "Esta casa es lo más cercano a unas vacaciones permanentes...")' },
+      { name: 'detalle', hint: 'Abre destacando UN detalle específico y evocador de la propiedad o la zona (ej. "La luz de la mañana entra por los ventanales y llena cada rincón...")' },
+      { name: 'proposito', hint: 'Abre describiendo a QUIÉN le cambia la vida esta propiedad (ej. "Para la familia que lleva años buscando ese espacio donde...")' },
+      { name: 'declaracion', hint: 'Abre con una DECLARACIÓN segura y directa sobre lo que hace única a esta propiedad (ej. "Pocas oportunidades como esta llegan al mercado...")' },
+      { name: 'tiempo', hint: 'Abre proyectando una IMAGEN TEMPORAL (al atardecer, en una cena con amigos, un domingo...) que evoque el estilo de vida' },
+      { name: 'ubicacion', hint: 'Abre pintando el BARRIO o la ZONA como protagonista antes que la propiedad misma' },
+    ];
+    // Seed determinista por propiedad (basado en address + amenidades) para que
+    // el mismo listing mantenga su identidad creativa si regeneran, pero entre
+    // listings distintos varíen automáticamente.
+    const seedStr = `${address || 'x'}|${construction || 0}|${amenityList.length}|${Date.now()}`;
+    let hash = 0;
+    for (let i = 0; i < seedStr.length; i++) hash = (hash * 31 + seedStr.charCodeAt(i)) | 0;
+    const angle = ANGLES[Math.abs(hash) % ANGLES.length];
 
-REGLAS ABSOLUTAS:
-- Entre 400 y 650 caracteres. Ni menos, ni más. SIEMPRE termina la última oración completa — NUNCA cortes una frase a la mitad.
-- Español mexicano natural, sin emojis, sin hashtags.
-- PROHIBIDO repetir los datos como lista ("3 recámaras, 2 baños, 150m²"). Eso ya lo ve el comprador en la ficha técnica.
-- En vez de listar, TRANSFORMA los datos en beneficios y sensaciones:
-  * NO: "Casa de 3 recámaras con alberca" → SÍ: "Imagina llegar cada tarde a refrescarte en tu propia alberca mientras los niños juegan en su propio espacio"
-  * NO: "200m² de construcción" → SÍ: "Espacios amplios donde cada rincón respira comodidad"
-  * NO: "Fraccionamiento con vigilancia 24/7" → SÍ: "Tu familia duerme tranquila con seguridad las 24 horas"
-- Abre con un gancho emocional irresistible — la primera frase decide si siguen leyendo o no
-- Si hay ubicación, véndela como zona de vida, no como dato ("en el corazón de...", "a minutos de todo lo que necesitas")${securityHint}
-- Cierra con urgencia sutil que empuje a actuar ("Agenda tu visita antes de que alguien más la aparte", "Esta oportunidad no espera")
+    const systemPrompt = `Eres copywriter inmobiliario premium en México. Tu trabajo es crear descripciones ÚNICAS e irrepetibles que vendan un estilo de vida — no que listen datos.
+
+ÁNGULO CREATIVO PARA ESTA PROPIEDAD (úsalo en la apertura):
+${angle.hint}
+
+REGLAS DURAS:
+- Entre 400 y 650 caracteres. Termina SIEMPRE la última oración completa — NUNCA cortes a media frase.
+- Español mexicano natural, sin emojis, sin hashtags, sin anglicismos innecesarios.
+- PROHIBIDO abrir con clichés como "Descubre...", "Te presentamos...", "Encanto...", "Esta hermosa casa...", "Bienvenido a...", "Lujo y confort...". Nunca uses esas fórmulas.
+- PROHIBIDO listar datos ("3 recámaras, 2 baños, 150m²"). Eso ya está en la ficha técnica.
+- TRANSFORMA los datos en sensaciones y momentos de vida:
+  * NO: "Casa con alberca" → SÍ: "Tardes que se alargan al borde del agua"
+  * NO: "200m² construcción" → SÍ: "Espacios que respiran"
+  * NO: "Vigilancia 24/7" → SÍ: "Llegas tarde y sabes que todo está en orden"
+- Si hay ubicación, préstale personalidad a la zona, no la enuncies como dato.${securityHint}
+- Cierra con urgencia sutil y específica (no la misma frase para todas las propiedades).
 - ${toneHint}
-- Nunca inventes información que no fue proporcionada — si faltan datos, enfócate en lo que SÍ tienes y hazlo brillar
+
+CRÍTICO PARA ESTA GENERACIÓN:
+- La apertura debe ser DISTINTA a cualquier descripción inmobiliaria estándar. Sé específico, sensorial, concreto.
+- Varía el ritmo: alterna frases cortas con frases largas.
+- Nunca inventes datos que no estén proporcionados.
 - Responde ÚNICAMENTE con la descripción, sin comillas, sin títulos, sin explicaciones.`;
 
-    const userPrompt = `Genera una descripción para esta propiedad:\n${details}${completenessNote}`;
+    // Nonce en el user prompt refuerza no-cache y añade diversidad en el muestreo del modelo.
+    const nonce = Math.random().toString(36).slice(2, 10);
+    const userPrompt = `Propiedad a describir:\n${details}\n\nÁngulo de apertura asignado: ${angle.name}\nSesión: ${nonce}${completenessNote}`;
 
     const description = await aiGenerate(systemPrompt, userPrompt, {
-      cacheTTL: 3600,
+      // Sin cache: cada generación debe ser única. Dos propiedades parecidas NO
+      // deben recibir la misma descripción palabra por palabra.
+      cacheTTL: 0,
       cachePrefix: 'desc',
+      // Temperatura alta = más variabilidad creativa en aperturas.
+      temperature: 0.95,
+      maxTokens: 700,
     });
 
     // Enforce max length — cortar en la última oración completa antes del límite
