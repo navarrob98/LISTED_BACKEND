@@ -1,8 +1,22 @@
 const express = require('express');
 const router = express.Router();
+const jwt = require('jsonwebtoken');
 const pool = require('../db/pool');
 const authenticateToken = require('../middleware/authenticateToken');
 const { publicSearchLimiter, publicDetailLimiter } = require('../middleware/publicRateLimiter');
+
+// Optional auth: si hay JWT válido setea req.user, si no continúa público.
+// Usado en /properties/:id para permitir ver propiedades prospect/pending al owner
+// y a agentes contactados, sin forzar auth en el caso público aprobado.
+function optionalAuth(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return next();
+  jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] }, (err, user) => {
+    if (!err) req.user = user;
+    next();
+  });
+}
 
 // POST /properties/add
 router.post('/properties/add', authenticateToken, async (req, res) => {
@@ -600,11 +614,19 @@ router.get('/properties/:id/chat', authenticateToken, (req, res) => {
   });
 });
 
-// GET /properties/:id (público — rate limit más laxo para share/SEO)
-router.get('/properties/:id', publicDetailLimiter, (req, res) => {
+// GET /properties/:id (público con optional auth)
+// - Público: solo approved + published
+// - Autenticado: además permite ver si es owner, manager, o agente contactado
+//   (cubre el caso de propiedades prospect/pending cuando el dueño o un agente
+//   en el chat intentan abrir el detalle).
+router.get('/properties/:id', publicDetailLimiter, optionalAuth, (req, res) => {
   const { id } = req.params;
+  const userId = req.user?.id ?? null;
 
-  const sql = `
+  // Si hay user autenticado, permitimos también estados prospect/pending
+  // si es participante. El WHERE usa OR para cubrir ambos casos en una query.
+  const sql = userId
+    ? `
     SELECT
       p.*,
       u.name AS owner_name,
@@ -616,12 +638,40 @@ router.get('/properties/:id', publicDetailLimiter, (req, res) => {
     FROM properties p
     JOIN users u ON p.created_by = u.id
     WHERE p.id = ?
-    AND p.is_published = 1
-    AND p.review_status = 'approved'
+      AND (
+        (p.is_published = 1 AND p.review_status = 'approved')
+        OR p.created_by = ?
+        OR p.managed_by = ?
+        OR EXISTS (
+          SELECT 1 FROM owner_agent_contacts oac
+          WHERE oac.user_id = p.created_by AND oac.agent_id = ?
+        )
+        OR EXISTS (
+          SELECT 1 FROM chat_messages cm
+          WHERE cm.property_id = p.id AND (cm.sender_id = ? OR cm.receiver_id = ?)
+        )
+      )
+    LIMIT 1
+  `
+    : `
+    SELECT
+      p.*,
+      u.name AS owner_name,
+      u.last_name AS owner_last_name,
+      CASE
+        WHEN p.price_original IS NULL OR p.price_original <= 0 OR p.price >= p.price_original THEN 0
+        ELSE ROUND(((p.price_original - p.price) / p.price_original) * 100, 1)
+      END AS discount_percent
+    FROM properties p
+    JOIN users u ON p.created_by = u.id
+    WHERE p.id = ?
+      AND p.is_published = 1
+      AND p.review_status = 'approved'
     LIMIT 1
   `;
+  const params = userId ? [id, userId, userId, userId, userId, userId] : [id];
 
-  pool.query(sql, [id], (err, rows) => {
+  pool.query(sql, params, (err, rows) => {
     if (err) return res.status(500).json({ error: 'Error al buscar la propiedad' });
     if (!rows.length) return res.status(404).json({ error: 'No encontrada' });
 
