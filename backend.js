@@ -23,26 +23,46 @@ const port = process.env.PORT || 3001;
 app.use(helmet());
 
 // ── CORS ──────────────────────────────────────────────
-const allowedOrigins = process.env.NODE_ENV === 'production'
-  ? [
-      'https://listed.com.mx',
-      'https://www.listed.com.mx',
-      'https://app.listed.com.mx',
-    ]
-  : [
-      'https://listed.com.mx',
-      'https://www.listed.com.mx',
-      'https://app.listed.com.mx',
-      'http://localhost:19006',
-      'http://localhost:3000',
-      'http://localhost:3001',
-    ];
+// Lista de orígenes allow-listed. Orígenes nuevos se agregan vía env var
+// CORS_EXTRA_ORIGINS (CSV) sin necesidad de cambiar código — útil para:
+//   - dominios de Railway auto-generados (https://*.up.railway.app)
+//   - subdominios internos (admin.listed.com.mx)
+//   - staging URLs temporales
+const defaultOrigins = [
+  'https://listed.com.mx',
+  'https://www.listed.com.mx',
+  'https://app.listed.com.mx',
+  'https://admin.listed.com.mx',
+];
+
+const devOrigins = [
+  'http://localhost:19006',
+  'http://localhost:3000',
+  'http://localhost:3001',
+];
+
+const extraOrigins = (process.env.CORS_EXTRA_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const allowedOrigins = [
+  ...defaultOrigins,
+  ...(process.env.NODE_ENV === 'production' ? [] : devOrigins),
+  ...extraOrigins,
+];
+
+// Permite cualquier subdominio *.up.railway.app (útil para previews / deploys temporales).
+// Si no quieres esto en prod, comenta el regex.
+const railwayRegex = /^https:\/\/[\w-]+\.up\.railway\.app$/;
 
 app.use(cors({
   origin: function(origin, cb) {
-    // requests sin origin (Postman, server-to-server) deben pasar
+    // requests sin origin (Postman, server-to-server, same-origin) deben pasar
     if (!origin) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
+    if (railwayRegex.test(origin)) return cb(null, true);
+    console.warn('[cors] blocked origin:', origin);
     return cb(new Error('Not allowed by CORS'));
   },
   methods: ['GET','POST','PUT','DELETE','OPTIONS'],
