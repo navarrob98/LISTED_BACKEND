@@ -32,6 +32,9 @@ const loginIpLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  // Solo contar logins FALLIDOS (4xx/5xx). Un usuario legítimo con sesiones en
+  // varios dispositivos no se autobloquea; un atacante probando passwords sí.
+  skipSuccessfulRequests: true,
   store: new RedisStore({ sendCommand: (...args) => redis.infra.call(...args), prefix: 'rl:login:' }),
   handler: (req, res) => res.status(429).json({ error: 'Demasiados intentos. Intente más tarde.' }),
 });
