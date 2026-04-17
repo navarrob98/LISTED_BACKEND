@@ -1,6 +1,10 @@
 const express = require('express');
 
 module.exports = function registerRoutes(app) {
+  // Health check: sin body parser, se registra antes de cualquier middleware pesado
+  // para que Railway siga recibiendo 200 aunque el resto del stack esté saturado.
+  app.use('/', require('./health'));
+
   // Stripe webhook MUST be registered BEFORE express.json() so it gets raw body.
   app.use('/', require('./payments'));
 

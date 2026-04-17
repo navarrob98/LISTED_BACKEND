@@ -20,17 +20,39 @@ router.post('/stripe/webhook', express.raw({ type: 'application/json' }), async 
     return res.status(400).send('Webhook signature verification failed');
   }
 
+  // ── Idempotency guard ────────────────────────────────
+  // Stripe reintenta webhooks en error/timeout. Sin este guard, el mismo evento
+  // puede procesar el pago múltiples veces → expires_at extendido, promoción
+  // duplicada, etc. INSERT IGNORE es atómico; affectedRows=0 indica duplicado.
+  try {
+    const [ins] = await pool.promise().query(
+      'INSERT IGNORE INTO stripe_events (id, event_type) VALUES (?, ?)',
+      [event.id, event.type]
+    );
+    if (ins.affectedRows === 0) {
+      // Ya procesado previamente — responder 200 para que Stripe no reintente.
+      return res.json({ received: true, duplicate: true });
+    }
+  } catch (e) {
+    // Si la tabla aún no existe (migración pendiente) o hay error de DB, log y
+    // procesa igual — mejor procesar dos veces que perder el evento. Este branch
+    // debe desaparecer una vez la migración 001_stripe_events.sql esté aplicada.
+    console.error('[stripe/webhook] idempotency check failed, proceeding anyway:', e.message);
+  }
+
   try {
     if (event.type === 'payment_intent.succeeded') {
       const pi = event.data.object; // Stripe.PaymentIntent
       const [rows] = await pool.promise().query(
-        'SELECT id, property_id FROM promotions WHERE stripe_payment_intent=? LIMIT 1',
+        'SELECT id, property_id, status FROM promotions WHERE stripe_payment_intent=? LIMIT 1',
         [pi.id]
       );
       const promo = Array.isArray(rows) && rows[0];
-      if (promo) {
+      // Doble guard: aunque el INSERT IGNORE haya pasado por race, si la promoción
+      // ya está paid no extiende expires_at ni duplica trabajo.
+      if (promo && promo.status !== 'paid') {
         await pool.promise().query(
-          'UPDATE promotions SET status="paid", expires_at=DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id=?',
+          'UPDATE promotions SET status="paid", expires_at=DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id=? AND status!="paid"',
           [promo.id]
         );
         await pool.promise().query(
@@ -47,7 +69,7 @@ router.post('/stripe/webhook', express.raw({ type: 'application/json' }), async 
     if (event.type === 'payment_intent.payment_failed') {
       const pi = event.data.object; // Stripe.PaymentIntent
       await pool.promise().query(
-        'UPDATE promotions SET status="canceled" WHERE stripe_payment_intent=?',
+        'UPDATE promotions SET status="canceled" WHERE stripe_payment_intent=? AND status NOT IN ("paid","canceled")',
         [pi.id]
       );
     }

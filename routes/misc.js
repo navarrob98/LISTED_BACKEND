@@ -5,10 +5,14 @@ const authenticateToken = require('../middleware/authenticateToken');
 const cloudinary = require('../cldnry');
 const { sendPushToUser } = require('../utils/helpers');
 const {
-  getCached, setCache, waitForNominatimSlot,
-  TTL_24H, TTL_7D,
-  autocompleteKey, geocodeKey, reverseGeocodeKey, detailsKey,
+  getCached, setCache, getCachedSWR, setCacheSWR, waitForNominatimSlot,
+  TTL_24H, TTL_7D, TTL_1Y,
+  autocompleteKey, geocodeKey, reverseGeocodeKey, detailsKey, cityKey,
 } = require('../utils/geoCache');
+const { isKnownCity, normalizeCityKey } = require('../utils/knownCities');
+
+// In-flight dedup: evita que dos requests simultáneos lancen dos fetches al geocoder.
+const inflightGeocode = new Map();
 
 // POST /api/buying-power
 router.post('/api/buying-power', authenticateToken, (req, res) => {
@@ -384,42 +388,96 @@ router.get('/api/places/details', async (req, res) => {
 });
 
 // GET /api/places/geocode → Nominatim /search
+// Stale-while-revalidate: cache fresco 24h, stale hasta 7 días.
+// Mientras está stale devuelve respuesta instantánea y refresca en background.
+const GEOCODE_FRESH_S = TTL_24H;         // 1 día fresco
+const GEOCODE_STALE_S = TTL_7D - TTL_24H; // 6 días adicionales stale
+
+async function fetchGeocodeFromNominatim(address, country) {
+  await waitForNominatimSlot();
+  const url = new URL('https://nominatim.openstreetmap.org/search');
+  url.searchParams.set('q', address);
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('limit', '1');
+  url.searchParams.set('countrycodes', country);
+  const r = await fetch(url, { headers: { 'User-Agent': NOMINATIM_UA } });
+  const data = await r.json();
+  if (!data.length) return { status: 'ZERO_RESULTS', results: [] };
+  const item = data[0];
+  return {
+    status: 'OK',
+    result: {
+      formatted_address: item.display_name,
+      geometry: { location: { lat: parseFloat(item.lat), lng: parseFloat(item.lon) } },
+    },
+  };
+}
+
+// Helper: persiste un resultado respetando ZERO_RESULTS (TTL corto) vs OK (TTL largo).
+// Evita que un fallo temporal de Nominatim sobreescriba una entrada buena por 7 días.
+async function persistGeocodeResult(cacheKey, result, knownCityForMX, address) {
+  if (result.status === 'ZERO_RESULTS') {
+    await setCacheSWR(cacheKey, result, TTL_24H / 24, TTL_24H); // 1h fresco, 24h stale
+  } else {
+    await setCacheSWR(cacheKey, result, GEOCODE_FRESH_S, GEOCODE_STALE_S);
+    if (knownCityForMX && result.status === 'OK') {
+      await setCache(cityKey(normalizeCityKey(address)), result, TTL_1Y);
+    }
+  }
+}
+
 router.get('/api/places/geocode', async (req, res) => {
   try {
     const address = req.query.address?.toString().trim() || '';
     const country = (req.query.country || 'MX').toString().toLowerCase();
     if (!address) return res.status(400).json({ error: 'address requerido' });
 
-    const cacheKey = geocodeKey(country, address);
-    const cached = await getCached(cacheKey);
-    if (cached) return res.json(cached);
-
-    await waitForNominatimSlot();
-    const url = new URL('https://nominatim.openstreetmap.org/search');
-    url.searchParams.set('q', address);
-    url.searchParams.set('format', 'json');
-    url.searchParams.set('limit', '1');
-    url.searchParams.set('countrycodes', country);
-
-    const r = await fetch(url, { headers: { 'User-Agent': NOMINATIM_UA } });
-    const data = await r.json();
-
-    if (!data.length) {
-      const noResult = { status: 'ZERO_RESULTS', results: [] };
-      await setCache(cacheKey, noResult, TTL_24H);
-      return res.json(noResult);
+    // ── 1. Cache permanente de ciudades (TTL 1 año) ──
+    // cityKey hardcodea namespace `geo:city:mx:`, así que solo aplica cuando country=mx;
+    // de lo contrario envenenaríamos cache con coords de otro país (p.ej. Monterrey, CA).
+    const isMX = country === 'mx';
+    const knownCity = isMX && isKnownCity(address);
+    if (knownCity) {
+      const ck = cityKey(normalizeCityKey(address));
+      const cityCached = await getCached(ck);
+      if (cityCached) return res.json(cityCached);
     }
 
-    const item = data[0];
-    const result = {
-      status: 'OK',
-      result: {
-        formatted_address: item.display_name,
-        geometry: { location: { lat: parseFloat(item.lat), lng: parseFloat(item.lon) } },
-      },
-    };
+    // ── 2. SWR cache normal (24h fresco, 7d stale) ──
+    const cacheKey = geocodeKey(country, address);
+    const cached = await getCachedSWR(cacheKey);
 
-    await setCache(cacheKey, result, TTL_7D);
+    if (cached) {
+      res.json(cached.data);
+      if (cached.isStale && !inflightGeocode.has(cacheKey)) {
+        const p = fetchGeocodeFromNominatim(address, country)
+          .then(async (result) => {
+            // IMPORTANTE: respetar ZERO_RESULTS para no clobber entrada buena
+            // si Nominatim responde vacío por rate-limit/hiccup transitorio.
+            await persistGeocodeResult(cacheKey, result, knownCity, address);
+            return result; // ← devolver para que awaiters concurrentes no reciban undefined
+          })
+          .catch((e) => {
+            console.error('[places/geocode swr refresh]', e);
+            // Rethrow para que awaiters concurrentes vean el error y fallen al fallback
+            throw e;
+          })
+          .finally(() => inflightGeocode.delete(cacheKey));
+        inflightGeocode.set(cacheKey, p);
+      }
+      return;
+    }
+
+    // ── 3. Cache miss: fetch de Nominatim (deduped) ──
+    let promise = inflightGeocode.get(cacheKey);
+    if (!promise) {
+      promise = fetchGeocodeFromNominatim(address, country)
+        .finally(() => inflightGeocode.delete(cacheKey));
+      inflightGeocode.set(cacheKey, promise);
+    }
+    const result = await promise;
+
+    await persistGeocodeResult(cacheKey, result, knownCity, address);
     res.json(result);
   } catch (e) {
     console.error('[places/geocode]', e);

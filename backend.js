@@ -27,12 +27,15 @@ const allowedOrigins = process.env.NODE_ENV === 'production'
   ? [
       'https://listed.com.mx',
       'https://www.listed.com.mx',
+      'https://app.listed.com.mx',
     ]
   : [
       'https://listed.com.mx',
       'https://www.listed.com.mx',
+      'https://app.listed.com.mx',
       'http://localhost:19006',
       'http://localhost:3000',
+      'http://localhost:3001',
     ];
 
 app.use(cors({

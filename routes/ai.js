@@ -18,7 +18,9 @@ function optionalAuth(req, res, next) {
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return next();
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+  // Pin HS256. Sin este whitelist, un atacante puede firmar un JWT con RS256
+  // usando JWT_SECRET como si fuera una clave pública y hacer algorithm confusion.
+  jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] }, (err, user) => {
     if (!err) req.user = user;
     next();
   });
