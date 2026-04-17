@@ -83,6 +83,47 @@ async function main() {
     }
   }
 
+  // 3. owner_agent_contacts: auto-rechazo tras 3 días sin respuesta del agente
+  try {
+    const [r] = await conn.query(
+      `UPDATE owner_agent_contacts
+       SET status = 'rejected'
+       WHERE IFNULL(status, 'pending') = 'pending'
+         AND created_at < DATE_SUB(NOW(), INTERVAL 3 DAY)`
+    );
+    results.auto_rejected_contacts = r.affectedRows;
+    console.log(`[cleanup]  ✓  auto-rejected contacts: ${r.affectedRows} rows`);
+  } catch (e) {
+    if (!/doesn't exist|Unknown/i.test(e.message)) {
+      console.error('[cleanup]  ✗  auto-reject contacts failed:', e.message);
+    }
+  }
+
+  // 4. owner_agent_requests: marcar como rejected los requests cuyos
+  //    3 contactos están todos rechazados (cascade del paso 3)
+  try {
+    const [r] = await conn.query(
+      `UPDATE owner_agent_requests r
+       SET r.status = 'rejected'
+       WHERE r.status = 'submitted'
+         AND NOT EXISTS (
+           SELECT 1 FROM owner_agent_contacts c
+           WHERE c.request_id = r.id
+             AND IFNULL(c.status, 'pending') != 'rejected'
+         )
+         AND EXISTS (
+           SELECT 1 FROM owner_agent_contacts c
+           WHERE c.request_id = r.id
+         )`
+    );
+    results.cascade_rejected_requests = r.affectedRows;
+    console.log(`[cleanup]  ✓  cascade-rejected requests: ${r.affectedRows} rows`);
+  } catch (e) {
+    if (!/doesn't exist|Unknown/i.test(e.message)) {
+      console.error('[cleanup]  ✗  cascade-reject requests failed:', e.message);
+    }
+  }
+
   const durationMs = Date.now() - startedAt;
   console.log(`[cleanup] done in ${durationMs}ms —`, JSON.stringify(results));
 

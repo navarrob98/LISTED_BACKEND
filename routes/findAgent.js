@@ -313,24 +313,52 @@ router.post('/api/find-agent/contact', authenticateToken, async (req, res) => {
     );
     if (!request) return res.status(404).json({ error: 'Solicitud no encontrada' });
 
-    // Verificar límite de contactos (count from contacts table)
-    const [{ cnt }] = await q(
-      'SELECT COUNT(*) AS cnt FROM owner_agent_contacts WHERE request_id = ?',
+    // Máximo 3 agentes activos (no rechazados) por solicitud. Si los 3
+    // anteriores rechazaron, el usuario puede volver a ofrecer a 3 nuevos.
+    const [{ active_cnt }] = await q(
+      `SELECT COUNT(*) AS active_cnt FROM owner_agent_contacts
+       WHERE request_id = ? AND IFNULL(status, 'pending') != 'rejected'`,
       [requestId]
     );
-    if (cnt >= 3) {
-      return res.status(403).json({ error: 'Máximo 3 agentes por solicitud' });
+    if (active_cnt >= 3) {
+      return res.status(403).json({
+        error: 'Ya tienes 3 agentes activos. Espera a que respondan o sean rechazados antes de ofrecer a nuevos agentes.',
+      });
     }
 
-    // Insertar contacto (IGNORE para idempotencia si ya existe)
-    const contactResult = await q(
-      'INSERT IGNORE INTO owner_agent_contacts (request_id, user_id, agent_id) VALUES (?, ?, ?)',
-      [requestId, userId, agentId]
+    // Upsert: si el agente había rechazado antes, permitir re-contactarlo
+    // reiniciando status='pending' y created_at (para el timeout de 3 días).
+    // Si el contacto existe con status activo (pending/accepted), no duplicar.
+    const [existingContact] = await q(
+      `SELECT id, status FROM owner_agent_contacts
+       WHERE request_id = ? AND agent_id = ? LIMIT 1`,
+      [requestId, agentId]
     );
 
-    // Dedup: si no insertó, el contacto ya existía
-    if (contactResult.affectedRows === 0) {
-      return res.json({ ok: false, already_contacted: true });
+    if (existingContact) {
+      if (existingContact.status === 'rejected') {
+        await q(
+          `UPDATE owner_agent_contacts SET status = 'pending', created_at = NOW()
+           WHERE id = ?`,
+          [existingContact.id]
+        );
+      } else {
+        return res.json({ ok: false, already_contacted: true });
+      }
+    } else {
+      await q(
+        'INSERT INTO owner_agent_contacts (request_id, user_id, agent_id) VALUES (?, ?, ?)',
+        [requestId, userId, agentId]
+      );
+    }
+
+    // Si el request estaba en estado 'rejected' (todos los 3 anteriores
+    // rechazaron), reabrirlo ahora que hay un nuevo contacto activo.
+    if (request.status === 'rejected') {
+      await q(
+        `UPDATE owner_agent_requests SET status = 'submitted' WHERE id = ?`,
+        [requestId]
+      );
     }
 
     // Buscar si ya existe una propiedad prospecto para este request
@@ -489,12 +517,18 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
             cover: prop.cover || null,
             created_at: c.created_at,
             contacts_count: 0,
+            active_count: 0,
+            rejected_count: 0,
+            can_reoffer: false,
             contacted_agent_ids: '',
             agents: [],
           });
         }
         const group = groupMap.get(rid);
         group.contacts_count++;
+        const status = c.contact_status || 'pending';
+        if (status === 'rejected') group.rejected_count++;
+        else group.active_count++;
         group.contacted_agent_ids += (group.contacted_agent_ids ? ',' : '') + c.agent_id;
         group.agents.push({
           id: c.agent_id,
@@ -502,9 +536,14 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
           last_name: c.last_name,
           profile_photo: c.profile_photo,
           phone: c.phone,
-          contact_status: c.contact_status,
+          contact_status: status,
           property_id: group.property_id,
         });
+      }
+      // Puede re-ofrecer si hay al menos 1 contacto y TODOS están rechazados
+      // (0 activos). El backend /contact aplicará el mismo check al insertar.
+      for (const group of groupMap.values()) {
+        group.can_reoffer = group.contacts_count > 0 && group.active_count === 0;
       }
       rows = Array.from(groupMap.values());
 
