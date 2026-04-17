@@ -487,6 +487,141 @@ router.post('/agents/update-credential-certificate', authenticateToken, async (r
   }
 });
 
+// GET /agents (público — lista de agentes verificados con paginación)
+// Query params: ?page=1&limit=20&city=Monterrey&type=brokerage&sort=rating
+router.get('/agents', publicDetailLimiter, async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
+    // Filtros sanitizados
+    const city = typeof req.query.city === 'string' ? req.query.city.trim().slice(0, 80) : '';
+    const type = ['brokerage', 'individual', 'seller'].includes(req.query.type) ? req.query.type : null;
+    const sort = ['rating', 'recent'].includes(req.query.sort) ? req.query.sort : 'rating';
+
+    // WHERE base: solo agentes verificados, no banned
+    const where = [
+      `u.agent_type IN ('brokerage','individual','seller')`,
+      `u.agent_verification_status = 'verified'`,
+      `(u.is_banned IS NULL OR u.is_banned = 0)`,
+    ];
+    const params = [];
+
+    if (type) {
+      where.push('u.agent_type = ?');
+      params.push(type);
+    }
+
+    if (city) {
+      // cities se guarda como JSON array de strings. Usa JSON_CONTAINS con LOWER
+      // para match case-insensitive. Si cities es null, no matchea.
+      where.push(`u.cities IS NOT NULL AND JSON_SEARCH(LOWER(u.cities), 'one', ?) IS NOT NULL`);
+      params.push(city.toLowerCase());
+    }
+
+    const whereSql = where.join(' AND ');
+
+    const orderBy = sort === 'recent'
+      ? 'u.id DESC'
+      : 'u.avg_rating DESC, u.rating_count DESC, u.id DESC'; // rating tiebreaker por count
+
+    // Cuenta total para paginación
+    const [[count]] = await pool.promise().query(
+      `SELECT COUNT(*) AS total FROM users u WHERE ${whereSql}`,
+      params
+    );
+
+    // Resultados
+    const [rows] = await pool.promise().query(
+      `SELECT u.id, u.name, u.last_name, u.agent_type, u.brokerage_name,
+              u.cities, u.profile_photo, u.avg_rating, u.rating_count,
+              u.work_start, u.work_end,
+              (SELECT COUNT(*) FROM properties p
+                 WHERE (p.created_by = u.id OR p.managed_by = u.id)
+                   AND p.is_published = 1) AS listings_count
+       FROM users u
+       WHERE ${whereSql}
+       ORDER BY ${orderBy}
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    // Parse cities JSON defensivamente (algunos rows podrían ser strings, otros objetos)
+    const agents = rows.map((r) => {
+      let cities = [];
+      if (r.cities) {
+        try {
+          cities = typeof r.cities === 'string' ? JSON.parse(r.cities) : r.cities;
+          if (!Array.isArray(cities)) cities = [];
+        } catch { cities = []; }
+      }
+      return { ...r, cities };
+    });
+
+    res.json({
+      agents,
+      page,
+      limit,
+      total: count.total,
+      totalPages: Math.ceil(count.total / limit),
+    });
+  } catch (e) {
+    console.error('[GET /agents]', e);
+    res.status(500).json({ error: 'Error al listar agentes' });
+  }
+});
+
+// GET /agents/:id/properties (público — propiedades publicadas del agente)
+router.get('/agents/:id/properties', publicDetailLimiter, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(30, Math.max(1, parseInt(req.query.limit) || 12));
+    const offset = (page - 1) * limit;
+
+    // Incluye propiedades creadas O gestionadas por el agente, publicadas y aprobadas.
+    const [[count]] = await pool.promise().query(
+      `SELECT COUNT(*) AS total
+       FROM properties p
+       WHERE (p.created_by = ? OR p.managed_by = ?)
+         AND p.is_published = 1`,
+      [id, id]
+    );
+
+    const [rows] = await pool.promise().query(
+      `SELECT
+         p.id, p.type, p.address, p.price, p.monthly_pay, p.estate_type,
+         p.bedrooms, p.bathrooms, p.land, p.construction, p.lat, p.lng,
+         p.promoted_until, p.listing_status,
+         (SELECT image_url FROM property_images pi
+            WHERE pi.property_id = p.id ORDER BY pi.id ASC LIMIT 1) AS image,
+         CASE
+           WHEN p.price_original IS NULL OR p.price_original <= 0 OR p.price >= p.price_original THEN 0
+           ELSE ROUND(((p.price_original - p.price) / p.price_original) * 100, 1)
+         END AS discount_percent
+       FROM properties p
+       WHERE (p.created_by = ? OR p.managed_by = ?)
+         AND p.is_published = 1
+       ORDER BY
+         (p.promoted_until IS NOT NULL AND p.promoted_until > NOW()) DESC,
+         p.id DESC
+       LIMIT ? OFFSET ?`,
+      [id, id, limit, offset]
+    );
+
+    res.json({
+      properties: rows,
+      page,
+      total: count.total,
+      totalPages: Math.ceil(count.total / limit),
+    });
+  } catch (e) {
+    console.error('[GET /agents/:id/properties]', e);
+    res.status(500).json({ error: 'Error al listar propiedades del agente' });
+  }
+});
+
 // GET /agents/:id (público — rate limit para scrapers)
 router.get('/agents/:id', publicDetailLimiter, (req, res) => {
   const { id } = req.params;
