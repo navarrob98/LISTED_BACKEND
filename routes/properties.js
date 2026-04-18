@@ -773,22 +773,80 @@ router.get('/my-properties/:id', authenticateToken, (req, res) => {
 });
 
 // DELETE /properties/:id
-router.delete('/properties/:id', authenticateToken, (req, res) => {
+// Cascada:
+//   - Propiedad prospecto: también borra el owner_agent_request + contactos +
+//     chat_messages de esa propiedad (sino las cards siguen apareciendo en
+//     /mis-propiedades porque se derivan de owner_agent_requests).
+//   - Propiedad normal: borra imágenes y la propiedad.
+router.delete('/properties/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const userId = req.user.id;
+  const conn = pool.promise();
 
-  const query = 'DELETE FROM properties WHERE id = ? AND (created_by = ? OR managed_by = ?)';
+  try {
+    const [rows] = await conn.query(
+      `SELECT id, created_by, managed_by, review_status, address, estate_type, city
+       FROM properties WHERE id = ? LIMIT 1`,
+      [id]
+    );
+    const property = rows?.[0];
+    if (!property) {
+      return res.status(404).json({ error: 'Propiedad no encontrada' });
+    }
 
-  pool.query(query, [id, userId, userId], (err, result) => {
-    if (err) {
-      console.error('Error deleting property:', err);
-      return res.status(500).json({ error: 'No se pudo eliminar la propiedad' });
+    const isOwner = String(property.created_by) === String(userId);
+    const isManager = String(property.managed_by) === String(userId);
+    if (!isOwner && !isManager) {
+      return res.status(403).json({ error: 'No autorizado' });
     }
-    if (result.affectedRows === 0) {
-      return res.status(403).json({ error: 'No autorizado o propiedad no encontrada' });
+
+    // Cascada para prospect: eliminar request + contactos + mensajes de chat
+    if (property.review_status === 'prospect' && isOwner) {
+      // Buscar request asociado por dueño + dirección + tipo + ciudad
+      const [reqRows] = await conn.query(
+        `SELECT id FROM owner_agent_requests
+         WHERE user_id = ? AND address = ? AND estate_type = ? AND city = ?`,
+        [userId, property.address, property.estate_type, property.city]
+      );
+
+      for (const r of reqRows) {
+        await conn.query(
+          'DELETE FROM owner_agent_contacts WHERE request_id = ?',
+          [r.id]
+        );
+        await conn.query(
+          'DELETE FROM owner_agent_requests WHERE id = ?',
+          [r.id]
+        );
+      }
+
+      // Borrar mensajes de chat vinculados a esta propiedad
+      await conn.query(
+        'DELETE FROM chat_messages WHERE property_id = ?',
+        [id]
+      );
     }
+
+    // Borrar imágenes primero (FK)
+    try {
+      await conn.query('DELETE FROM property_images WHERE property_id = ?', [id]);
+    } catch (e) {
+      // Si no existe la tabla o no hay filas, seguir
+    }
+
+    const [del] = await conn.query(
+      'DELETE FROM properties WHERE id = ? AND (created_by = ? OR managed_by = ?)',
+      [id, userId, userId]
+    );
+    if (del.affectedRows === 0) {
+      return res.status(403).json({ error: 'No autorizado' });
+    }
+
     res.json({ message: 'Propiedad eliminada correctamente' });
-  });
+  } catch (err) {
+    console.error('Error deleting property:', err);
+    res.status(500).json({ error: 'No se pudo eliminar la propiedad' });
+  }
 });
 
 // POST /properties/:id/resubmit
