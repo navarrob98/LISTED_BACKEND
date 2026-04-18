@@ -361,17 +361,27 @@ router.post('/api/find-agent/contact', authenticateToken, async (req, res) => {
       );
     }
 
-    // Buscar si ya existe una propiedad prospecto para este request
-    const [existingProp] = await q(
-      `SELECT id FROM properties WHERE created_by = ? AND review_status = 'prospect'
-       AND address = ? AND estate_type = ? AND city = ? LIMIT 1`,
-      [userId, request.address, request.estate_type, request.city]
-    );
-
+    // Preferir property_id ya vinculado al request (columna directa).
+    // Fallback: buscar por address match (legacy).
     let propertyId;
-    if (existingProp) {
-      propertyId = existingProp.id;
-    } else {
+    if (request.property_id) {
+      const [stillExists] = await q(
+        'SELECT id FROM properties WHERE id = ? LIMIT 1',
+        [request.property_id]
+      );
+      if (stillExists) propertyId = stillExists.id;
+    }
+
+    if (!propertyId) {
+      const [existingProp] = await q(
+        `SELECT id FROM properties WHERE created_by = ? AND review_status = 'prospect'
+         AND address = ? AND estate_type = ? AND city = ? LIMIT 1`,
+        [userId, request.address, request.estate_type, request.city]
+      );
+      if (existingProp) propertyId = existingProp.id;
+    }
+
+    if (!propertyId) {
       // Crear propiedad prospecto solo la primera vez
       const isRentProspect = request.operation_type === 'renta';
       const propResult = await q(
@@ -401,6 +411,14 @@ router.post('/api/find-agent/contact', authenticateToken, async (req, res) => {
           [imgValues]
         );
       }
+    }
+
+    // Vincula property_id al request para evitar matching frágil después
+    if (propertyId && request.property_id !== propertyId) {
+      await q(
+        'UPDATE owner_agent_requests SET property_id = ? WHERE id = ?',
+        [propertyId, requestId]
+      );
     }
 
     // Construir mensaje automático
@@ -477,17 +495,14 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
       // endpoint /contact al generar el mensaje intro). Matching por address
       // no es confiable porque Nominatim devuelve strings largos y el property
       // puede haberse editado.
+      // property_id viene directo de owner_agent_requests.property_id
+      // (vinculado al crear la propiedad prospect en /contact).
       const contacts = await q(
         `SELECT oac.request_id, oac.agent_id, oac.status AS contact_status,
                 u.name, u.last_name, u.profile_photo, u.phone,
                 r.address, r.city, r.estate_type, r.desired_price AS price,
                 r.construction_area AS construction, r.bedrooms, r.bathrooms,
-                r.operation_type AS type, r.created_at,
-                (SELECT cm.property_id FROM chat_messages cm
-                 WHERE cm.sender_id = oac.user_id
-                   AND cm.receiver_id = oac.agent_id
-                   AND cm.property_id IS NOT NULL
-                 ORDER BY cm.id ASC LIMIT 1) AS property_id
+                r.operation_type AS type, r.created_at, r.property_id
          FROM owner_agent_contacts oac
          JOIN users u ON u.id = oac.agent_id
          JOIN owner_agent_requests r ON r.id = oac.request_id
