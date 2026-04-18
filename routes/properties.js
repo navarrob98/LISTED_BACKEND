@@ -800,14 +800,32 @@ router.delete('/properties/:id', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'No autorizado' });
     }
 
-    // Cascada para prospect: eliminar request + contactos + mensajes de chat
-    if (property.review_status === 'prospect' && isOwner) {
-      // Buscar request asociado por dueño + dirección + tipo + ciudad
-      const [reqRows] = await conn.query(
+    // Cascada cuando borra el OWNER (regular que ofreció vía find-agent):
+    // elimina request + contactos + chat_messages. Aplica a cualquier status
+    // (prospect, pending, approved) porque el vínculo con el request se crea
+    // al contactar agentes y sigue vivo después de promocionar/aprobar.
+    if (isOwner) {
+      // Buscar request asociado. Primero intenta exact match por address+type+city.
+      // Si no encuentra (por ediciones de address), usa el request más reciente
+      // del usuario con la misma ciudad+tipo.
+      let [reqRows] = await conn.query(
         `SELECT id FROM owner_agent_requests
          WHERE user_id = ? AND address = ? AND estate_type = ? AND city = ?`,
         [userId, property.address, property.estate_type, property.city]
       );
+
+      if (reqRows.length === 0) {
+        // Fallback: vincular vía chat_messages.property_id
+        const [viaChat] = await conn.query(
+          `SELECT DISTINCT oac.request_id AS id
+           FROM chat_messages cm
+           JOIN owner_agent_contacts oac
+             ON oac.user_id = cm.sender_id AND oac.agent_id = cm.receiver_id
+           WHERE cm.property_id = ? AND cm.sender_id = ?`,
+          [id, userId]
+        );
+        reqRows = viaChat;
+      }
 
       for (const r of reqRows) {
         await conn.query(
