@@ -800,38 +800,54 @@ router.delete('/properties/:id', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'No autorizado' });
     }
 
-    // Cascada cuando borra el OWNER (regular que ofreció vía find-agent):
-    // elimina TODOS los requests que apuntan a esta propiedad + sus contactos
-    // + chat_messages + hidden_chats. Usa la columna property_id del request
-    // (vínculo directo, no address match que no es confiable).
+    // Al borrar el OWNER:
+    //   - Requests SIN accepted: se eliminan (cleanup normal — nunca cuajó).
+    //   - Requests CON accepted: se preservan como historial (la relación con
+    //     el agente existió realmente; se mantiene para auditoría/reseñas).
+    //   - chat_messages se conservan como historial, pero la conversación se
+    //     ARCHIVA (hidden_chats) para cada participante: no aparece en lista.
     if (isOwner) {
-      const [reqRows] = await conn.query(
+      // Todos los requests que apuntan a esta propiedad
+      const [allReqs] = await conn.query(
         'SELECT id FROM owner_agent_requests WHERE property_id = ? AND user_id = ?',
         [id, userId]
       );
 
-      for (const r of reqRows) {
-        await conn.query(
-          'DELETE FROM owner_agent_contacts WHERE request_id = ?',
+      // Agentes con los que el dueño chateó sobre esta propiedad (para archivar)
+      const [chatPartners] = await conn.query(
+        `SELECT DISTINCT
+           IF(sender_id = ?, receiver_id, sender_id) AS other_user_id
+         FROM chat_messages
+         WHERE property_id = ? AND (sender_id = ? OR receiver_id = ?)`,
+        [userId, id, userId, userId]
+      );
+
+      // Solo borra requests sin contacto accepted. Preserva los aceptados.
+      for (const r of allReqs) {
+        const [[{ has_accepted }]] = await conn.query(
+          `SELECT COUNT(*) > 0 AS has_accepted FROM owner_agent_contacts
+           WHERE request_id = ? AND status = 'accepted'`,
           [r.id]
         );
-        await conn.query(
-          'DELETE FROM owner_agent_requests WHERE id = ?',
-          [r.id]
-        );
+        if (!has_accepted) {
+          await conn.query('DELETE FROM owner_agent_contacts WHERE request_id = ?', [r.id]);
+          await conn.query('DELETE FROM owner_agent_requests WHERE id = ?', [r.id]);
+        }
       }
 
-      // Archiva las conversaciones vinculadas a esta propiedad: borra todos los
-      // mensajes con este property_id (para ambas partes) + limpia hidden_chats
-      // para que no queden residuos en la lista de chats.
-      await conn.query(
-        'DELETE FROM chat_messages WHERE property_id = ?',
-        [id]
-      );
-      await conn.query(
-        'DELETE FROM hidden_chats WHERE property_id = ?',
-        [id]
-      ).catch(() => {}); // tabla opcional
+      // Archiva las conversaciones para AMBAS partes (owner + agente)
+      for (const cp of chatPartners) {
+        const other = cp.other_user_id;
+        try {
+          await conn.query(
+            `INSERT IGNORE INTO hidden_chats (user_id, chat_with_user_id, property_id)
+             VALUES (?, ?, ?), (?, ?, ?)`,
+            [userId, other, id, other, userId, id]
+          );
+        } catch (e) {
+          // Si la tabla no existe o FK falla, seguir — no es crítico
+        }
+      }
     }
 
     // Borrar imágenes primero (FK)
