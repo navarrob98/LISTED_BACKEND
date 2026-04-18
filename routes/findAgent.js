@@ -472,13 +472,22 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
         [userId, userId, userId]
       );
     } else {
-      // Propietario: obtener contactos con info de agente y request
+      // Propietario: obtener contactos con info de agente y request. Derivamos
+      // property_id desde chat_messages (vínculo confiable creado por el
+      // endpoint /contact al generar el mensaje intro). Matching por address
+      // no es confiable porque Nominatim devuelve strings largos y el property
+      // puede haberse editado.
       const contacts = await q(
         `SELECT oac.request_id, oac.agent_id, oac.status AS contact_status,
                 u.name, u.last_name, u.profile_photo, u.phone,
                 r.address, r.city, r.estate_type, r.desired_price AS price,
                 r.construction_area AS construction, r.bedrooms, r.bathrooms,
-                r.operation_type AS type, r.created_at
+                r.operation_type AS type, r.created_at,
+                (SELECT cm.property_id FROM chat_messages cm
+                 WHERE cm.sender_id = oac.user_id
+                   AND cm.receiver_id = oac.agent_id
+                   AND cm.property_id IS NOT NULL
+                 ORDER BY cm.id ASC LIMIT 1) AS property_id
          FROM owner_agent_contacts oac
          JOIN users u ON u.id = oac.agent_id
          JOIN owner_agent_requests r ON r.id = oac.request_id
@@ -487,24 +496,30 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
         [userId]
       );
 
-      // Buscar propiedades prospect asociadas a este usuario (por dirección)
-      const prospectProps = await q(
-        `SELECT p.id, p.address,
-                (SELECT image_url FROM property_images WHERE property_id = p.id ORDER BY id ASC LIMIT 1) AS cover
-         FROM properties p
-         WHERE p.created_by = ? AND p.review_status IN ('prospect', 'approved')
-         ORDER BY p.created_at DESC`,
-        [userId]
-      );
+      // Covers de las propiedades referenciadas
+      const propertyIds = [...new Set(contacts.map(c => c.property_id).filter(Boolean))];
+      const coverMap = new Map();
+      if (propertyIds.length > 0) {
+        const placeholders = propertyIds.map(() => '?').join(',');
+        const coverRows = await q(
+          `SELECT property_id, image_url FROM (
+             SELECT property_id, image_url,
+                    ROW_NUMBER() OVER (PARTITION BY property_id ORDER BY id ASC) AS rn
+             FROM property_images
+             WHERE property_id IN (${placeholders})
+           ) t WHERE rn = 1`,
+          propertyIds
+        );
+        for (const row of coverRows) coverMap.set(row.property_id, row.image_url);
+      }
 
       // Agrupar por request_id
       const groupMap = new Map();
       for (const c of contacts) {
         const rid = c.request_id;
         if (!groupMap.has(rid)) {
-          const prop = prospectProps.find(p => p.address === c.address) || prospectProps[0] || {};
           groupMap.set(rid, {
-            property_id: prop.id || null,
+            property_id: c.property_id || null,
             request_id: rid,
             address: c.address,
             city: c.city,
@@ -514,7 +529,7 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
             bedrooms: c.bedrooms,
             bathrooms: c.bathrooms,
             type: c.type,
-            cover: prop.cover || null,
+            cover: c.property_id ? (coverMap.get(c.property_id) || null) : null,
             created_at: c.created_at,
             contacts_count: 0,
             active_count: 0,
@@ -525,6 +540,11 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
           });
         }
         const group = groupMap.get(rid);
+        // Si aún no tenemos property_id en el group y este contact sí, llenar
+        if (!group.property_id && c.property_id) {
+          group.property_id = c.property_id;
+          group.cover = coverMap.get(c.property_id) || null;
+        }
         group.contacts_count++;
         const status = c.contact_status || 'pending';
         if (status === 'rejected') group.rejected_count++;
@@ -547,15 +567,9 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
       }
       rows = Array.from(groupMap.values());
 
-      console.log('[prospects/owner] DEBUG contacts:', JSON.stringify(contacts.map(c => ({
-        request_id: c.request_id, agent_id: c.agent_id, address: c.address, price: c.price,
-      }))));
-      console.log('[prospects/owner] DEBUG prospectProps:', JSON.stringify(prospectProps.map(p => ({
-        id: p.id, address: p.address,
-      }))));
       console.log('[prospects/owner] DEBUG groups:', JSON.stringify(rows.map(r => ({
-        request_id: r.request_id, property_id: r.property_id, address: r.address, price: r.price,
-        agents_count: r.agents.length,
+        request_id: r.request_id, property_id: r.property_id, address: r.address,
+        contacts: r.contacts_count, active: r.active_count, rejected: r.rejected_count,
       }))));
     }
 
