@@ -462,6 +462,15 @@ module.exports = function initSockets(io, pool, helpers) {
           );
           if (!senderRow || senderRow.agent_type !== 'regular') return;
 
+          // Desactivar IA en chats prospect: si el regular ES el dueño de la
+          // propiedad, está ofreciéndola al agente (flujo find-agent). El agente
+          // debe responder personalmente porque está evaluando tomar el listado.
+          const [[propOwner]] = await pool.promise().query(
+            'SELECT created_by, review_status FROM properties WHERE id = ? LIMIT 1',
+            [property_id]
+          );
+          if (propOwner && String(propOwner.created_by) === String(sender_id)) return;
+
           // Skip AI if session was already ended for this triplet
           const sessionEnded = await isAiSessionEnded(pool, receiver_id, sender_id, property_id);
           if (sessionEnded) return;
