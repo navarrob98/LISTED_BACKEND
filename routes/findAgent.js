@@ -495,8 +495,9 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
       // endpoint /contact al generar el mensaje intro). Matching por address
       // no es confiable porque Nominatim devuelve strings largos y el property
       // puede haberse editado.
-      // property_id viene directo de owner_agent_requests.property_id
-      // (vinculado al crear la propiedad prospect en /contact).
+      // property_id viene directo de owner_agent_requests.property_id.
+      // INNER JOIN con properties: si la propiedad fue borrada, el request
+      // queda huérfano y NO se muestra (evita cards con ver/editar rotos).
       const contacts = await q(
         `SELECT oac.request_id, oac.agent_id, oac.status AS contact_status,
                 u.name, u.last_name, u.profile_photo, u.phone,
@@ -506,6 +507,7 @@ router.get('/api/find-agent/prospects', authenticateToken, async (req, res) => {
          FROM owner_agent_contacts oac
          JOIN users u ON u.id = oac.agent_id
          JOIN owner_agent_requests r ON r.id = oac.request_id
+         JOIN properties p ON p.id = r.property_id
          WHERE oac.user_id = ?
          ORDER BY r.created_at DESC`,
         [userId]
