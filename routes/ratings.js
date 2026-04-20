@@ -49,8 +49,13 @@ router.post('/api/ratings', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Agente no encontrado' });
     }
 
-    // Validar según tipo
-    if (type === 'appointment' && appointment_id) {
+    // Validar interacción real: sin prueba de cita completada o transacción
+    // cerrada, cualquier usuario podría crear reseñas fake contra cualquier
+    // agente. El cliente DEBE haber tenido una interacción verificable.
+    if (type === 'appointment') {
+      if (!appointment_id) {
+        return res.status(400).json({ error: 'appointment_id requerido para calificar una cita' });
+      }
       const [[appt]] = await qp(
         'SELECT id, requester_id, agent_id, status FROM appointments WHERE id = ?',
         [appointment_id]
@@ -60,6 +65,23 @@ router.post('/api/ratings', authenticateToken, async (req, res) => {
       }
       if (appt.status !== 'completed') {
         return res.status(400).json({ error: 'La cita debe estar completada' });
+      }
+    } else if (type === 'transaction') {
+      // Transaction ratings requieren que el agente haya cerrado el trato
+      // con este cliente (properties.closed_by_client_id poblado via /close-deal).
+      if (!property_id) {
+        return res.status(400).json({ error: 'property_id requerido para calificar transacción' });
+      }
+      const [[prop]] = await qp(
+        `SELECT closed_by_client_id, created_by, managed_by
+         FROM properties WHERE id = ? LIMIT 1`,
+        [property_id]
+      );
+      const closedWithMe = prop && String(prop.closed_by_client_id) === String(userId);
+      const agentIsOwnerOrManager =
+        prop && (String(prop.created_by) === String(agent_id) || String(prop.managed_by) === String(agent_id));
+      if (!closedWithMe || !agentIsOwnerOrManager) {
+        return res.status(403).json({ error: 'No tienes una transacción cerrada con este agente' });
       }
     }
 

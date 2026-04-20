@@ -101,8 +101,20 @@ router.post('/properties/add', authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "Usuario no encontrado" });
     }
 
-    // Agentes verificados publican directo, el resto pasa por revisión
     const user = uRows[0];
+
+    // Regulars NO pueden publicar directo — deben pasar por el flujo find-agent
+    // (`/api/find-agent/contact` crea propiedades prospect). Si llegan aquí es
+    // bypass de UI: bloqueamos a nivel de servidor.
+    const AGENT_TYPES = ['individual', 'brokerage', 'seller'];
+    if (!AGENT_TYPES.includes(user.agent_type)) {
+      return res.status(403).json({
+        error: 'Solo agentes pueden publicar propiedades. Los usuarios regulares deben ofrecer su propiedad vía el flujo de encontrar agente.',
+        code: 'REGULAR_CANNOT_PUBLISH',
+      });
+    }
+
+    // Agentes verificados publican directo, el resto pasa por revisión
     const isVerifiedAgent = user.agent_verification_status === 'verified';
     const finalReviewStatus = isVerifiedAgent ? "approved" : "pending";
     const finalIsPublished = isVerifiedAgent ? 1 : 0;
@@ -331,9 +343,12 @@ router.put('/properties/:id', authenticateToken, async (req, res) => {
     furnished: 'bool',
     pets_allowed: 'bool',
     listing_status: 'string',
-    is_published: 'bool',
     status_change_count: 'int',
   };
+
+  // `is_published` NO está en el whitelist — se controla server-side vía
+  // listing_status (lógica en ~línea 356). Permitir editar is_published
+  // directamente dejaba que cualquier dueño publicara sin revisión.
 
   // Validar listing_status si viene
   const ALLOWED_LISTING_STATUS = ['disponible', 'apartada', 'no_disponible'];

@@ -55,6 +55,8 @@ router.post('/stripe/webhook', express.raw({ type: 'application/json' }), async 
           'UPDATE promotions SET status="paid", expires_at=DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id=? AND status!="paid"',
           [promo.id]
         );
+        // Feature intencional: pagar promoción salta la cola de revisión y
+        // publica de inmediato. Se comunica al usuario en el flujo de publicar.
         await pool.promise().query(
           `UPDATE properties
              SET promoted_until = DATE_ADD(NOW(), INTERVAL 7 DAY),
@@ -192,7 +194,8 @@ router.post('/payments/promote/confirm', express.json(), authenticateToken, asyn
       return res.json({ ok: true, already: true });
     }
 
-    // 4) Mark as paid
+    // 4) Mark as paid. Feature intencional: pagar promoción salta la cola de
+    // revisión y publica inmediato. Se comunica al usuario en /publicar.
     await pool.promise().query(
       'UPDATE promotions SET status="paid", expires_at=DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE id=?',
       [promo.id]

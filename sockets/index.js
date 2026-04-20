@@ -130,11 +130,13 @@ async function createAiAppointment({ pool, io, sendPushToUser, agentId, clientId
     );
   }
 
-  // Create appointment (requester = client, agent = agent)
+  // Create appointment (requester = client, agent = agent).
+  // initiated_by = agent: la IA actúa EN NOMBRE del agente proponiendo la cita,
+  // así que el cliente es quien debe aceptar (/client-accept).
   const [apptResult] = await pool.promise().query(
-    `INSERT INTO appointments (property_id, requester_id, agent_id, appointment_date, appointment_time, notes, status)
-     VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
-    [propertyId, clientId, agentId, date, time, 'Propuesta por asistente IA']
+    `INSERT INTO appointments (property_id, requester_id, agent_id, initiated_by, appointment_date, appointment_time, notes, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+    [propertyId, clientId, agentId, agentId, date, time, 'Propuesta por asistente IA']
   );
   const appointmentId = apptResult.insertId;
 

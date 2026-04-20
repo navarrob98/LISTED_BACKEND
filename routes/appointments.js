@@ -234,9 +234,12 @@ router.post('/api/appointments', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Faltan campos obligatorios' });
     }
 
-    // Validar que la propiedad existe y obtener el agente
+    // Validar que la propiedad existe y obtener el agente que la gestiona.
+    // Para propiedades del flujo find-agent (regular ofrece, agente acepta),
+    // `created_by` es el dueño regular y `managed_by` es el agente. La cita
+    // debe ir al agente que realmente atiende, no al dueño.
     const [propRows] = await pool.promise().query(
-      'SELECT id, created_by, address, type, price FROM properties WHERE id = ? AND is_published = 1',
+      'SELECT id, created_by, managed_by, address, type, price FROM properties WHERE id = ? AND is_published = 1',
       [property_id]
     );
 
@@ -245,7 +248,7 @@ router.post('/api/appointments', authenticateToken, async (req, res) => {
     }
 
     const property = propRows[0];
-    const agentId = property.created_by;
+    const agentId = property.managed_by || property.created_by;
 
     // Validar que no sea el propio agente solicitando
     if (String(agentId) === String(requesterId)) {
@@ -279,11 +282,12 @@ router.post('/api/appointments', authenticateToken, async (req, res) => {
       return res.status(409).json({ error: 'El agente tiene un compromiso en su calendario personal en ese horario' });
     }
 
-    // Crear la cita
+    // Crear la cita. initiated_by = requester (cliente) porque es quien
+    // está solicitando la visita. El agente debe /confirm.
     const [result] = await pool.promise().query(
-      `INSERT INTO appointments (property_id, requester_id, agent_id, appointment_date, appointment_time, notes, status)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
-      [property_id, requesterId, agentId, appointment_date, appointment_time, notes || null]
+      `INSERT INTO appointments (property_id, requester_id, agent_id, initiated_by, appointment_date, appointment_time, notes, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      [property_id, requesterId, agentId, requesterId, appointment_date, appointment_time, notes || null]
     );
 
     // Enviar notificación push al agente
@@ -473,11 +477,12 @@ router.post('/api/appointments/quick-invite', authenticateToken, async (req, res
       }
     }
 
-    // Create the appointment (requester = client, agent = authenticated agent)
+    // Create the appointment (requester = client, agent = authenticated agent).
+    // initiated_by = agent: el agente invita al cliente. Cliente debe /client-accept.
     const [result] = await pool.promise().query(
-      `INSERT INTO appointments (property_id, requester_id, agent_id, appointment_date, appointment_time, notes, status)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
-      [property_id, client_id, agentId, appointment_date, appointment_time, notes || null]
+      `INSERT INTO appointments (property_id, requester_id, agent_id, initiated_by, appointment_date, appointment_time, notes, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      [property_id, client_id, agentId, agentId, appointment_date, appointment_time, notes || null]
     );
 
     // Send push notification to the client
@@ -528,7 +533,7 @@ router.put('/api/appointments/:id/client-accept', authenticateToken, async (req,
     const userId = req.user.id;
 
     const [rows] = await pool.promise().query(
-      'SELECT id, agent_id, requester_id, status, property_id, appointment_date, appointment_time FROM appointments WHERE id = ? LIMIT 1',
+      'SELECT id, agent_id, requester_id, initiated_by, status, property_id, appointment_date, appointment_time FROM appointments WHERE id = ? LIMIT 1',
       [appointmentId]
     );
 
@@ -538,9 +543,16 @@ router.put('/api/appointments/:id/client-accept', authenticateToken, async (req,
 
     const appointment = rows[0];
 
-    // Only the requester (client) can accept
+    // Solo el requester (cliente) puede aceptar
     if (String(appointment.requester_id) !== String(userId)) {
       return res.status(403).json({ error: 'Solo el cliente puede aceptar la cita' });
+    }
+
+    // Y solo si el cliente NO fue quien inició la cita. Si el cliente es
+    // requester Y iniciador (flujo normal cliente→propiedad), debe esperar
+    // que el agente /confirm, no puede aceptarse a sí mismo.
+    if (String(appointment.initiated_by) === String(userId)) {
+      return res.status(400).json({ error: 'Iniciaste esta cita. Espera la confirmación del agente.' });
     }
 
     if (appointment.status !== 'pending') {
@@ -716,7 +728,7 @@ router.put('/api/appointments/:id/confirm', authenticateToken, async (req, res) 
     const userId = req.user.id;
 
     const [rows] = await pool.promise().query(
-      'SELECT id, agent_id, requester_id, status, property_id FROM appointments WHERE id = ? LIMIT 1',
+      'SELECT id, agent_id, requester_id, initiated_by, status, property_id FROM appointments WHERE id = ? LIMIT 1',
       [appointmentId]
     );
 
@@ -728,6 +740,12 @@ router.put('/api/appointments/:id/confirm', authenticateToken, async (req, res) 
 
     if (String(appointment.agent_id) !== String(userId)) {
       return res.status(403).json({ error: 'Solo el agente puede confirmar la cita' });
+    }
+
+    // Si el agente inició la cita (quick-invite o IA), no puede auto-confirmarla.
+    // El cliente debe usar /client-accept.
+    if (String(appointment.initiated_by) === String(userId)) {
+      return res.status(400).json({ error: 'Iniciaste esta cita. Espera la aceptación del cliente.' });
     }
 
     if (appointment.status !== 'pending') {
@@ -1265,15 +1283,18 @@ router.put('/api/appointments/:id/reschedule', authenticateToken, async (req, re
     // Actualizar la cita y resetear a pending si estaba confirmada
     const newStatus = appointment.status === 'confirmed' ? 'pending' : appointment.status;
 
+    // Al reprogramar: quien propone el nuevo horario se convierte en el
+    // "iniciador" — el otro lado debe confirmar/aceptar el nuevo slot.
     await pool.promise().query(
       `UPDATE appointments
        SET appointment_date = ?,
            appointment_time = ?,
            notes = ?,
            status = ?,
+           initiated_by = ?,
            updated_at = NOW()
        WHERE id = ?`,
-      [appointment_date, appointment_time, notes || null, newStatus, appointmentId]
+      [appointment_date, appointment_time, notes || null, newStatus, userId, appointmentId]
     );
 
     emitAppointmentUpdated({
