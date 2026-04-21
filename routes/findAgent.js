@@ -630,38 +630,64 @@ router.post('/api/find-agent/prospects/:propertyId/respond', authenticateToken, 
     if (!contact) return res.status(403).json({ error: 'No autorizado' });
 
     if (action === 'accept') {
-      // Atomic update: solo acepta si no hay managed_by (race condition safe)
-      const upd = await q(
-        'UPDATE properties SET managed_by = ? WHERE id = ? AND managed_by IS NULL',
-        [agentId, propertyId]
-      );
+      // Atomic update: solo acepta si no hay managed_by (race condition safe).
+      // Esta es la ÚNICA operación que puede devolver error al cliente.
+      let upd;
+      try {
+        upd = await q(
+          'UPDATE properties SET managed_by = ? WHERE id = ? AND managed_by IS NULL',
+          [agentId, propertyId]
+        );
+      } catch (e) {
+        console.error('[find-agent/respond] managed_by update failed:', e);
+        return res.status(500).json({ error: 'Error interno' });
+      }
       if (upd.affectedRows === 0) {
         return res.status(409).json({ error: 'Esta propiedad ya fue aceptada por otro agente' });
       }
 
-      // Publicar directamente al ser aceptada por un agente
-      await q(
-        'UPDATE properties SET review_status = ?, is_published = 1 WHERE id = ?',
-        ['approved', propertyId]
-      );
+      // A partir de aquí la propiedad YA fue traspasada. Cualquier side effect
+      // que falle se loggea pero no debe devolver error al cliente.
 
-      await q('UPDATE owner_agent_contacts SET status = ? WHERE id = ?', ['accepted', contact.id]);
+      // Publicar directamente al ser aceptada por un agente
+      try {
+        await q(
+          'UPDATE properties SET review_status = ?, is_published = 1 WHERE id = ?',
+          ['approved', propertyId]
+        );
+      } catch (e) {
+        console.error('[find-agent/respond] publish update failed:', e?.message || e);
+      }
+
+      // Marcar este contacto como aceptado
+      try {
+        await q('UPDATE owner_agent_contacts SET status = ? WHERE id = ?', ['accepted', contact.id]);
+      } catch (e) {
+        console.error('[find-agent/respond] contact accept update failed:', e?.message || e);
+      }
 
       // Rechazar automáticamente a los demás agentes contactados para esta propiedad
-      await q(
-        `UPDATE owner_agent_contacts SET status = 'rejected'
-         WHERE user_id = ? AND agent_id != ? AND status != 'accepted'
-           AND request_id = (SELECT t.request_id FROM (SELECT request_id FROM owner_agent_contacts WHERE id = ?) t)`,
-        [property.created_by, agentId, contact.id]
-      );
+      try {
+        await q(
+          `UPDATE owner_agent_contacts SET status = 'rejected'
+           WHERE request_id = ? AND id != ? AND status != 'accepted'`,
+          [contact.request_id, contact.id]
+        );
+      } catch (e) {
+        console.error('[find-agent/respond] reject-others update failed:', e?.message || e);
+      }
 
       // Actualizar request a accepted
-      await q(
-        'UPDATE owner_agent_requests SET status = ? WHERE id = ?',
-        ['accepted', contact.request_id]
-      );
+      try {
+        await q(
+          'UPDATE owner_agent_requests SET status = ? WHERE id = ?',
+          ['accepted', contact.request_id]
+        );
+      } catch (e) {
+        console.error('[find-agent/respond] request accept update failed:', e?.message || e);
+      }
 
-      // Notificar al propietario — fire-and-forget, no debe crashear el response
+      // Notificar al propietario — fire-and-forget
       try {
         await Promise.resolve(sendPushToUser({
           userId: property.created_by,
@@ -673,21 +699,31 @@ router.post('/api/find-agent/prospects/:propertyId/respond', authenticateToken, 
         console.error('[find-agent/respond] push sync error:', pushErr?.message || pushErr);
       }
 
-      res.json({ ok: true, action: 'accepted' });
+      return res.json({ ok: true, action: 'accepted' });
     } else {
-      await q('UPDATE owner_agent_contacts SET status = ? WHERE id = ?', ['rejected', contact.id]);
-
-      // Si todos los contactos del request fueron rechazados, marcar request como rejected
-      const [{ pending }] = await q(
-        `SELECT COUNT(*) AS pending FROM owner_agent_contacts
-         WHERE request_id = ? AND status != 'rejected'`,
-        [contact.request_id]
-      );
-      if (pending === 0) {
-        await q('UPDATE owner_agent_requests SET status = ? WHERE id = ?', ['rejected', contact.request_id]);
+      // Reject: también blindado para no devolver error al cliente si los side
+      // effects fallan después del UPDATE principal.
+      try {
+        await q('UPDATE owner_agent_contacts SET status = ? WHERE id = ?', ['rejected', contact.id]);
+      } catch (e) {
+        console.error('[find-agent/respond] contact reject update failed:', e);
+        return res.status(500).json({ error: 'Error interno' });
       }
 
-      res.json({ ok: true, action: 'rejected' });
+      try {
+        const [{ pending }] = await q(
+          `SELECT COUNT(*) AS pending FROM owner_agent_contacts
+           WHERE request_id = ? AND status != 'rejected'`,
+          [contact.request_id]
+        );
+        if (pending === 0) {
+          await q('UPDATE owner_agent_requests SET status = ? WHERE id = ?', ['rejected', contact.request_id]);
+        }
+      } catch (e) {
+        console.error('[find-agent/respond] request reject update failed:', e?.message || e);
+      }
+
+      return res.json({ ok: true, action: 'rejected' });
     }
   } catch (err) {
     console.error('[find-agent/respond]', err);
